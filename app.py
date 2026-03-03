@@ -303,6 +303,7 @@ def parse_patient(raw):
     mcol = next((c for c in ["결제메모", "승인번호", "메모"] if c in df.columns), None)
     if mcol:
         memo = _pick_first_series(df, mcol)
+        df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{6,}", str(x)) if pd.notna(x) else [])
         df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
 
     df["p_idx"] = range(len(df))
@@ -349,11 +350,30 @@ def run_matching(hansol, daily, patient):
             matched_h.add(hi)
         matched_dc.add(d_row["d_idx"])
 
-    # 승인번호→차트번호 맵
-    appr_map = {}
-    for _, pr in patient.iterrows():
-        for a in pr["승인번호목록"]:
-            appr_map[clean_no(a)] = pr["차트번호"]
+    # 환자별 인덱스/승인번호 인덱스 맵 (차트번호+이름을 함께 활용)
+    patient_by_chart, patient_by_name = {}, {}
+    approval_to_patient_idxs = {}
+    for p_idx, pr in patient.iterrows():
+        ch = clean_no(pr.get("차트번호", ""))
+        nm = clean_name(pr.get("이름", ""))
+        if ch:
+            patient_by_chart.setdefault(ch, set()).add(p_idx)
+        if nm:
+            patient_by_name.setdefault(nm, set()).add(p_idx)
+        for a in pr.get("승인번호목록", []):
+            aa = clean_no(a)
+            if aa:
+                approval_to_patient_idxs.setdefault(aa, set()).add(p_idx)
+
+    def _candidate_patient_idxs(dr):
+        cand = set()
+        ch = clean_no(dr.get("차트번호", ""))
+        nm = clean_name(dr.get("성명", ""))
+        if ch in patient_by_chart:
+            cand |= patient_by_chart[ch]
+        if nm in patient_by_name:
+            cand |= patient_by_name[nm]
+        return cand
 
     # 차트→본부금/카드사 맵
     chart_info = {}
@@ -366,17 +386,36 @@ def run_matching(hansol, daily, patient):
         if card_co and card_co not in chart_info[ch]["카드사_list"]:
             chart_info[ch]["카드사_list"].append(card_co)
 
-    # P1
-    if appr_map:
-        for _, hr in h_card.iterrows():
-            if hr["h_idx"] in matched_h:
+    # P1 - 일마 차트번호/성명으로 차트정보를 묶고, 결제메모 승인번호와 한솔 승인번호를 직접 매칭
+    if approval_to_patient_idxs:
+        for _, dr in d_card.iterrows():
+            if dr["d_idx"] in matched_dc:
                 continue
-            a = hr.get("승인번호", "")
-            if a and a in appr_map:
-                ch = appr_map[a]
-                dc = d_card[(d_card["차트번호"] == ch) & (~d_card["d_idx"].isin(matched_dc))]
-                if not dc.empty:
-                    add("P1_승인번호", "🟢HIGH", [hr["h_idx"]], dc.iloc[0])
+            cand_pidx = _candidate_patient_idxs(dr)
+            if not cand_pidx:
+                continue
+
+            cand_apprs = {appr for appr, pidxs in approval_to_patient_idxs.items() if pidxs & cand_pidx}
+            if not cand_apprs:
+                continue
+
+            hc = h_card[(~h_card["h_idx"].isin(matched_h)) & (h_card["승인번호"].isin(cand_apprs))]
+            if hc.empty:
+                continue
+
+            amt = int(dr["카드"])
+            hc_amt = hc[hc["금액"] == amt]
+            if len(hc_amt) == 1:
+                add("P1_승인번호_차트연결", "🟢HIGH", [int(hc_amt.iloc[0]["h_idx"])], dr)
+                continue
+            if len(hc) == 1:
+                add("P1_승인번호_차트연결", "🟡MED", [int(hc.iloc[0]["h_idx"])], dr)
+                continue
+
+            # 동일 승인번호 후보가 여러 건일 때는 금액 일치 우선, 그 외에는 가장 이른 건 1건 연결
+            pick_src = hc_amt if not hc_amt.empty else hc
+            pick = pick_src.sort_values(["시간_분", "h_idx"]).iloc[0]
+            add("P1_승인번호_차트연결", "🟡MED", [int(pick["h_idx"])], dr)
 
     # P2
     for _, dr in d_card.iterrows():
@@ -569,13 +608,13 @@ def run_matching(hansol, daily, patient):
 def build_hansol_chart_compare(match_df, patient):
     if match_df.empty:
         return pd.DataFrame(columns=[
-            "차트번호", "한솔카드건수", "한솔카드번호", "한솔카드사", "차트카드사", "카드사검증",
+            "차트번호", "한솔카드건수", "한솔카드번호", "한솔카드사(참고)", "차트카드사(참고)",
         ])
 
     hc = match_df[match_df["한솔_유형"] == "카드"].copy()
     if hc.empty:
         return pd.DataFrame(columns=[
-            "차트번호", "한솔카드건수", "한솔카드번호", "한솔카드사", "차트카드사", "카드사검증",
+            "차트번호", "한솔카드건수", "한솔카드번호", "한솔카드사(참고)", "차트카드사(참고)",
         ])
 
     hc["차트번호"] = hc["일마_차트"].apply(clean_no)
@@ -583,26 +622,17 @@ def build_hansol_chart_compare(match_df, patient):
     grp = hc.groupby("차트번호").agg(
         한솔카드건수=("한솔카드번호_norm", "count"),
         한솔카드번호=("한솔카드번호_norm", lambda x: ", ".join(sorted(set([v for v in x if v])))),
-        한솔카드사=("한솔_카드사", lambda x: ", ".join(sorted(set([str(v).strip() for v in x if str(v).strip()])))),
+        **{"한솔카드사(참고)": ("한솔_카드사", lambda x: ", ".join(sorted(set([str(v).strip() for v in x if str(v).strip()]))))},
     ).reset_index()
 
     p_card = patient[patient["분류"] == "카드"].copy()
     p_map = p_card.groupby("차트번호")["카드사"].apply(
         lambda x: ", ".join(sorted(set([str(v).strip() for v in x if str(v).strip()])))
-    ).reset_index().rename(columns={"카드사": "차트카드사"})
+    ).reset_index().rename(columns={"카드사": "차트카드사(참고)"})
 
     out = grp.merge(p_map, on="차트번호", how="left")
-    out["차트카드사"] = out["차트카드사"].fillna("")
-
-    def _judge(row):
-        hs = [x.strip() for x in str(row["한솔카드사"]).split(",") if x.strip()]
-        ps = [x.strip() for x in str(row["차트카드사"]).split(",") if x.strip()]
-        if not hs or not ps:
-            return "정보부족"
-        return "일치" if any(card_company_match(h, p) for h in hs for p in ps) else "불일치"
-
-    out["카드사검증"] = out.apply(_judge, axis=1)
-    return out.sort_values(["카드사검증", "차트번호"]).reset_index(drop=True)
+    out["차트카드사(참고)"] = out["차트카드사(참고)"].fillna("")
+    return out.sort_values(["차트번호"]).reset_index(drop=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -886,10 +916,6 @@ else:
             mm = pc[pc["불일치상세"] != "✅일치"]
             if len(mm):
                 prio.append(dict(순위="🟠P3", 항목="수단별 불일치", 건수=len(mm), 금액="-"))
-        if not hc_compare.empty:
-            cc_mis = hc_compare[hc_compare["카드사검증"] == "불일치"]
-            if len(cc_mis):
-                prio.append(dict(순위="🟠P3", 항목="한솔↔차트 카드사 불일치", 건수=len(cc_mis), 금액="-"))
         if prio:
             st.dataframe(pd.DataFrame(prio), use_container_width=True, hide_index=True)
         else:
@@ -917,9 +943,8 @@ else:
     with t2b:
         st.subheader("🧩 한솔↔차트 매칭 (일마 매칭 기반)")
         if not hc_compare.empty:
-            view = st.radio("카드사검증", ["전체", "불일치/정보부족"], horizontal=True)
-            disp = hc_compare if view == "전체" else hc_compare[hc_compare["카드사검증"].isin(["불일치", "정보부족"])]
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.caption("카드사 정보는 참고값입니다. 불일치 분류는 하지 않습니다.")
+            st.dataframe(hc_compare, use_container_width=True, hide_index=True)
         else:
             st.info("표시할 한솔↔차트 카드 매핑 정보가 없습니다.")
 
