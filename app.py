@@ -113,14 +113,29 @@ def load_file(f):
 
 def parse_hansol(raw):
     """한솔페이 파싱: 헤더 자동탐지, 시간 파싱, 거절/취소 분류"""
-    hdr = 0
-    for i, row in raw.iterrows():
-        if row.astype(str).str.contains("금액|승인번호|카드번호", na=False).any():
-            hdr = i
-            break
-    df = raw.iloc[hdr + 1:].copy()
-    df.columns = [str(c).strip().replace("\n", "") for c in raw.iloc[hdr]]
-    df = df.reset_index(drop=True)
+    # CSV처럼 이미 컬럼 헤더가 있는 경우를 우선 처리
+    raw.columns = [str(c).strip().replace("\n", "") for c in raw.columns]
+    has_header = any(c in raw.columns for c in ["금액", "거래금액", "결제금액"])
+
+    if has_header:
+        df = raw.copy().reset_index(drop=True)
+    else:
+        hdr = 0
+        for i, row in raw.iterrows():
+            if row.astype(str).str.contains("금액|승인번호|카드번호", na=False).any():
+                hdr = i
+                break
+        df = raw.iloc[hdr + 1:].copy()
+        df.columns = [str(c).strip().replace("\n", "") for c in raw.iloc[hdr]]
+        df = df.reset_index(drop=True)
+
+    amount_col = next((c for c in ["금액", "거래금액", "결제금액"] if c in df.columns), None)
+    if amount_col is None:
+        st.error(f"한솔페이 파일에서 금액 컬럼을 찾을 수 없습니다. (현재 컬럼: {', '.join(map(str, df.columns))})")
+        return pd.DataFrame()
+
+    if amount_col != "금액":
+        df["금액"] = df[amount_col]
 
     df["금액"] = df["금액"].apply(clean_money)
     df = df[df["금액"] > 0].copy()
