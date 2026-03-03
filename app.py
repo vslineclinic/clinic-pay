@@ -120,6 +120,16 @@ def parse_hansol_time(df):
             )
             parsed = pd.to_datetime(date_digits + time_digits, format="%Y%m%d%H%M%S", errors="coerce")
 
+    time_candidates = ["승인일시", "거래일시", "일시", "거래시간", "승인시간"]
+    chosen = next((c for c in time_candidates if c in df.columns), None)
+    if chosen:
+        parsed = pd.to_datetime(df[chosen], errors="coerce")
+    else:
+        parsed = pd.Series(pd.NaT, index=df.index)
+
+    # NOTE:
+    # - pandas 2.x does not allow fillna(value=DatetimeIndex) and raises TypeError.
+    # - Build a fallback Series with the same index and use combine_first instead.
     fallback = pd.Series(
         pd.Timestamp("1970-01-01") + pd.to_timedelta(np.arange(len(df)), unit="m"),
         index=df.index,
