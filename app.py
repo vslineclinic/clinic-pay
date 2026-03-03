@@ -16,6 +16,8 @@ v1 대비 주요 개선:
   11. 본부금 기반 분할결제 탐지 – 본부금 힌트로 2건 분할 정밀 매칭
 """
 
+import importlib
+import io
 import re
 from itertools import combinations
 
@@ -96,14 +98,38 @@ def similar_chart_no(a, b):
     return any(lo[:i] + lo[i + 1:] == sh for i in range(len(lo)))
 
 
-def load_file(f):
+def load_file(f, password=None, default_password="vsline99!!"):
     if f.name.lower().endswith(".csv"):
         try:
             return pd.read_csv(f, encoding="utf-8")
         except UnicodeDecodeError:
             f.seek(0)
             return pd.read_csv(f, encoding="cp949")
-    return pd.read_excel(f, header=None)
+
+    raw = f.read()
+    f.seek(0)
+
+    attempts = [password.strip()] if isinstance(password, str) and password.strip() else [None, default_password]
+    last_error = None
+
+    for pw in attempts:
+        try:
+            if pw is None:
+                return pd.read_excel(io.BytesIO(raw), header=None)
+
+            if importlib.util.find_spec("msoffcrypto") is None:
+                raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
+            msoffcrypto = importlib.import_module("msoffcrypto")
+            office = msoffcrypto.OfficeFile(io.BytesIO(raw))
+            office.load_key(password=pw)
+            decrypted = io.BytesIO()
+            office.decrypt(decrypted)
+            decrypted.seek(0)
+            return pd.read_excel(decrypted, header=None)
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"엑셀 파일을 열 수 없습니다. 비밀번호를 확인해주세요. ({last_error})")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -251,12 +277,15 @@ def parse_patient(raw):
     df["본부금"] = df[copay_cols].sum(axis=1) if copay_cols else 0
     df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
 
+    def _pick_first_series(frame, col):
+        """중복 컬럼명이 있는 경우 첫 번째 컬럼만 Series로 반환"""
+        if col not in frame.columns:
+            return pd.Series(index=frame.index, dtype=object)
+        data = frame.loc[:, col]
+        return data.iloc[:, 0] if isinstance(data, pd.DataFrame) else data
+
     # 결제수단 정밀분류
-    pay_col = df.loc[:, "결제수단"] if "결제수단" in df.columns else pd.Series(dtype=str)
-    if isinstance(pay_col, pd.DataFrame):
-        # 동일 컬럼명이 중복되면 DataFrame이 반환되어 loc 마스킹 시 TypeError가 발생할 수 있음
-        pay_col = pay_col.iloc[:, 0]
-    pay = pay_col.astype(str)
+    pay = _pick_first_series(df, "결제수단").astype(str)
     df["분류"] = "기타"
     df.loc[pay.str.startswith("카드", na=False), "분류"] = "카드"
     df.loc[pay.str.contains("현금영수증", na=False), "분류"] = "현금"
@@ -273,7 +302,8 @@ def parse_patient(raw):
     df["승인번호목록"] = [[] for _ in range(len(df))]
     mcol = next((c for c in ["결제메모", "승인번호", "메모"] if c in df.columns), None)
     if mcol:
-        df["승인번호목록"] = df[mcol].apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
+        memo = _pick_first_series(df, mcol)
+        df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
 
     df["p_idx"] = range(len(df))
     return df
@@ -718,13 +748,19 @@ if "done" not in st.session_state:
         f_d = st.file_uploader("📥 일일마감", type=["csv", "xlsx", "xls"], key="d")
     with c3:
         f_p = st.file_uploader("📥 차트마감", type=["csv", "xlsx", "xls"], key="p")
+        p_pw = st.text_input(
+            "🔐 차트 파일 비밀번호 (선택)",
+            type="password",
+            key="p_pw",
+            help="비워두면 비밀번호 없음 → 기본값(vsline99!!) 순서로 자동 시도합니다.",
+        )
 
     if f_h and f_d and f_p:
         if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
             with st.spinner("매칭 엔진 실행 중..."):
                 hansol = parse_hansol(load_file(f_h))
                 daily = parse_daily(load_file(f_d))
-                patient = parse_patient(load_file(f_p))
+                patient = parse_patient(load_file(f_p, password=p_pw))
                 if daily.empty:
                     st.error("일일마감 파일 파싱 실패")
                     st.stop()
