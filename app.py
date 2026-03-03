@@ -890,22 +890,33 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         h_total = tots["h_card"] + tots["h_cash"]
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        d_tot_no_plat = tots["d_tot"] - tots["d_plat"]
+        p_tot_no_plat = tots["p_tot"] - tots["p_plat"]
         summary_data = {
-            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], 0, h_total],
-            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
-            "한솔vs차트_차이": [
+            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계", "합계(플랫폼제외)"],
+            "한솔페이": [tots["h_card"], tots["h_cash"], 0, h_total, h_total],
+            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"], d_tot_no_plat],
+            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"], p_tot_no_plat],
+            "한솔vs차트_차이(플랫폼제외)": [
                 tots["h_card"] - tots["p_card"],
                 tots["h_cash"] - p_cash_xfer,
-                0,
-                h_total - tots["p_tot"],
+                "-",
+                "-",
+                h_total - p_tot_no_plat,
             ],
             "일마vs차트_차이": [
                 tots["d_card"] - tots["p_card"],
                 d_cash_xfer - p_cash_xfer,
                 tots["d_plat"] - tots["p_plat"],
                 tots["d_tot"] - tots["p_tot"],
+                d_tot_no_plat - p_tot_no_plat,
+            ],
+            "한솔vs일마_차이(플랫폼제외)": [
+                tots["h_card"] - tots["d_card"],
+                "-",
+                "-",
+                "-",
+                h_total - d_tot_no_plat,
             ],
         }
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
@@ -1045,19 +1056,27 @@ else:
         st.subheader("일자별 합계매칭")
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        h_total = tots["h_card"] + tots["h_cash"]
+        d_tot_no_plat = tots["d_tot"] - tots["d_plat"]
+        p_tot_no_plat = tots["p_tot"] - tots["p_plat"]
         sm = pd.DataFrame({
-            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], "-", tots["h_card"] + tots["h_cash"]],
-            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
+            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계", "합계(플랫폼제외)"],
+            "한솔페이": [tots["h_card"], tots["h_cash"], "-", tots["h_card"] + tots["h_cash"], h_total],
+            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"], d_tot_no_plat],
+            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"], p_tot_no_plat],
         })
 
         def _highlight_vs_chart(row):
-            """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경"""
+            """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경
+            '합계' 행에서 한솔페이는 플랫폼 미포함이므로 비교 스킵 (합계(플랫폼제외)에서 비교)"""
             styles = [""] * len(row)
             chart_val = row["차트마감"]
+            is_total_row = row["구분"] == "합계"
             for i, (col, val) in enumerate(row.items()):
                 if col in ("구분", "차트마감"):
+                    continue
+                # 합계 행에서 한솔페이는 플랫폼 미포함이므로 비교하지 않음
+                if is_total_row and col == "한솔페이":
                     continue
                 if str(val) == "-" or str(chart_val) == "-":
                     continue
@@ -1077,7 +1096,6 @@ else:
 
         # 구분별 차이 금액 정리
         st.markdown("#### 구분별 차이 금액")
-        h_total = tots["h_card"] + tots["h_cash"]
         diff_rows = []
         diff_rows.append({
             "구분": "카드",
@@ -1098,10 +1116,10 @@ else:
             "한솔 vs 일마": "-",
         })
         diff_rows.append({
-            "구분": "합계",
-            "한솔 vs 차트": f"{h_total - tots['p_tot']:+,}",
-            "일마 vs 차트": f"{tots['d_tot'] - tots['p_tot']:+,}",
-            "한솔 vs 일마": f"{h_total - tots['d_tot']:+,}",
+            "구분": "합계(플랫폼제외)",
+            "한솔 vs 차트": f"{h_total - p_tot_no_plat:+,}",
+            "일마 vs 차트": f"{d_tot_no_plat - p_tot_no_plat:+,}",
+            "한솔 vs 일마": f"{h_total - d_tot_no_plat:+,}",
         })
         diff_df = pd.DataFrame(diff_rows)
 
