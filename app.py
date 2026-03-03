@@ -374,6 +374,7 @@ def build_patient_compare(daily, patient):
     p_piv.rename(columns={"이름": "성명_차트"}, inplace=True)
 
     mg = d_agg.merge(p_piv, on="차트번호", how="outer", indicator=True)
+    mg["_merge"] = mg["_merge"].astype(str)  # Categorical → str (fillna 호환)
     mg["매칭"] = "✅일치"
     mg.loc[mg["_merge"] == "left_only", "매칭"] = "❌차트누락"
     mg.loc[mg["_merge"] == "right_only", "매칭"] = "❌일마누락"
@@ -394,7 +395,11 @@ def build_patient_compare(daily, patient):
                 used.add(j)
                 break
 
-    mg = mg.fillna(0)
+    # 숫자 컬럼만 fillna(0), 문자열 컬럼은 빈문자열
+    num_cols = mg.select_dtypes(include="number").columns
+    mg[num_cols] = mg[num_cols].fillna(0)
+    str_cols = mg.select_dtypes(include=["object", "string"]).columns
+    mg[str_cols] = mg[str_cols].fillna("")
     for pay in ["카드", "현금", "이체", "플랫폼"]:
         ic, pc = f"[일마]{pay}", f"[차트]{pay}"
         if ic in mg.columns and pc in mg.columns:
