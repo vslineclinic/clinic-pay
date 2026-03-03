@@ -465,146 +465,187 @@ def tax_risk(hansol, daily, patient, matched_h):
 st.title("📊 병원 정산 3-Way 대사 v2")
 st.caption("한솔페이 × 일일마감 × 차트마감 | 자동 매칭 → 의심건 즉시 탐지")
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    f_h = st.file_uploader("📥 한솔페이", type=["csv", "xlsx", "xls"], key="h")
-with c2:
-    f_d = st.file_uploader("📥 일일마감", type=["csv", "xlsx", "xls"], key="d")
-with c3:
-    f_p = st.file_uploader("📥 차트마감", type=["csv", "xlsx", "xls"], key="p")
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 2-Phase UI: 분석 전 → 파일업로드 / 분석 후 → 결과만 표시
+# (결과 화면에서 위젯 조작해도 절대 업로드 화면으로 안 돌아감)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-if f_h and f_d and f_p:
-    if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
-        with st.spinner("매칭 엔진 실행 중..."):
-            hansol = parse_hansol(load_file(f_h))
-            daily = parse_daily(load_file(f_d))
-            patient = parse_patient(load_file(f_p))
-            if daily.empty:
-                st.stop()
+if "done" not in st.session_state:
+    # ════════════════════════════════════════════
+    # Phase 1: 파일 업로드 + 분석 실행
+    # ════════════════════════════════════════════
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        f_h = st.file_uploader("📥 한솔페이", type=["csv", "xlsx", "xls"], key="h")
+    with c2:
+        f_d = st.file_uploader("📥 일일마감", type=["csv", "xlsx", "xls"], key="d")
+    with c3:
+        f_p = st.file_uploader("📥 차트마감", type=["csv", "xlsx", "xls"], key="p")
 
-            # 합계
-            h_ok = hansol[hansol["tx_status"] == "정상"]
-            tots = {
-                "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()),
-                "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()),
-                "d_card": int(daily["카드"].sum()),
-                "d_cash": int(daily["현금"].sum()),
-                "d_xfer": int(daily["이체"].sum()),
-                "d_plat": int(daily["플랫폼합"].sum()),
-                "d_tot": int(daily["총액"].sum()),
-                "p_card": int(patient[patient["분류"] == "카드"]["금액"].sum()),
-                "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
-                "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
-                "p_plat": int(patient[patient["분류"] == "플랫폼"]["금액"].sum()),
-                "p_tot": int(patient["금액"].sum()),
-            }
+    if f_h and f_d and f_p:
+        if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
+            with st.spinner("매칭 엔진 실행 중..."):
+                hansol = parse_hansol(load_file(f_h))
+                daily = parse_daily(load_file(f_d))
+                patient = parse_patient(load_file(f_p))
+                if daily.empty:
+                    st.error("일일마감 파일 파싱 실패")
+                    st.stop()
 
-            match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
-            pc = build_patient_compare(daily, patient)
-            tx = tax_risk(hansol, daily, patient, matched_h)
+                h_ok = hansol[hansol["tx_status"] == "정상"]
+                tots = {
+                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()),
+                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()),
+                    "d_card": int(daily["카드"].sum()),
+                    "d_cash": int(daily["현금"].sum()),
+                    "d_xfer": int(daily["이체"].sum()),
+                    "d_plat": int(daily["플랫폼합"].sum()),
+                    "d_tot": int(daily["총액"].sum()),
+                    "p_card": int(patient[patient["분류"] == "카드"]["금액"].sum()),
+                    "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
+                    "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
+                    "p_plat": int(patient[patient["분류"] == "플랫폼"]["금액"].sum()),
+                    "p_tot": int(patient["금액"].sum()),
+                }
 
-            h_um = h_ok[~h_ok["h_idx"].isin(matched_h)]
-            d_um = daily[(daily["카드"] > 0) & (~daily["d_idx"].isin(matched_dc))]
-            n_ok = len(h_ok)
-            n_m = len(matched_h)
-            rate = n_m / n_ok * 100 if n_ok else 0
+                match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
+                pc = build_patient_compare(daily, patient)
+                tx = tax_risk(hansol, daily, patient, matched_h)
 
-        # ── KPI ──
-        st.divider()
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("한솔 유효건", f"{n_ok}")
-        k2.metric("자동매칭", f"{n_m}", f"{rate:.0f}%")
-        k3.metric("한솔 미매칭", f"{len(h_um)}", delta_color="inverse")
-        k4.metric("일마 미매칭", f"{len(d_um)}", delta_color="inverse")
-        k5.metric("세무위험", f"{len(tx)}", delta_color="inverse")
+                h_um = h_ok[~h_ok["h_idx"].isin(matched_h)]
+                d_um = daily[(daily["카드"] > 0) & (~daily["d_idx"].isin(matched_dc))]
 
-        # ── 탭 ──
-        t0, t1, t2, t3, t4 = st.tabs([
-            "📋 합계 대사", "🚨 의심건", "💳 한솔↔일마", "📊 일마↔차트", "🔒 세무위험",
-        ])
+                # session_state에 저장
+                st.session_state["done"] = True
+                st.session_state["hansol"] = hansol
+                st.session_state["tots"] = tots
+                st.session_state["match_df"] = match_df
+                st.session_state["pc"] = pc
+                st.session_state["tx"] = tx
+                st.session_state["h_um"] = h_um
+                st.session_state["d_um"] = d_um
+                st.session_state["n_ok"] = len(h_ok)
+                st.session_state["n_m"] = len(matched_h)
 
-        with t0:
-            st.subheader("일자별 합계 대사")
-            sm = pd.DataFrame({
-                "구분": ["카드", "현금/영수증", "이체", "플랫폼", "합계"],
-                "한솔페이": [tots["h_card"], tots["h_cash"], "-", "-", tots["h_card"] + tots["h_cash"]],
-                "일일마감": [tots["d_card"], tots["d_cash"], tots["d_xfer"], tots["d_plat"], tots["d_tot"]],
-                "차트마감": [tots["p_card"], tots["p_cash"], tots["p_xfer"], tots["p_plat"], tots["p_tot"]],
-            })
-            st.dataframe(sm, use_container_width=True, hide_index=True)
+            st.rerun()  # 즉시 Phase 2로 전환
+    else:
+        st.info("👆 3개 파일을 모두 업로드해주세요.")
 
-            diffs = []
-            if tots["h_card"] != tots["d_card"]:
-                diffs.append(f"💳 한솔카드 ≠ 일마카드: 차이 {tots['h_card'] - tots['d_card']:,}")
-            if tots["d_plat"] != tots["p_plat"]:
-                diffs.append(f"📱 일마플랫폼 ≠ 차트플랫폼: 차이 {tots['d_plat'] - tots['p_plat']:,}")
-            if diffs:
-                st.warning("\n".join(diffs))
-            else:
-                st.success("✅ 주요 합계 일치")
-
-            rej = hansol[hansol["tx_status"] == "승인거절"]
-            can = hansol[hansol["tx_status"] == "취소"]
-            if len(rej) + len(can) > 0:
-                st.info(f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건 (유효건에서 제외)")
-
-        with t1:
-            st.subheader("🚨 즉시 확인 필요")
-            prio = []
-            if len(h_um):
-                prio.append(dict(순위="🔴P1", 항목="한솔 미매칭", 건수=len(h_um), 금액=f"{h_um['금액'].sum():,}"))
-            if len(d_um):
-                prio.append(dict(순위="🔴P1", 항목="일마 미매칭카드", 건수=len(d_um), 금액=f"{d_um['카드'].sum():,}"))
-            if not match_df.empty:
-                ml = match_df[match_df["확신도"].isin(["🟡MED", "🔴LOW"])]
-                if len(ml):
-                    prio.append(dict(순위="🟡P2", 항목="추정매칭(수동확인)", 건수=len(ml), 금액=f"{ml['한솔_금액'].sum():,}"))
-            if not pc.empty:
-                mm = pc[pc["불일치상세"] != "✅일치"]
-                if len(mm):
-                    prio.append(dict(순위="🟠P3", 항목="수단별 불일치", 건수=len(mm), 금액="-"))
-            if prio:
-                st.dataframe(pd.DataFrame(prio), use_container_width=True, hide_index=True)
-            else:
-                st.success("🎉 의심건 없음!")
-
-            if len(h_um):
-                st.markdown("#### ❌ 한솔 미매칭")
-                cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "is_현금"] if c in h_um.columns]
-                st.dataframe(h_um[cols], use_container_width=True, hide_index=True)
-            if len(d_um):
-                st.markdown("#### ❌ 일마 미매칭(카드)")
-                st.dataframe(d_um[["내원순서", "성명", "차트번호", "카드"]], use_container_width=True, hide_index=True)
-
-        with t2:
-            st.subheader("💳 한솔↔일마 매칭")
-            st.caption("🟢HIGH 자동확정 | 🟡MED 검토권장 | 🔴LOW 수동확인")
-            if not match_df.empty:
-                cf = st.multiselect("확신도", ["🟢HIGH", "🟡MED", "🔴LOW"], default=["🟢HIGH", "🟡MED", "🔴LOW"])
-                st.dataframe(match_df[match_df["확신도"].isin(cf)].sort_values("일마_순서"),
-                             use_container_width=True, hide_index=True)
-                st.markdown("##### 규칙별 통계")
-                st.dataframe(match_df.groupby("매칭규칙").agg(건수=("매칭규칙", "count"), 금액합=("한솔_금액", "sum")).reset_index(),
-                             use_container_width=True, hide_index=True)
-
-        with t3:
-            st.subheader("📊 일마↔차트 수단별")
-            if not pc.empty:
-                vw = st.radio("표시", ["불일치만", "전체"], horizontal=True)
-                disp = pc if vw == "전체" else pc[pc["불일치상세"] != "✅일치"]
-                cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
-                                    "[일마]카드", "[차트]카드", "[일마]현금", "[차트]현금",
-                                    "[일마]이체", "[차트]이체", "[일마]플랫폼", "[차트]플랫폼"] if c in disp.columns]
-                st.dataframe(disp[cols], use_container_width=True, hide_index=True)
-
-        with t4:
-            st.subheader("🔒 세무위험")
-            if not tx.empty:
-                st.dataframe(tx.sort_values("위험등급"), use_container_width=True, hide_index=True)
-                hi = tx[tx["위험등급"] == "🔴높음"]
-                if len(hi):
-                    st.error(f"⚠️ 고위험 {len(hi)}건 (합계 {hi['금액'].sum():,}원)")
-            else:
-                st.success("✅ 세무위험 없음")
 else:
-    st.info("👆 3개 파일을 모두 업로드해주세요.")
+    # ════════════════════════════════════════════
+    # Phase 2: 결과 표시 (파일 업로더 없음 → 위젯 안전)
+    # ════════════════════════════════════════════
+    hansol = st.session_state["hansol"]
+    tots = st.session_state["tots"]
+    match_df = st.session_state["match_df"]
+    pc = st.session_state["pc"]
+    tx = st.session_state["tx"]
+    h_um = st.session_state["h_um"]
+    d_um = st.session_state["d_um"]
+    n_ok = st.session_state["n_ok"]
+    n_m = st.session_state["n_m"]
+    rate = n_m / n_ok * 100 if n_ok else 0
+
+    # 다시 분석 버튼
+    if st.button("🔄 새 파일로 다시 분석하기"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+    # ── KPI ──
+    st.divider()
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("한솔 유효건", f"{n_ok}")
+    k2.metric("자동매칭", f"{n_m}", f"{rate:.0f}%")
+    k3.metric("한솔 미매칭", f"{len(h_um)}", delta_color="inverse")
+    k4.metric("일마 미매칭", f"{len(d_um)}", delta_color="inverse")
+    k5.metric("세무위험", f"{len(tx)}", delta_color="inverse")
+
+    # ── 탭 ──
+    t0, t1, t2, t3, t4 = st.tabs([
+        "📋 합계 대사", "🚨 의심건", "💳 한솔↔일마", "📊 일마↔차트", "🔒 세무위험",
+    ])
+
+    with t0:
+        st.subheader("일자별 합계 대사")
+        sm = pd.DataFrame({
+            "구분": ["카드", "현금/영수증", "이체", "플랫폼", "합계"],
+            "한솔페이": [tots["h_card"], tots["h_cash"], "-", "-", tots["h_card"] + tots["h_cash"]],
+            "일일마감": [tots["d_card"], tots["d_cash"], tots["d_xfer"], tots["d_plat"], tots["d_tot"]],
+            "차트마감": [tots["p_card"], tots["p_cash"], tots["p_xfer"], tots["p_plat"], tots["p_tot"]],
+        })
+        st.dataframe(sm, use_container_width=True, hide_index=True)
+
+        diffs = []
+        if tots["h_card"] != tots["d_card"]:
+            diffs.append(f"💳 한솔카드 ≠ 일마카드: 차이 {tots['h_card'] - tots['d_card']:,}")
+        if tots["d_plat"] != tots["p_plat"]:
+            diffs.append(f"📱 일마플랫폼 ≠ 차트플랫폼: 차이 {tots['d_plat'] - tots['p_plat']:,}")
+        if diffs:
+            st.warning("\n".join(diffs))
+        else:
+            st.success("✅ 주요 합계 일치")
+
+        rej = hansol[hansol["tx_status"] == "승인거절"]
+        can = hansol[hansol["tx_status"] == "취소"]
+        if len(rej) + len(can) > 0:
+            st.info(f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건 (유효건에서 제외)")
+
+    with t1:
+        st.subheader("🚨 즉시 확인 필요")
+        prio = []
+        if len(h_um):
+            prio.append(dict(순위="🔴P1", 항목="한솔 미매칭", 건수=len(h_um), 금액=f"{h_um['금액'].sum():,}"))
+        if len(d_um):
+            prio.append(dict(순위="🔴P1", 항목="일마 미매칭카드", 건수=len(d_um), 금액=f"{d_um['카드'].sum():,}"))
+        if not match_df.empty:
+            ml = match_df[match_df["확신도"].isin(["🟡MED", "🔴LOW"])]
+            if len(ml):
+                prio.append(dict(순위="🟡P2", 항목="추정매칭(수동확인)", 건수=len(ml), 금액=f"{ml['한솔_금액'].sum():,}"))
+        if not pc.empty:
+            mm = pc[pc["불일치상세"] != "✅일치"]
+            if len(mm):
+                prio.append(dict(순위="🟠P3", 항목="수단별 불일치", 건수=len(mm), 금액="-"))
+        if prio:
+            st.dataframe(pd.DataFrame(prio), use_container_width=True, hide_index=True)
+        else:
+            st.success("🎉 의심건 없음!")
+
+        if len(h_um):
+            st.markdown("#### ❌ 한솔 미매칭")
+            cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "is_현금"] if c in h_um.columns]
+            st.dataframe(h_um[cols], use_container_width=True, hide_index=True)
+        if len(d_um):
+            st.markdown("#### ❌ 일마 미매칭(카드)")
+            st.dataframe(d_um[["내원순서", "성명", "차트번호", "카드"]], use_container_width=True, hide_index=True)
+
+    with t2:
+        st.subheader("💳 한솔↔일마 매칭")
+        st.caption("🟢HIGH 자동확정 | 🟡MED 검토권장 | 🔴LOW 수동확인")
+        if not match_df.empty:
+            cf = st.multiselect("확신도", ["🟢HIGH", "🟡MED", "🔴LOW"], default=["🟢HIGH", "🟡MED", "🔴LOW"])
+            st.dataframe(match_df[match_df["확신도"].isin(cf)].sort_values("일마_순서"),
+                         use_container_width=True, hide_index=True)
+            st.markdown("##### 규칙별 통계")
+            st.dataframe(match_df.groupby("매칭규칙").agg(건수=("매칭규칙", "count"), 금액합=("한솔_금액", "sum")).reset_index(),
+                         use_container_width=True, hide_index=True)
+
+    with t3:
+        st.subheader("📊 일마↔차트 수단별")
+        if not pc.empty:
+            vw = st.radio("표시", ["불일치만", "전체"], horizontal=True)
+            disp = pc if vw == "전체" else pc[pc["불일치상세"] != "✅일치"]
+            cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
+                                "[일마]카드", "[차트]카드", "[일마]현금", "[차트]현금",
+                                "[일마]이체", "[차트]이체", "[일마]플랫폼", "[차트]플랫폼"] if c in disp.columns]
+            st.dataframe(disp[cols], use_container_width=True, hide_index=True)
+
+    with t4:
+        st.subheader("🔒 세무위험")
+        if not tx.empty:
+            st.dataframe(tx.sort_values("위험등급"), use_container_width=True, hide_index=True)
+            hi = tx[tx["위험등급"] == "🔴높음"]
+            if len(hi):
+                st.error(f"⚠️ 고위험 {len(hi)}건 (합계 {hi['금액'].sum():,}원)")
+        else:
+            st.success("✅ 세무위험 없음")
