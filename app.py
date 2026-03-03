@@ -19,6 +19,7 @@ v1 대비 주요 개선:
 import importlib
 import io
 import re
+from datetime import datetime
 from itertools import combinations
 
 import numpy as np
@@ -767,6 +768,153 @@ def tax_risk(hansol, daily, patient, matched_h):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AI용 통합 엑셀 생성
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
+                          missing_all, missing_only, pc, tx, tots,
+                          h_um, d_um, matched_h):
+    """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성"""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+
+        # ── Sheet 1: AI_안내 (시스템 개요 + 데이터 사전) ──
+        guide_rows = [
+            ["[시스템 개요]", ""],
+            ["시스템명", "병원 정산 3-Way 대사 시스템 v2.1"],
+            ["목적", "한솔페이(PG사) × 일일마감(프론트) × 차트마감(EMR) 교차 검증으로 의심거래 탐지"],
+            ["분석일시", datetime.now().strftime("%Y-%m-%d %H:%M")],
+            ["", ""],
+            ["[데이터 출처 설명]", ""],
+            ["한솔페이(Sheet: 1_한솔페이)", "PG사(결제대행사)에서 실제 승인/취소된 카드·현금영수증 거래 원본. 금액·시간·승인번호·카드사 포함."],
+            ["일일마감(Sheet: 2_일일마감)", "병원 프론트에서 작성하는 일일 환자별 수납 기록. 차트번호·성명·결제수단별 금액 포함."],
+            ["차트마감(Sheet: 3_차트마감)", "EMR(전자의무기록)의 환자별 결제 집계. 차트번호·이름·결제수단·금액·본부금 포함."],
+            ["", ""],
+            ["[핵심 시트 설명]", ""],
+            ["4_매칭결과", "한솔페이↔일일마감 자동 매칭 결과. 매칭규칙·확신도(HIGH/MED/LOW) 포함. 확신도가 낮을수록 수동 확인 필요."],
+            ["5_한솔미매칭", "한솔페이에 정상 승인되었으나 일일마감과 매칭되지 않은 건. 누락·오류 가능성 높음."],
+            ["6_일마미매칭", "일일마감에 카드 수납이 있으나 한솔페이와 매칭되지 않은 건."],
+            ["7_한솔vs차트_누락추정", "한솔페이↔차트마감 간 금액 비교. 매칭없음/금액부족/초과매칭 등 상태 표시."],
+            ["8_일마vs차트_수단별비교", "일일마감↔차트마감 결제수단별 금액 비교. 불일치 상세 포함."],
+            ["9_세무위험", "자동 탐지된 세무 위험 항목. 과소신고·차트번호불일치·취소거래 등. 위험등급(높음/중간) 포함."],
+            ["10_합계비교", "3개 데이터 소스의 결제수단별 합계 교차 비교."],
+            ["", ""],
+            ["[의심거래 판단 기준 (AI 분석 시 참고)]", ""],
+            ["과소신고 위험(높음)", "한솔페이에 정상 승인되었으나 차트에 미반영된 건 → 매출 누락 가능성"],
+            ["차트번호 불일치(중간)", "일마/차트 간 동일 환자이나 차트번호가 다른 경우 → 이중 차트 또는 입력 오류"],
+            ["취소거래 확인(중간)", "한솔페이에 취소 기록 → 정상 환불 여부 확인 필요"],
+            ["한솔 미매칭(높음)", "PG사에 기록 있으나 병원 장부에 없음 → 수납 누락 또는 현금 전환 의심"],
+            ["금액 불일치(중간)", "같은 환자의 결제수단별 금액이 소스 간 다름 → 수납 오류 또는 조작 가능성"],
+            ["분할결제 패턴(참고)", "동일 시간대 2~3건 소액 분할 → 의도적 분할 여부 확인"],
+            ["", ""],
+            ["[누적 분석 시 AI 활용 가이드]", ""],
+            ["활용법", "이 파일을 여러 일자 분석 결과와 함께 AI에 업로드하여 패턴을 분석하세요."],
+            ["누적 패턴 탐지", "특정 환자/차트번호가 반복적으로 미매칭되거나, 특정 시간대에 취소가 집중되는 패턴을 확인하세요."],
+            ["프롬프트 예시", "이 엑셀 파일들은 병원 정산 3-Way 대사 결과입니다. 각 파일의 '9_세무위험' 시트와 '5_한솔미매칭' 시트를 분석하여 반복되는 의심 패턴을 찾아주세요."],
+        ]
+        guide_df = pd.DataFrame(guide_rows, columns=["항목", "설명"])
+        guide_df.to_excel(writer, sheet_name="0_AI안내_데이터사전", index=False)
+
+        # ── Sheet 2: 한솔페이 원본 ──
+        h_export = hansol.copy()
+        h_cols = [c for c in ["h_idx", "금액", "시간표시", "tx_status", "카드사",
+                               "승인번호", "카드번호", "is_현금"] if c in h_export.columns]
+        h_export = h_export[h_cols].rename(columns={
+            "h_idx": "순번", "tx_status": "거래상태", "is_현금": "현금여부"
+        })
+        h_export.to_excel(writer, sheet_name="1_한솔페이", index=False)
+
+        # ── Sheet 3: 일일마감 원본 ──
+        d_export = daily.copy()
+        d_cols = [c for c in ["d_idx", "내원순서", "차트번호", "성명", "카드", "현금",
+                               "이체", "여신티켓", "강남언니", "나만의닥터", "제로페이",
+                               "기타지역화폐", "플랫폼합", "총액"] if c in d_export.columns]
+        d_export = d_export[d_cols].rename(columns={"d_idx": "순번"})
+        d_export.to_excel(writer, sheet_name="2_일일마감", index=False)
+
+        # ── Sheet 4: 차트마감 원본 ──
+        p_export = patient.copy()
+        p_cols = [c for c in ["p_idx", "차트번호", "이름", "분류", "금액", "카드사",
+                               "본부금", "승인번호목록"] if c in p_export.columns]
+        p_export = p_export[p_cols].rename(columns={"p_idx": "순번"})
+        p_export.to_excel(writer, sheet_name="3_차트마감", index=False)
+
+        # ── Sheet 5: 매칭결과 ──
+        if not match_df.empty:
+            m_export = match_df.copy()
+            m_export.to_excel(writer, sheet_name="4_매칭결과", index=False)
+
+        # ── Sheet 6: 한솔 미매칭 ──
+        if not h_um.empty:
+            h_um_export = h_um.copy()
+            h_um_cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호",
+                                      "is_현금", "카드사"] if c in h_um_export.columns]
+            h_um_export = h_um_export[h_um_cols]
+            h_um_export.to_excel(writer, sheet_name="5_한솔미매칭", index=False)
+        else:
+            pd.DataFrame({"상태": ["한솔 미매칭 건 없음"]}).to_excel(
+                writer, sheet_name="5_한솔미매칭", index=False)
+
+        # ── Sheet 7: 일마 미매칭 ──
+        if not d_um.empty:
+            d_um_export = d_um[["내원순서", "성명", "차트번호", "카드"]].copy()
+            d_um_export.to_excel(writer, sheet_name="6_일마미매칭", index=False)
+        else:
+            pd.DataFrame({"상태": ["일마 미매칭 건 없음"]}).to_excel(
+                writer, sheet_name="6_일마미매칭", index=False)
+
+        # ── Sheet 8: 한솔↔차트 누락추정 ──
+        if not missing_all.empty:
+            miss_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
+                                      "차트카드건수", "한솔매칭금액", "한솔매칭건수",
+                                      "일마카드금액", "차이(차트-한솔)"] if c in missing_all.columns]
+            missing_all[miss_cols].to_excel(writer, sheet_name="7_한솔vs차트_누락추정", index=False)
+
+        # ── Sheet 9: 일마↔차트 수단별 비교 ──
+        if not pc.empty:
+            pc_cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
+                                    "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
+                                    "[일마]현금+이체", "[차트]현금+이체",
+                                    "[일마]플랫폼", "[차트]플랫폼"] if c in pc.columns]
+            pc[pc_cols].to_excel(writer, sheet_name="8_일마vs차트_수단별비교", index=False)
+
+        # ── Sheet 10: 세무위험 ──
+        if not tx.empty:
+            tx.to_excel(writer, sheet_name="9_세무위험", index=False)
+        else:
+            pd.DataFrame({"상태": ["세무위험 탐지 건 없음"]}).to_excel(
+                writer, sheet_name="9_세무위험", index=False)
+
+        # ── Sheet 11: 합계비교 ──
+        h_total = tots["h_card"] + tots["h_cash"]
+        d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
+        p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        summary_data = {
+            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
+            "한솔페이": [tots["h_card"], tots["h_cash"], 0, h_total],
+            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
+            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
+            "한솔vs차트_차이": [
+                tots["h_card"] - tots["p_card"],
+                tots["h_cash"] - p_cash_xfer,
+                0,
+                h_total - tots["p_tot"],
+            ],
+            "일마vs차트_차이": [
+                tots["d_card"] - tots["p_card"],
+                d_cash_xfer - p_cash_xfer,
+                tots["d_plat"] - tots["p_plat"],
+                tots["d_tot"] - tots["p_tot"],
+            ],
+        }
+        pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -889,8 +1037,8 @@ else:
     k6.metric("누락추정", f"{len(missing_only)}", delta_color="inverse")
 
     # ── 탭 ──
-    t0, t1, t2, t2b, t3, t4, t5 = st.tabs([
-        "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험", "📝 메신저 요약",
+    t0, t1, t2, t2b, t3, t4, t5, t6 = st.tabs([
+        "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험", "📝 메신저 요약", "🤖 AI 통합 다운로드",
     ])
 
     with t0:
@@ -1159,3 +1307,73 @@ else:
 
         if not type_col:
             st.warning("⚠️ 일일마감 데이터에서 신환/구환 구분 컬럼을 찾지 못했습니다. 신환/구환 수치는 수동으로 입력해주세요.")
+
+    with t6:
+        st.subheader("🤖 AI 분석용 통합 파일 다운로드")
+        st.caption("한솔페이 + 일일마감 + 차트마감 + 분석결과를 하나의 엑셀 파일로 통합합니다.")
+
+        st.markdown("""
+**사용법:** 다운로드한 엑셀 파일을 ChatGPT / Gemini / Claude 등에 업로드하고 아래 프롬프트를 사용하세요.
+
+---
+
+**권장 프롬프트 (복사해서 사용):**
+
+> 첨부된 엑셀 파일은 병원 정산 3-Way 대사(한솔페이 PG사 × 일일마감 × 차트마감) 분석 결과입니다.
+> '0_AI안내_데이터사전' 시트를 먼저 읽고 데이터 구조를 파악한 후,
+> 아래 항목을 분석해주세요:
+>
+> 1. '5_한솔미매칭' 시트에서 미매칭 건의 패턴 (시간대, 금액대, 카드사 집중 여부)
+> 2. '9_세무위험' 시트의 고위험 건 상세 분석
+> 3. '7_한솔vs차트_누락추정' 시트에서 누락/금액부족 건 분석
+> 4. 전체 데이터에서 의심거래 패턴 종합 의견
+>
+> 여러 날짜의 파일이 있다면 누적 패턴도 분석해주세요.
+
+---
+
+**누적 분석 팁:** 여러 날짜의 파일을 한꺼번에 AI에 올리면 반복 패턴(동일 차트번호 반복 미매칭, 특정 시간대 취소 집중 등)을 탐지할 수 있습니다.
+        """)
+
+        h_ok = hansol[hansol["tx_status"] == "정상"]
+        excel_data = build_ai_merged_excel(
+            hansol=hansol, daily=daily, patient=patient,
+            match_df=match_df, hc_compare=hc_compare,
+            missing_all=missing_all, missing_only=missing_only,
+            pc=pc, tx=tx, tots=tots,
+            h_um=h_um, d_um=d_um, matched_h=set(match_df["한솔_idx"].tolist()) if not match_df.empty and "한솔_idx" in match_df.columns else set(),
+        )
+        today_str = datetime.now().strftime("%Y%m%d")
+        st.download_button(
+            label="📥 AI 통합 엑셀 다운로드",
+            data=excel_data,
+            file_name=f"정산대사_AI통합_{today_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+
+        # 파일 내용 미리보기
+        st.markdown("#### 📑 포함 시트 목록")
+        preview_data = {
+            "시트명": [
+                "0_AI안내_데이터사전", "1_한솔페이", "2_일일마감", "3_차트마감",
+                "4_매칭결과", "5_한솔미매칭", "6_일마미매칭",
+                "7_한솔vs차트_누락추정", "8_일마vs차트_수단별비교",
+                "9_세무위험", "10_합계비교",
+            ],
+            "설명": [
+                "AI가 데이터를 이해하기 위한 안내 및 용어 사전",
+                f"PG사 거래 원본 ({len(hansol)}건)",
+                f"프론트 일일마감 ({len(daily)}건)",
+                f"EMR 차트마감 ({len(patient)}건)",
+                f"한솔↔일마 자동매칭 ({len(match_df)}건)",
+                f"한솔 미매칭 ({len(h_um)}건)",
+                f"일마 미매칭 ({len(d_um)}건)",
+                f"한솔↔차트 누락추정 ({len(missing_all)}건)",
+                f"일마↔차트 수단별 비교 ({len(pc)}건)",
+                f"세무위험 ({len(tx)}건)",
+                "3개 소스 합계 교차비교",
+            ],
+        }
+        st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True)
