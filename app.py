@@ -84,7 +84,15 @@ def parse_hansol_time(df):
         parsed = pd.to_datetime(df[chosen], errors="coerce")
     else:
         parsed = pd.Series(pd.NaT, index=df.index)
-    return parsed.fillna(pd.Timestamp("1970-01-01") + pd.to_timedelta(df.index, unit="m"))
+
+    # NOTE:
+    # - pandas 2.x does not allow fillna(value=DatetimeIndex) and raises TypeError.
+    # - Build a fallback Series with the same index and use combine_first instead.
+    fallback = pd.Series(
+        pd.Timestamp("1970-01-01") + pd.to_timedelta(np.arange(len(df)), unit="m"),
+        index=df.index,
+    )
+    return parsed.combine_first(fallback)
 
 
 def build_priority_table(match_df, unmatched_h, unmatched_d, final_merge):
