@@ -77,7 +77,49 @@ def similar_chart_no(left, right):
     return any(longer[:i] + longer[i + 1 :] == shorter for i in range(len(longer)))
 
 
+def _parse_flexible_datetime(series):
+    parsed = pd.to_datetime(series, errors="coerce")
+
+    cleaned = series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    digits = cleaned.str.replace(r"\D", "", regex=True)
+
+    format_map = {
+        14: "%Y%m%d%H%M%S",
+        12: "%Y%m%d%H%M",
+        8: "%Y%m%d",
+    }
+    for length, dt_format in format_map.items():
+        mask = (parsed.isna()) & (digits.str.len() == length)
+        if mask.any():
+            parsed.loc[mask] = pd.to_datetime(digits.loc[mask], format=dt_format, errors="coerce")
+
+    return parsed
+
+
 def parse_hansol_time(df):
+    datetime_candidates = ["승인일시", "거래일시", "일시", "거래시간", "승인시간"]
+    date_candidates = ["승인일자", "거래일자", "일자", "거래일", "승인일"]
+
+    chosen_dt = next((c for c in datetime_candidates if c in df.columns), None)
+    parsed = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    if chosen_dt:
+        parsed = _parse_flexible_datetime(df[chosen_dt])
+
+    if parsed.isna().all():
+        date_col = next((c for c in date_candidates if c in df.columns), None)
+        time_col = next((c for c in ["승인시간", "거래시간", "시간"] if c in df.columns), None)
+        if date_col and time_col:
+            date_digits = df[date_col].astype(str).str.replace(r"\D", "", regex=True).str[:8]
+            time_digits = (
+                df[time_col]
+                .astype(str)
+                .str.replace(r"\.0$", "", regex=True)
+                .str.replace(r"\D", "", regex=True)
+                .str.zfill(6)
+                .str[-6:]
+            )
+            parsed = pd.to_datetime(date_digits + time_digits, format="%Y%m%d%H%M%S", errors="coerce")
+
     time_candidates = ["승인일시", "거래일시", "일시", "거래시간", "승인시간"]
     chosen = next((c for c in time_candidates if c in df.columns), None)
     if chosen:
@@ -154,7 +196,7 @@ if file_hansol and file_daily and file_patient:
 
             df_d["차트번호"] = df_d["차트번호"].apply(clean_no)
             df_d["성명"] = df_d["성명"].apply(clean_name)
-            df_d["일마순번"] = np.arange(len(df_d))
+            df_d["일마순번"] = np.arange(1, len(df_d) + 1)
 
             for col in ["카드", "현금", "이체", "강남언니", "여신티켓", "기타-지역화폐", "나만의닥터"]:
                 if col in df_d.columns:
