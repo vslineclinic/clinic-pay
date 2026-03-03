@@ -1,5 +1,5 @@
 """
-병원 정산 3-Way 대사 시스템 v2.0
+병원 정산 3-Way 대사 시스템 v2.1
 한솔페이 × 일일마감 × 차트마감(환자별집계) 자동 매칭 + 의심건 즉시 탐지
 
 v1 대비 주요 개선:
@@ -11,6 +11,9 @@ v1 대비 주요 개선:
   6. 일자 합계 대사 선행 (전체 균형부터 확인)
   7. 환자별집계 결제수단 정밀분류 (카드/현금영수증/통장입금/기타 구분)
   8. 세무위험 자동 탐지 (과소·과다 신고 + 차트번호 불일치)
+  9. 본부금(진료비) 차트 금액 통합 – 6,900원 등 본부금 수납 반영
+  10. 카드사 정보 매칭 – 결제수단/매입사 카드사명으로 정밀 매칭
+  11. 본부금 기반 분할결제 탐지 – 본부금 힌트로 2건 분할 정밀 매칭
 """
 
 import re
@@ -47,6 +50,19 @@ def clean_name(x):
     if pd.isna(x):
         return ""
     return re.sub(r"[\s\-\*]", "", str(x)).strip()
+
+
+def _extract_card_company(pay_str):
+    """결제수단 문자열에서 카드사명 추출 ('카드-삼성카드' → '삼성')"""
+    if pd.isna(pay_str):
+        return ""
+    s = str(pay_str).strip()
+    m = re.match(r"카드[\s\-\:\(\[]*(.+?)[\)\]\s]*$", s)
+    if not m:
+        return ""
+    name = m.group(1).strip()
+    name = re.sub(r"카드$", "", name).strip()
+    return name
 
 
 def similar_chart_no(a, b):
@@ -119,6 +135,13 @@ def parse_hansol(raw):
 
     # K/S: K=현금영수증, S=카드 → 모두 유지 (is_현금으로 구분)
 
+    # 카드사 정보 추출
+    card_co_col = next((c for c in ["매입사", "카드사", "발급사", "카드종류"] if c in df.columns), None)
+    df["카드사"] = ""
+    if card_co_col:
+        df["카드사"] = df[card_co_col].astype(str).str.replace("nan", "").str.strip()
+        df["카드사"] = df["카드사"].apply(lambda x: re.sub(r"카드$", "", x).strip() if x else "")
+
     df["h_idx"] = range(len(df))
     return df
 
@@ -189,9 +212,12 @@ def parse_patient(raw):
     df["이름"] = df["이름"].apply(clean_name)
 
     amt_cols = [c for c in ["비급여(과세총금액)", "비급여(비과세)"] if c in df.columns]
-    for c in amt_cols:
+    copay_cols = [c for c in df.columns if "본부금" in str(c) or "본인부담" in str(c)]
+    all_amt_cols = amt_cols + copay_cols
+    for c in all_amt_cols:
         df[c] = df[c].apply(clean_money)
-    df["금액"] = df[amt_cols].sum(axis=1) if amt_cols else 0
+    df["본부금"] = df[copay_cols].sum(axis=1) if copay_cols else 0
+    df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
 
     # 결제수단 정밀분류
     pay = df.get("결제수단", pd.Series(dtype=str)).astype(str)
@@ -200,6 +226,12 @@ def parse_patient(raw):
     df.loc[pay.str.contains("현금영수증", na=False), "분류"] = "현금"
     df.loc[(pay == "통장입금") | pay.str.contains("이체", na=False), "분류"] = "이체"
     df.loc[pay.str.startswith("기타"), "분류"] = "플랫폼"
+
+    # 카드사 추출
+    df["카드사"] = ""
+    card_mask = df["분류"] == "카드"
+    if card_mask.any():
+        df.loc[card_mask, "카드사"] = pay[card_mask].apply(_extract_card_company)
 
     # 승인번호 추출
     df["승인번호목록"] = [[] for _ in range(len(df))]
@@ -218,11 +250,13 @@ def parse_patient(raw):
 
 def run_matching(hansol, daily, patient):
     """
-    5-Pass 매칭:
+    7-Pass 매칭:
       P1: 승인번호 직접매칭
       P2: 유일 금액 1:1
+      P2b: 카드사+금액 (동일금액 다건 → 카드사 구분)
       P3: 분할결제 2~3건 합 (시간근접)
-      P4: 시간-순서 상관 (동일금액 다건)
+      P3b: 본부금 기반 분할결제 (차트 본부금 힌트)
+      P4: 시간-순서 상관 (동일금액 다건, 카드사 우선)
       P5: 현금영수증 + 이체
     """
     h_ok = hansol[hansol["tx_status"] == "정상"]
@@ -240,6 +274,7 @@ def run_matching(hansol, daily, patient):
                 매칭규칙=rule, 확신도=conf,
                 한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(hr["금액"]),
                 한솔_카드번호=str(hr.get("카드번호", ""))[:12],
+                한솔_카드사=str(hr.get("카드사", "")),
                 한솔_유형="현금" if hr["is_현금"] else "카드",
                 일마_순서=d_row["내원순서"], 일마_성명=d_row["성명"],
                 일마_차트=d_row["차트번호"], 일마_카드=int(d_row["카드"]),
@@ -252,6 +287,17 @@ def run_matching(hansol, daily, patient):
     for _, pr in patient.iterrows():
         for a in pr["승인번호목록"]:
             appr_map[clean_no(a)] = pr["차트번호"]
+
+    # 차트→본부금/카드사 맵
+    chart_info = {}
+    for _, pr in patient.iterrows():
+        ch = pr["차트번호"]
+        if ch not in chart_info:
+            chart_info[ch] = {"본부금": 0, "카드사_list": []}
+        chart_info[ch]["본부금"] += int(pr.get("본부금", 0))
+        card_co = str(pr.get("카드사", "")).strip()
+        if card_co and card_co not in chart_info[ch]["카드사_list"]:
+            chart_info[ch]["카드사_list"].append(card_co)
 
     # P1
     if appr_map:
@@ -275,6 +321,26 @@ def run_matching(hansol, daily, patient):
         if len(hc) == 1 and len(ds) == 1:
             add("P2_유일금액", "🟢HIGH", [hc.iloc[0]["h_idx"]], dr)
 
+    # P2b - 카드사+금액 매칭 (동일금액 다건 → 카드사로 구분)
+    for _, dr in d_card.iterrows():
+        if dr["d_idx"] in matched_dc:
+            continue
+        amt = dr["카드"]
+        ci = chart_info.get(dr["차트번호"], {})
+        card_cos = ci.get("카드사_list", [])
+        if not card_cos:
+            continue
+        hc = h_card[(h_card["금액"] == amt) & (~h_card["h_idx"].isin(matched_h))]
+        if len(hc) < 1:
+            continue
+        for card_co in card_cos:
+            if not card_co:
+                continue
+            hc_match = hc[hc["카드사"].str.contains(card_co, na=False, case=False)]
+            if len(hc_match) == 1:
+                add("P2b_카드사+금액", "🟢HIGH", [hc_match.iloc[0]["h_idx"]], dr)
+                break
+
     # P3
     for _, dr in d_card.iterrows():
         if dr["d_idx"] in matched_dc:
@@ -295,6 +361,33 @@ def run_matching(hansol, daily, patient):
                         add(f"P3_분할{r}건", "🟢HIGH" if spread <= 5 else "🟡MED", idxs, dr)
                         found = True
                         break
+
+    # P3b - 본부금 기반 분할결제 (차트 본부금 정보로 정밀 분할 탐지)
+    for _, dr in d_card.iterrows():
+        if dr["d_idx"] in matched_dc:
+            continue
+        target = dr["카드"]
+        ci = chart_info.get(dr["차트번호"], {})
+        copay = ci.get("본부금", 0)
+        if copay <= 0 or copay >= target:
+            continue
+        main_amt = target - copay
+        avail = h_card[~h_card["h_idx"].isin(matched_h)]
+        h_main = avail[avail["금액"] == main_amt]
+        h_copay = avail[avail["금액"] == copay]
+        if h_main.empty or h_copay.empty:
+            continue
+        best_pair, best_spread = None, 999
+        for _, hm in h_main.iterrows():
+            for _, hcp in h_copay.iterrows():
+                if hm["h_idx"] == hcp["h_idx"]:
+                    continue
+                spread = abs(hm["시간_분"] - hcp["시간_분"])
+                if spread < best_spread:
+                    best_spread = spread
+                    best_pair = (int(hm["h_idx"]), int(hcp["h_idx"]))
+        if best_pair and best_spread <= 15:
+            add("P3b_본부금분할", "🟢HIGH" if best_spread <= 5 else "🟡MED", list(best_pair), dr)
 
     # P4
     confirmed = [(r["한솔_시간"], r["일마_순서"]) for r in results if r["확신도"] == "🟢HIGH" and r["한솔_시간"]]
@@ -325,7 +418,19 @@ def run_matching(hansol, daily, patient):
             else:
                 exp = do * 5
 
-            best = hc.iloc[(hc["시간_분"] - exp).abs().argsort()[:1]]
+            # 카드사 정보로 후보 축소
+            ci = chart_info.get(dr["차트번호"], {})
+            card_cos = ci.get("카드사_list", [])
+            hc_filtered = hc
+            if card_cos and len(hc) > 1:
+                for card_co in card_cos:
+                    if not card_co:
+                        continue
+                    hc_co = hc[hc["카드사"].str.contains(card_co, na=False, case=False)]
+                    if not hc_co.empty:
+                        hc_filtered = hc_co
+                        break
+            best = hc_filtered.iloc[(hc_filtered["시간_분"] - exp).abs().argsort()[:1]]
             diff_m = abs(best.iloc[0]["시간_분"] - exp)
             add("P4_순서추정", "🟡MED" if diff_m <= 30 else "🔴LOW", [best.iloc[0]["h_idx"]], dr)
 
@@ -341,7 +446,9 @@ def run_matching(hansol, daily, patient):
                 results.append(dict(
                     매칭규칙=rule_tag, 확신도="🟢HIGH" if len(hc) == 1 else "🟡MED",
                     한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(amt),
-                    한솔_카드번호=str(hr.get("카드번호", "")), 한솔_유형="현금영수증",
+                    한솔_카드번호=str(hr.get("카드번호", "")),
+                    한솔_카드사="",
+                    한솔_유형="현금영수증",
                     일마_순서=dr["내원순서"], 일마_성명=dr["성명"],
                     일마_차트=dr["차트번호"], 일마_카드=int(dr["카드"]),
                 ))
@@ -372,6 +479,13 @@ def build_patient_compare(daily, patient):
             p_piv[c] = 0
     p_piv["[차트]합계"] = p_piv[[c for c in p_piv.columns if c.startswith("[차트]")]].sum(axis=1)
     p_piv.rename(columns={"이름": "성명_차트"}, inplace=True)
+
+    # 본부금 참고 컬럼 추가
+    if "본부금" in patient.columns:
+        p_copay = patient.groupby(["차트번호", "이름"])["본부금"].sum().reset_index()
+        p_copay.rename(columns={"이름": "성명_차트", "본부금": "[차트]본부금(참고)"}, inplace=True)
+        p_piv = p_piv.merge(p_copay, on=["차트번호", "성명_차트"], how="left")
+        p_piv["[차트]본부금(참고)"] = p_piv["[차트]본부금(참고)"].fillna(0)
 
     mg = d_agg.merge(p_piv, on="차트번호", how="outer", indicator=True)
     mg["_merge"] = mg["_merge"].astype(str)  # Categorical → str (fillna 호환)
@@ -462,7 +576,7 @@ def tax_risk(hansol, daily, patient, matched_h):
 # UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-st.title("📊 병원 정산 3-Way 대사 v2")
+st.title("📊 병원 정산 3-Way 대사 v2.1")
 st.caption("한솔페이 × 일일마감 × 차트마감 | 자동 매칭 → 의심건 즉시 탐지")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -636,7 +750,8 @@ else:
             vw = st.radio("표시", ["불일치만", "전체"], horizontal=True)
             disp = pc if vw == "전체" else pc[pc["불일치상세"] != "✅일치"]
             cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
-                                "[일마]카드", "[차트]카드", "[일마]현금", "[차트]현금",
+                                "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
+                                "[일마]현금", "[차트]현금",
                                 "[일마]이체", "[차트]이체", "[일마]플랫폼", "[차트]플랫폼"] if c in disp.columns]
             st.dataframe(disp[cols], use_container_width=True, hide_index=True)
 
