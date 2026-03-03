@@ -251,12 +251,15 @@ def parse_patient(raw):
     df["본부금"] = df[copay_cols].sum(axis=1) if copay_cols else 0
     df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
 
+    def _pick_first_series(frame, col):
+        """중복 컬럼명이 있는 경우 첫 번째 컬럼만 Series로 반환"""
+        if col not in frame.columns:
+            return pd.Series(index=frame.index, dtype=object)
+        data = frame.loc[:, col]
+        return data.iloc[:, 0] if isinstance(data, pd.DataFrame) else data
+
     # 결제수단 정밀분류
-    pay_col = df.loc[:, "결제수단"] if "결제수단" in df.columns else pd.Series(dtype=str)
-    if isinstance(pay_col, pd.DataFrame):
-        # 동일 컬럼명이 중복되면 DataFrame이 반환되어 loc 마스킹 시 TypeError가 발생할 수 있음
-        pay_col = pay_col.iloc[:, 0]
-    pay = pay_col.astype(str)
+    pay = _pick_first_series(df, "결제수단").astype(str)
     df["분류"] = "기타"
     df.loc[pay.str.startswith("카드", na=False), "분류"] = "카드"
     df.loc[pay.str.contains("현금영수증", na=False), "분류"] = "현금"
@@ -273,7 +276,8 @@ def parse_patient(raw):
     df["승인번호목록"] = [[] for _ in range(len(df))]
     mcol = next((c for c in ["결제메모", "승인번호", "메모"] if c in df.columns), None)
     if mcol:
-        df["승인번호목록"] = df[mcol].apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
+        memo = _pick_first_series(df, mcol)
+        df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
 
     df["p_idx"] = range(len(df))
     return df
