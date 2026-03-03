@@ -519,9 +519,14 @@ def build_patient_compare(daily, patient):
         if ic in mg.columns and pc in mg.columns:
             mg[f"△{pay}"] = mg[ic] - mg[pc]
 
+    # 현금+이체 통합 (수납 방식 차이로 인한 불필요한 불일치 제거)
+    mg["[일마]현금+이체"] = mg.get("[일마]현금", 0) + mg.get("[일마]이체", 0)
+    mg["[차트]현금+이체"] = mg.get("[차트]현금", 0) + mg.get("[차트]이체", 0)
+    mg["△현금+이체"] = mg["[일마]현금+이체"] - mg["[차트]현금+이체"]
+
     def detail(row):
         r = []
-        for pay, ico in [("카드", "💳"), ("현금", "💵"), ("이체", "🏦"), ("플랫폼", "📱")]:
+        for pay, ico in [("카드", "💳"), ("현금+이체", "💵"), ("플랫폼", "📱")]:
             c = f"△{pay}"
             if c in row and row[c] != 0:
                 r.append(f"{ico}{pay}({row[c]:+,.0f})")
@@ -751,8 +756,8 @@ else:
             disp = pc if vw == "전체" else pc[pc["불일치상세"] != "✅일치"]
             cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
                                 "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
-                                "[일마]현금", "[차트]현금",
-                                "[일마]이체", "[차트]이체", "[일마]플랫폼", "[차트]플랫폼"] if c in disp.columns]
+                                "[일마]현금+이체", "[차트]현금+이체",
+                                "[일마]플랫폼", "[차트]플랫폼"] if c in disp.columns]
             st.dataframe(disp[cols], use_container_width=True, hide_index=True)
 
     with t4:
