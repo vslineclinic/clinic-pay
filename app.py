@@ -1,8 +1,15 @@
 """
-병원 정산 3-Way 대사 시스템 v2.1
+병원 정산 3-Way 대사 시스템 v2.2
 한솔페이 × 일일마감 × 차트마감(환자별집계) 자동 매칭 + 의심건 즉시 탐지
 
-v1 대비 주요 개선:
+v2.2 주요 개선 (v2.1 → v2.2):
+  12. 카드번호→차트번호 크로스레퍼런스 – 매칭 결과에서 카드번호-환자 매핑 자동 구축
+  13. P6 카드번호 기반 매칭 – 동일 카드번호 = 동일 환자 추정으로 추가 매칭
+  14. P6b 카드번호+분할결제 – 카드번호 매핑 기반 분할결제 정밀 탐지
+  15. 카드사 크로스검증 – 한솔카드사 ↔ 차트카드사 비교로 확신도 자동 조정
+  16. 한솔↔차트 크로스레퍼런스 뷰 – 카드번호/카드사 기반 3-Way 검증 UI
+
+v2.1 주요 개선 (v1 → v2.1):
   1. parse_hansol_time 이중파싱 버그 수정
   2. 승인거절/취소 자동 분류 (한솔페이)
   3. 분할결제 매칭 (한솔 2~3건 합 = 일마 1건, 시간근접 ≤10분)
@@ -63,6 +70,22 @@ def _extract_card_company(pay_str):
     name = m.group(1).strip()
     name = re.sub(r"카드$", "", name).strip()
     return name
+
+
+def _card_company_match(h_co, chart_cos):
+    """한솔 카드사명과 차트 카드사 목록 간 일치 여부 확인"""
+    if not h_co:
+        return False
+    h = re.sub(r"카드$", "", str(h_co)).strip().lower()
+    if not h:
+        return False
+    for cc in chart_cos:
+        if not cc:
+            continue
+        c = re.sub(r"카드$", "", str(cc)).strip().lower()
+        if c and (h in c or c in h):
+            return True
+    return False
 
 
 def similar_chart_no(a, b):
@@ -250,14 +273,20 @@ def parse_patient(raw):
 
 def run_matching(hansol, daily, patient):
     """
-    7-Pass 매칭:
-      P1: 승인번호 직접매칭
-      P2: 유일 금액 1:1
-      P2b: 카드사+금액 (동일금액 다건 → 카드사 구분)
-      P3: 분할결제 2~3건 합 (시간근접)
-      P3b: 본부금 기반 분할결제 (차트 본부금 힌트)
-      P4: 시간-순서 상관 (동일금액 다건, 카드사 우선)
-      P5: 현금영수증 + 이체
+    9-Pass 매칭 + 카드사 크로스검증:
+      Round 1 (기존):
+        P1: 승인번호 직접매칭
+        P2: 유일 금액 1:1
+        P2b: 카드사+금액 (동일금액 다건 → 카드사 구분)
+        P3: 분할결제 2~3건 합 (시간근접)
+        P3b: 본부금 기반 분할결제 (차트 본부금 힌트)
+        P4: 시간-순서 상관 (동일금액 다건, 카드사 우선)
+        P5: 현금영수증 + 이체
+      Round 2 (크로스레퍼런스):
+        카드번호→차트번호 매핑 구축 (Round 1 HIGH 매칭 결과)
+        P6: 카드번호 기반 매칭 (동일카드=동일환자 추정)
+        P6b: 카드번호+분할결제 (카드번호 매핑 기반 정밀 분할)
+      Post: 카드사 크로스검증 → 확신도 조정
     """
     h_ok = hansol[hansol["tx_status"] == "정상"]
     h_card = h_ok[~h_ok["is_현금"]].copy()
@@ -454,7 +483,176 @@ def run_matching(hansol, daily, patient):
                 ))
                 matched_h.add(hr["h_idx"])
 
-    return pd.DataFrame(results), matched_h, matched_dc
+    # ── Round 2: 카드번호→차트번호 크로스레퍼런스 기반 재매칭 ──
+
+    # HIGH 확신도 매칭에서 카드번호→차트번호 매핑 추출
+    card_no_chart_map = {}  # {한솔_카드번호: 차트번호}
+    for r in results:
+        if r["확신도"] == "🟢HIGH":
+            cno = r.get("한솔_카드번호", "").strip()
+            chno = r.get("일마_차트", "").strip()
+            if cno and chno and len(cno) >= 4:
+                if cno not in card_no_chart_map:
+                    card_no_chart_map[cno] = chno
+
+    # P6: 카드번호 기반 매칭 – 동일 카드번호 = 동일 환자 추정
+    for _, hr in h_card.iterrows():
+        if hr["h_idx"] in matched_h:
+            continue
+        cno = str(hr.get("카드번호", ""))[:12].strip()
+        if not cno or cno not in card_no_chart_map:
+            continue
+        inferred_chart = card_no_chart_map[cno]
+        dc = d_card[(d_card["차트번호"] == inferred_chart) & (~d_card["d_idx"].isin(matched_dc))]
+        if dc.empty:
+            continue
+        amt = hr["금액"]
+        dc_exact = dc[dc["카드"] == amt]
+        if len(dc_exact) >= 1:
+            # 카드사 추가 검증으로 확신도 결정
+            h_co = str(hr.get("카드사", "")).strip()
+            ci = chart_info.get(inferred_chart, {})
+            chart_cos = ci.get("카드사_list", [])
+            co_ok = _card_company_match(h_co, chart_cos) if h_co and chart_cos else True
+            conf = "🟢HIGH" if co_ok else "🟡MED"
+            add("P6_카드번호", conf, [hr["h_idx"]], dc_exact.iloc[0])
+
+    # P6 이후 카드번호맵 갱신
+    for r in results:
+        if r["확신도"] == "🟢HIGH":
+            cno = r.get("한솔_카드번호", "").strip()
+            chno = r.get("일마_차트", "").strip()
+            if cno and chno and len(cno) >= 4 and cno not in card_no_chart_map:
+                card_no_chart_map[cno] = chno
+
+    # P6b: 카드번호 매핑 기반 분할결제 + 금액 재매칭
+    for _, dr in d_card.iterrows():
+        if dr["d_idx"] in matched_dc:
+            continue
+        target = dr["카드"]
+        chart_no = dr["차트번호"]
+        # 해당 차트번호에 연결된 카드번호 집합
+        linked_card_nos = {cno for cno, ch in card_no_chart_map.items() if ch == chart_no}
+        if not linked_card_nos:
+            continue
+        # 미매칭 한솔 중 해당 카드번호들의 거래만 추출
+        avail = h_card[~h_card["h_idx"].isin(matched_h)].copy()
+        avail["_cno"] = avail["카드번호"].astype(str).str[:12].str.strip()
+        avail = avail[avail["_cno"].isin(linked_card_nos)]
+        if avail.empty:
+            continue
+        # 단건 금액 매칭
+        exact = avail[avail["금액"] == target]
+        if len(exact) >= 1:
+            add("P6b_카드번호+금액", "🟢HIGH", [exact.iloc[0]["h_idx"]], dr)
+            continue
+        # 분할결제 매칭 (2~3건 합)
+        avail_list = avail[["h_idx", "금액", "시간_분"]].values.tolist()
+        found = False
+        for combo_r in [2, 3]:
+            if found or len(avail_list) < combo_r:
+                break
+            for combo in combinations(range(len(avail_list)), combo_r):
+                items = [avail_list[k] for k in combo]
+                if sum(it[1] for it in items) == target:
+                    times = [it[2] for it in items]
+                    spread = max(times) - min(times) if times else 999
+                    if spread <= 15:
+                        idxs = [int(it[0]) for it in items]
+                        add(f"P6b_카드번호분할{combo_r}건", "🟢HIGH" if spread <= 5 else "🟡MED", idxs, dr)
+                        found = True
+                        break
+
+    # ── 카드사 크로스검증: 한솔카드사 ↔ 차트카드사 비교 → 확신도 조정 ──
+    for i, r in enumerate(results):
+        chart_no = r.get("일마_차트", "")
+        h_co = r.get("한솔_카드사", "").strip()
+        ci = chart_info.get(chart_no, {})
+        chart_cos = ci.get("카드사_list", [])
+        if not h_co or not chart_cos:
+            continue
+        co_match = _card_company_match(h_co, chart_cos)
+        rule = results[i]["매칭규칙"]
+        if co_match:
+            # 카드사 일치 → 낮은 확신도 상향
+            if results[i]["확신도"] == "🟡MED":
+                results[i]["확신도"] = "🟢HIGH"
+                results[i]["매칭규칙"] += "+카드사✓"
+            elif results[i]["확신도"] == "🔴LOW":
+                results[i]["확신도"] = "🟡MED"
+                results[i]["매칭규칙"] += "+카드사✓"
+        else:
+            # 카드사 불일치 → P4(시간추정) 등 불확실한 매칭만 하향
+            if rule.startswith("P4") and results[i]["확신도"] == "🟢HIGH":
+                results[i]["확신도"] = "🟡MED"
+                results[i]["매칭규칙"] += "+카드사✗"
+            elif results[i]["확신도"] in ("🟡MED", "🔴LOW"):
+                results[i]["매칭규칙"] += "+카드사✗"
+
+    return pd.DataFrame(results), matched_h, matched_dc, card_no_chart_map
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 한솔↔차트 크로스레퍼런스
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def build_hansol_chart_compare(match_df, patient, card_no_chart_map):
+    """한솔↔차트 크로스레퍼런스: 카드번호/카드사 기반 3-Way 검증"""
+    if match_df.empty:
+        return pd.DataFrame()
+
+    # 차트 정보 구축 (카드사, 금액)
+    chart_card_info = {}
+    for _, pr in patient.iterrows():
+        ch = pr["차트번호"]
+        if ch not in chart_card_info:
+            chart_card_info[ch] = {"카드사_list": [], "카드합": 0, "이름": pr.get("이름", "")}
+        if pr.get("분류") == "카드":
+            chart_card_info[ch]["카드합"] += int(pr.get("금액", 0))
+            card_co = str(pr.get("카드사", "")).strip()
+            if card_co and card_co not in chart_card_info[ch]["카드사_list"]:
+                chart_card_info[ch]["카드사_list"].append(card_co)
+
+    rows = []
+    card_matches = match_df[match_df["한솔_유형"] == "카드"]
+    for chart_no, grp in card_matches.groupby("일마_차트"):
+        h_card_sum = int(grp["한솔_금액"].sum())
+        h_card_cos = sorted(set(grp["한솔_카드사"].dropna().unique()) - {""})
+        h_card_nos = sorted(set(grp["한솔_카드번호"].dropna().unique()) - {""})
+        name = grp.iloc[0].get("일마_성명", "")
+
+        ci = chart_card_info.get(chart_no, {})
+        p_card_sum = ci.get("카드합", 0)
+        p_card_cos = ci.get("카드사_list", [])
+
+        # 카드사 비교
+        co_status = "-"
+        if h_card_cos and p_card_cos:
+            all_match = all(_card_company_match(hc, p_card_cos) for hc in h_card_cos if hc)
+            co_status = "✅일치" if all_match else "❌불일치"
+        elif h_card_cos or p_card_cos:
+            co_status = "⚠️부분정보"
+
+        # 매칭 확신도 분포
+        conf_counts = grp["확신도"].value_counts().to_dict()
+        conf_summary = " ".join(f"{k}{v}" for k, v in sorted(conf_counts.items()))
+
+        rows.append({
+            "차트번호": chart_no,
+            "성명": name,
+            "한솔_카드합": h_card_sum,
+            "차트_카드합": p_card_sum,
+            "△카드": h_card_sum - p_card_sum,
+            "한솔_카드사": ", ".join(h_card_cos),
+            "차트_카드사": ", ".join(p_card_cos),
+            "카드사검증": co_status,
+            "한솔_카드번호": ", ".join(h_card_nos),
+            "매칭건수": len(grp),
+            "확신도분포": conf_summary,
+        })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -581,8 +779,8 @@ def tax_risk(hansol, daily, patient, matched_h):
 # UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-st.title("📊 병원 정산 3-Way 대사 v2.1")
-st.caption("한솔페이 × 일일마감 × 차트마감 | 자동 매칭 → 의심건 즉시 탐지")
+st.title("📊 병원 정산 3-Way 대사 v2.2")
+st.caption("한솔페이 × 일일마감 × 차트마감 | 자동 매칭 + 카드사 크로스검증 → 의심건 즉시 탐지")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2-Phase UI: 분석 전 → 파일업로드 / 분석 후 → 결과만 표시
@@ -627,7 +825,8 @@ if "done" not in st.session_state:
                     "p_tot": int(patient["금액"].sum()),
                 }
 
-                match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
+                match_df, matched_h, matched_dc, card_no_chart_map = run_matching(hansol, daily, patient)
+                hc_compare = build_hansol_chart_compare(match_df, patient, card_no_chart_map)
                 pc = build_patient_compare(daily, patient)
                 tx = tax_risk(hansol, daily, patient, matched_h)
 
@@ -639,12 +838,14 @@ if "done" not in st.session_state:
                 st.session_state["hansol"] = hansol
                 st.session_state["tots"] = tots
                 st.session_state["match_df"] = match_df
+                st.session_state["hc_compare"] = hc_compare
                 st.session_state["pc"] = pc
                 st.session_state["tx"] = tx
                 st.session_state["h_um"] = h_um
                 st.session_state["d_um"] = d_um
                 st.session_state["n_ok"] = len(h_ok)
                 st.session_state["n_m"] = len(matched_h)
+                st.session_state["n_cardmap"] = len(card_no_chart_map)
 
             st.rerun()  # 즉시 Phase 2로 전환
     else:
@@ -657,12 +858,14 @@ else:
     hansol = st.session_state["hansol"]
     tots = st.session_state["tots"]
     match_df = st.session_state["match_df"]
+    hc_compare = st.session_state["hc_compare"]
     pc = st.session_state["pc"]
     tx = st.session_state["tx"]
     h_um = st.session_state["h_um"]
     d_um = st.session_state["d_um"]
     n_ok = st.session_state["n_ok"]
     n_m = st.session_state["n_m"]
+    n_cardmap = st.session_state.get("n_cardmap", 0)
     rate = n_m / n_ok * 100 if n_ok else 0
 
     # 다시 분석 버튼
@@ -673,16 +876,17 @@ else:
 
     # ── KPI ──
     st.divider()
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("한솔 유효건", f"{n_ok}")
     k2.metric("자동매칭", f"{n_m}", f"{rate:.0f}%")
-    k3.metric("한솔 미매칭", f"{len(h_um)}", delta_color="inverse")
-    k4.metric("일마 미매칭", f"{len(d_um)}", delta_color="inverse")
-    k5.metric("세무위험", f"{len(tx)}", delta_color="inverse")
+    k3.metric("카드매핑", f"{n_cardmap}", help="카드번호→환자 매핑 수")
+    k4.metric("한솔 미매칭", f"{len(h_um)}", delta_color="inverse")
+    k5.metric("일마 미매칭", f"{len(d_um)}", delta_color="inverse")
+    k6.metric("세무위험", f"{len(tx)}", delta_color="inverse")
 
     # ── 탭 ──
-    t0, t1, t2, t3, t4 = st.tabs([
-        "📋 합계 대사", "🚨 의심건", "💳 한솔↔일마", "📊 일마↔차트", "🔒 세무위험",
+    t0, t1, t2, t2b, t3, t4 = st.tabs([
+        "📋 합계 대사", "🚨 의심건", "💳 한솔↔일마", "🔗 한솔↔차트", "📊 일마↔차트", "🔒 세무위험",
     ])
 
     with t0:
@@ -721,10 +925,14 @@ else:
             ml = match_df[match_df["확신도"].isin(["🟡MED", "🔴LOW"])]
             if len(ml):
                 prio.append(dict(순위="🟡P2", 항목="추정매칭(수동확인)", 건수=len(ml), 금액=f"{ml['한솔_금액'].sum():,}"))
+        if not hc_compare.empty:
+            co_bad = hc_compare[hc_compare["카드사검증"] == "❌불일치"]
+            if len(co_bad):
+                prio.append(dict(순위="🟠P3", 항목="카드사 불일치(한솔↔차트)", 건수=len(co_bad), 금액="-"))
         if not pc.empty:
             mm = pc[pc["불일치상세"] != "✅일치"]
             if len(mm):
-                prio.append(dict(순위="🟠P3", 항목="수단별 불일치", 건수=len(mm), 금액="-"))
+                prio.append(dict(순위="🟠P4", 항목="수단별 불일치", 건수=len(mm), 금액="-"))
         if prio:
             st.dataframe(pd.DataFrame(prio), use_container_width=True, hide_index=True)
         else:
@@ -748,6 +956,41 @@ else:
             st.markdown("##### 규칙별 통계")
             st.dataframe(match_df.groupby("매칭규칙").agg(건수=("매칭규칙", "count"), 금액합=("한솔_금액", "sum")).reset_index(),
                          use_container_width=True, hide_index=True)
+
+    with t2b:
+        st.subheader("🔗 한솔↔차트 크로스레퍼런스")
+        st.caption("일마-한솔 매칭 결과 기반 카드번호→환자 매핑 + 카드사 크로스검증")
+        if not hc_compare.empty:
+            # 카드사 검증 요약
+            n_total = len(hc_compare)
+            n_ok_co = len(hc_compare[hc_compare["카드사검증"] == "✅일치"])
+            n_bad_co = len(hc_compare[hc_compare["카드사검증"] == "❌불일치"])
+            n_partial = len(hc_compare[hc_compare["카드사검증"] == "⚠️부분정보"])
+            co1, co2, co3, co4 = st.columns(4)
+            co1.metric("환자 수", n_total)
+            co2.metric("카드사 일치", n_ok_co, help="한솔카드사 = 차트카드사")
+            co3.metric("카드사 불일치", n_bad_co, delta_color="inverse")
+            co4.metric("부분정보", n_partial, help="한쪽만 카드사 정보 있음")
+
+            vw_hc = st.radio("표시", ["불일치/부분만", "전체"], horizontal=True, key="hc_view")
+            if vw_hc == "불일치/부분만":
+                disp_hc = hc_compare[hc_compare["카드사검증"] != "✅일치"]
+            else:
+                disp_hc = hc_compare
+            if not disp_hc.empty:
+                cols_hc = [c for c in ["차트번호", "성명", "한솔_카드합", "차트_카드합", "△카드",
+                                       "한솔_카드사", "차트_카드사", "카드사검증",
+                                       "한솔_카드번호", "매칭건수", "확신도분포"] if c in disp_hc.columns]
+                st.dataframe(disp_hc[cols_hc], use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ 모든 환자의 카드사 정보가 일치합니다!")
+
+            # 금액 불일치 경고
+            amt_diff = hc_compare[hc_compare["△카드"] != 0]
+            if not amt_diff.empty:
+                st.warning(f"⚠️ 한솔매칭금액 ≠ 차트카드금액: {len(amt_diff)}건 (분할결제/미매칭 가능)")
+        else:
+            st.info("한솔↔차트 크로스레퍼런스 데이터가 없습니다.")
 
     with t3:
         st.subheader("📊 일마↔차트 수단별")
