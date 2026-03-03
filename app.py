@@ -8,7 +8,7 @@ v1 대비 주요 개선:
   3. 분할결제 매칭 (한솔 2~3건 합 = 일마 1건, 시간근접 ≤10분)
   4. 현금영수증·이체 매칭 (한솔 현금 ↔ 일마 현금/이체)
   5. 시간-순서 상관 매칭 (동일금액 다건 → 보간)
-  6. 일자 합계 대사 선행 (전체 균형부터 확인)
+  6. 일자별 합계매칭 선행 (전체 균형부터 확인)
   7. 환자별집계 결제수단 정밀분류 (카드/현금영수증/통장입금/기타 구분)
   8. 세무위험 자동 탐지 (과소·과다 신고 + 차트번호 불일치)
   9. 본부금(진료비) 차트 금액 통합 – 6,900원 등 본부금 수납 반영
@@ -605,6 +605,47 @@ def build_hansol_chart_compare(match_df, patient):
     return out.sort_values(["카드사검증", "차트번호"]).reset_index(drop=True)
 
 
+def build_missing_receipts(match_df, patient, daily):
+    """한솔-차트 매칭 기반 누락 추정 수납건 분석"""
+    p_card = patient[patient["분류"] == "카드"].copy()
+    chart_card = p_card.groupby(["차트번호", "이름"]).agg(
+        차트카드금액=("금액", "sum"),
+        차트카드건수=("금액", "count"),
+    ).reset_index()
+
+    if not match_df.empty:
+        h_card_match = match_df[match_df["한솔_유형"] == "카드"].copy()
+        h_card_match["_chart"] = h_card_match["일마_차트"].apply(clean_no)
+        h_agg = h_card_match.groupby("_chart").agg(
+            한솔매칭금액=("한솔_금액", "sum"),
+            한솔매칭건수=("한솔_금액", "count"),
+        ).reset_index().rename(columns={"_chart": "차트번호"})
+    else:
+        h_agg = pd.DataFrame(columns=["차트번호", "한솔매칭금액", "한솔매칭건수"])
+
+    d_card = daily[daily["카드"] > 0][["차트번호", "성명", "카드"]].copy()
+    d_agg = d_card.groupby("차트번호").agg(일마카드금액=("카드", "sum")).reset_index()
+
+    result = chart_card.merge(h_agg, on="차트번호", how="left")
+    result = result.merge(d_agg, on="차트번호", how="left")
+    for c in ["한솔매칭금액", "한솔매칭건수", "일마카드금액"]:
+        result[c] = result[c].fillna(0).astype(int)
+    result["차이(차트-한솔)"] = result["차트카드금액"] - result["한솔매칭금액"]
+
+    def _status(row):
+        if row["한솔매칭금액"] == 0:
+            return "❌한솔매칭없음"
+        if row["차이(차트-한솔)"] > 0:
+            return "⚠️금액부족"
+        if row["차이(차트-한솔)"] < 0:
+            return "⚠️초과매칭"
+        return "✅일치"
+
+    result["매칭상태"] = result.apply(_status, axis=1)
+    missing = result[result["매칭상태"] != "✅일치"].copy()
+    return result, missing
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 환자별 3-Way 비교
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -783,6 +824,7 @@ if "done" not in st.session_state:
 
                 match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
                 hc_compare = build_hansol_chart_compare(match_df, patient)
+                missing_all, missing_only = build_missing_receipts(match_df, patient, daily)
                 pc = build_patient_compare(daily, patient)
                 tx = tax_risk(hansol, daily, patient, matched_h)
 
@@ -792,9 +834,13 @@ if "done" not in st.session_state:
                 # session_state에 저장
                 st.session_state["done"] = True
                 st.session_state["hansol"] = hansol
+                st.session_state["daily"] = daily
+                st.session_state["patient"] = patient
                 st.session_state["tots"] = tots
                 st.session_state["match_df"] = match_df
                 st.session_state["hc_compare"] = hc_compare
+                st.session_state["missing_all"] = missing_all
+                st.session_state["missing_only"] = missing_only
                 st.session_state["pc"] = pc
                 st.session_state["tx"] = tx
                 st.session_state["h_um"] = h_um
@@ -811,9 +857,13 @@ else:
     # Phase 2: 결과 표시 (파일 업로더 없음 → 위젯 안전)
     # ════════════════════════════════════════════
     hansol = st.session_state["hansol"]
+    daily = st.session_state["daily"]
+    patient = st.session_state["patient"]
     tots = st.session_state["tots"]
     match_df = st.session_state["match_df"]
     hc_compare = st.session_state["hc_compare"]
+    missing_all = st.session_state["missing_all"]
+    missing_only = st.session_state["missing_only"]
     pc = st.session_state["pc"]
     tx = st.session_state["tx"]
     h_um = st.session_state["h_um"]
@@ -836,16 +886,15 @@ else:
     k3.metric("한솔 미매칭", f"{len(h_um)}", delta_color="inverse")
     k4.metric("일마 미매칭", f"{len(d_um)}", delta_color="inverse")
     k5.metric("세무위험", f"{len(tx)}", delta_color="inverse")
-    mapped_chart = hc_compare[hc_compare["한솔카드번호"] != ""] if not hc_compare.empty else pd.DataFrame()
-    k6.metric("한솔↔차트매핑", f"{len(mapped_chart)}")
+    k6.metric("누락추정", f"{len(missing_only)}", delta_color="inverse")
 
     # ── 탭 ──
-    t0, t1, t2, t2b, t3, t4 = st.tabs([
-        "📋 합계 대사", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험",
+    t0, t1, t2, t2b, t3, t4, t5 = st.tabs([
+        "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험", "📝 메신저 요약",
     ])
 
     with t0:
-        st.subheader("일자별 합계 대사")
+        st.subheader("일자별 합계매칭")
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         sm = pd.DataFrame({
@@ -854,7 +903,75 @@ else:
             "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
             "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
         })
-        st.dataframe(sm, use_container_width=True, hide_index=True)
+
+        def _highlight_vs_chart(row):
+            """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경"""
+            styles = [""] * len(row)
+            chart_val = row["차트마감"]
+            for i, (col, val) in enumerate(row.items()):
+                if col in ("구분", "차트마감"):
+                    continue
+                if str(val) == "-" or str(chart_val) == "-":
+                    continue
+                try:
+                    v1 = int(str(val).replace(",", ""))
+                    v2 = int(str(chart_val).replace(",", ""))
+                    if v1 == v2:
+                        styles[i] = "background-color: #3b82f6; color: white"
+                    else:
+                        styles[i] = "background-color: #ef4444; color: white"
+                except (ValueError, TypeError):
+                    pass
+            return styles
+
+        styled_sm = sm.style.apply(_highlight_vs_chart, axis=1)
+        st.dataframe(styled_sm, use_container_width=True, hide_index=True)
+
+        # 구분별 차이 금액 정리
+        st.markdown("#### 구분별 차이 금액")
+        h_total = tots["h_card"] + tots["h_cash"]
+        diff_rows = []
+        diff_rows.append({
+            "구분": "카드",
+            "한솔 vs 차트": f"{tots['h_card'] - tots['p_card']:+,}",
+            "일마 vs 차트": f"{tots['d_card'] - tots['p_card']:+,}",
+            "한솔 vs 일마": f"{tots['h_card'] - tots['d_card']:+,}",
+        })
+        diff_rows.append({
+            "구분": "현금/영수증+이체",
+            "한솔 vs 차트": f"{tots['h_cash'] - p_cash_xfer:+,}",
+            "일마 vs 차트": f"{d_cash_xfer - p_cash_xfer:+,}",
+            "한솔 vs 일마": "-",
+        })
+        diff_rows.append({
+            "구분": "플랫폼",
+            "한솔 vs 차트": "-",
+            "일마 vs 차트": f"{tots['d_plat'] - tots['p_plat']:+,}",
+            "한솔 vs 일마": "-",
+        })
+        diff_rows.append({
+            "구분": "합계",
+            "한솔 vs 차트": f"{h_total - tots['p_tot']:+,}",
+            "일마 vs 차트": f"{tots['d_tot'] - tots['p_tot']:+,}",
+            "한솔 vs 일마": f"{h_total - tots['d_tot']:+,}",
+        })
+        diff_df = pd.DataFrame(diff_rows)
+
+        def _highlight_diff_col(col):
+            styles = []
+            for val in col:
+                if val == "-" or val == "+0":
+                    styles.append("")
+                    continue
+                try:
+                    n = int(str(val).replace(",", "").replace("+", ""))
+                    styles.append("background-color: #ef4444; color: white" if n != 0 else "")
+                except (ValueError, TypeError):
+                    styles.append("")
+            return styles
+
+        styled_diff = diff_df.style.apply(_highlight_diff_col, subset=["한솔 vs 차트", "일마 vs 차트", "한솔 vs 일마"])
+        st.dataframe(styled_diff, use_container_width=True, hide_index=True)
 
         diffs = []
         if tots["h_card"] != tots["d_card"]:
@@ -886,10 +1003,9 @@ else:
             mm = pc[pc["불일치상세"] != "✅일치"]
             if len(mm):
                 prio.append(dict(순위="🟠P3", 항목="수단별 불일치", 건수=len(mm), 금액="-"))
-        if not hc_compare.empty:
-            cc_mis = hc_compare[hc_compare["카드사검증"] == "불일치"]
-            if len(cc_mis):
-                prio.append(dict(순위="🟠P3", 항목="한솔↔차트 카드사 불일치", 건수=len(cc_mis), 금액="-"))
+        if len(missing_only):
+            missing_amt = int(missing_only["차이(차트-한솔)"].sum()) if "차이(차트-한솔)" in missing_only.columns else 0
+            prio.append(dict(순위="🟠P3", 항목="한솔↔차트 누락추정", 건수=len(missing_only), 금액=f"{missing_amt:,}"))
         if prio:
             st.dataframe(pd.DataFrame(prio), use_container_width=True, hide_index=True)
         else:
@@ -915,13 +1031,32 @@ else:
                          use_container_width=True, hide_index=True)
 
     with t2b:
-        st.subheader("🧩 한솔↔차트 매칭 (일마 매칭 기반)")
-        if not hc_compare.empty:
-            view = st.radio("카드사검증", ["전체", "불일치/정보부족"], horizontal=True)
-            disp = hc_compare if view == "전체" else hc_compare[hc_compare["카드사검증"].isin(["불일치", "정보부족"])]
-            st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.subheader("🧩 한솔↔차트 누락 추정 수납건")
+        if not missing_all.empty:
+            view = st.radio("표시", ["누락/불일치만", "전체"], horizontal=True, key="t2b_view")
+            disp = missing_only if view == "누락/불일치만" else missing_all
+            disp_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액", "차트카드건수",
+                                     "한솔매칭금액", "한솔매칭건수", "일마카드금액", "차이(차트-한솔)"] if c in disp.columns]
+            st.dataframe(disp[disp_cols].sort_values("매칭상태"), use_container_width=True, hide_index=True)
+
+            # 누락 요약 통계
+            st.markdown("#### 누락 분석 요약")
+            no_match = missing_all[missing_all["매칭상태"] == "❌한솔매칭없음"]
+            under_match = missing_all[missing_all["매칭상태"] == "⚠️금액부족"]
+            over_match = missing_all[missing_all["매칭상태"] == "⚠️초과매칭"]
+            ok_match = missing_all[missing_all["매칭상태"] == "✅일치"]
+            summary_items = []
+            summary_items.append(f"✅ 완전일치: {len(ok_match)}건")
+            if len(no_match):
+                summary_items.append(f"❌ 한솔매칭없음: {len(no_match)}건 (차트금액 합계 {int(no_match['차트카드금액'].sum()):,}원)")
+            if len(under_match):
+                summary_items.append(f"⚠️ 금액부족: {len(under_match)}건 (부족금액 합계 {int(under_match['차이(차트-한솔)'].sum()):,}원)")
+            if len(over_match):
+                summary_items.append(f"⚠️ 초과매칭: {len(over_match)}건 (초과금액 합계 {int(abs(over_match['차이(차트-한솔)'].sum())):,}원)")
+            for item in summary_items:
+                st.markdown(f"- {item}")
         else:
-            st.info("표시할 한솔↔차트 카드 매핑 정보가 없습니다.")
+            st.success("✅ 모든 차트 카드수납이 한솔과 정상 매칭되었습니다.")
 
     with t3:
         st.subheader("📊 일마↔차트 수단별")
@@ -943,3 +1078,84 @@ else:
                 st.error(f"⚠️ 고위험 {len(hi)}건 (합계 {hi['금액'].sum():,}원)")
         else:
             st.success("✅ 세무위험 없음")
+
+    with t5:
+        st.subheader("📝 메신저 정산 요약")
+        st.caption("차트(일일마감) 기준으로 생성 · 복사 버튼으로 바로 붙여넣기")
+
+        # 환자수
+        total_patients = len(daily)
+
+        # 신환/구환 구분 시도
+        type_col = None
+        for c in daily.columns:
+            c_clean = str(c).replace(" ", "")
+            if any(k in c_clean for k in ["신구환", "환자구분", "예약구분", "구분"]):
+                # '구분' 컬럼이 결제수단 구분이 아닌지 확인
+                sample = daily[c].astype(str).str.cat()
+                if any(k in sample for k in ["신환", "구환", "신규", "재진", "초진"]):
+                    type_col = c
+                    break
+
+        new_appt = new_paid = new_amt = 0
+        old_appt = old_paid = old_amt = 0
+        if type_col:
+            new_mask = daily[type_col].astype(str).str.contains("신환|신규|초진|N", na=False)
+            old_mask = ~new_mask
+            new_appt = int(new_mask.sum())
+            new_paid = int((new_mask & (daily["총액"] > 0)).sum())
+            new_amt = int(daily.loc[new_mask, "총액"].sum())
+            old_appt = int(old_mask.sum())
+            old_paid = int((old_mask & (daily["총액"] > 0)).sum())
+            old_amt = int(daily.loc[old_mask, "총액"].sum())
+
+        # 취소+부도
+        cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
+
+        # 결제수단별 합계 (일일마감 기준)
+        card_total = int(daily["카드"].sum())
+        cash_total = int(daily["현금"].sum())
+        transfer_total = int(daily["이체"].sum())
+        yeoshin = int(daily["여신티켓"].sum())
+        gangnam = int(daily["강남언니"].sum())
+        naman = int(daily["나만의닥터"].sum())
+        zeropay = int(daily["제로페이"].sum())
+        local_currency = int(daily["기타지역화폐"].sum())
+
+        # 환불+취소 금액
+        refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
+
+        # Today
+        today_total = int(daily["총액"].sum())
+
+        # 템플릿 생성
+        lines = []
+        lines.append("--------------------------------------")
+        lines.append("VS라인클리닉 인천점")
+        lines.append(f"총 내원 환자 : {total_patients}명")
+        if type_col:
+            lines.append(f"신환예약 : {new_appt}명 수납 : {new_paid}명 {new_amt:,}원")
+            lines.append(f"구환예약 : {old_appt}명 수납 : {old_paid}명 {old_amt:,}원")
+        else:
+            paid_count = int((daily["총액"] > 0).sum())
+            lines.append(f"신환예약 : 명 수납 : 명 원")
+            lines.append(f"구환예약 : 명 수납 : 명 원")
+        lines.append(f"총 취소+부도 환자 : {cancel_count}명")
+        lines.append(f"Today : {today_total:,}원")
+        lines.append("")
+        lines.append(f"이체 : {transfer_total:,}원")
+        lines.append(f"현금 : {cash_total:,}원")
+        lines.append(f"카드 : {card_total:,}원")
+        lines.append(f"여신티켓 : {yeoshin:,}원")
+        lines.append(f"강남언니 : {gangnam:,}원")
+        lines.append(f"나만의닥터 : {naman:,}원")
+        lines.append(f"제로페이 : {zeropay:,}원")
+        lines.append(f"지역화폐 : {local_currency:,}원" if local_currency > 0 else "지역화폐 : 원")
+        lines.append(f"환불+취소 : {refund:,}원")
+        lines.append(f"Total : {today_total:,}원")
+
+        template_text = "\n".join(lines)
+        st.code(template_text, language=None)
+
+        if not type_col:
+            st.warning("⚠️ 일일마감 데이터에서 신환/구환 구분 컬럼을 찾지 못했습니다. 신환/구환 수치는 수동으로 입력해주세요.")
