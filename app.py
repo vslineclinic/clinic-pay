@@ -317,46 +317,43 @@ if file_hansol and file_daily and file_patient:
                         }
                     )
 
+            final_cols = [
+                "차트번호",
+                "차트번호_차트",
+                "성명",
+                "[일마] 카드",
+                "[일마] 현금",
+                "[일마] 이체",
+                "[일마] 플랫폼",
+                "[차트] 카드",
+                "[차트] 현금",
+                "[차트] 이체",
+                "[차트] 플랫폼",
+                "매칭상태",
+            ]
+
             fuzzy_df = pd.DataFrame(fuzzy_rows)
             exact_valid = exact_merge[exact_merge["매칭상태"] == "✅ 차트번호 일치"].copy()
             exact_valid["차트번호_차트"] = exact_valid["차트번호"]
 
+            unmatched_daily_only = exact_merge[exact_merge["매칭상태"] == "미매칭"].copy()
+            unmatched_daily_only = unmatched_daily_only[~unmatched_daily_only["차트번호"].isin(fuzzy_df["차트번호"])]
+            unmatched_daily_only["차트번호_차트"] = "-"
+            unmatched_daily_only["매칭상태"] = "❌ 차트 미매칭(일마만 존재)"
+
+            unmatched_chart_only = p_ready[~p_ready.index.isin(used_chart_idx)].copy()
+            unmatched_chart_only["차트번호_차트"] = unmatched_chart_only["차트번호"]
+            unmatched_chart_only["차트번호"] = "-"
+            unmatched_chart_only["매칭상태"] = "❌ 일마 미매칭(차트만 존재)"
+            for col in ["[일마] 카드", "[일마] 현금", "[일마] 이체", "[일마] 플랫폼"]:
+                unmatched_chart_only[col] = 0
+
             final_merge = pd.concat(
                 [
-                    exact_valid[
-                        [
-                            "차트번호",
-                            "차트번호_차트",
-                            "성명",
-                            "[일마] 카드",
-                            "[일마] 현금",
-                            "[일마] 이체",
-                            "[일마] 플랫폼",
-                            "[차트] 카드",
-                            "[차트] 현금",
-                            "[차트] 이체",
-                            "[차트] 플랫폼",
-                            "매칭상태",
-                        ]
-                    ],
-                    fuzzy_df[
-                        [
-                            "차트번호",
-                            "차트번호_차트",
-                            "성명",
-                            "[일마] 카드",
-                            "[일마] 현금",
-                            "[일마] 이체",
-                            "[일마] 플랫폼",
-                            "[차트] 카드",
-                            "[차트] 현금",
-                            "[차트] 이체",
-                            "[차트] 플랫폼",
-                            "매칭상태",
-                        ]
-                    ]
-                    if not fuzzy_df.empty
-                    else pd.DataFrame(),
+                    exact_valid[final_cols],
+                    fuzzy_df[final_cols] if not fuzzy_df.empty else pd.DataFrame(columns=final_cols),
+                    unmatched_daily_only[final_cols] if not unmatched_daily_only.empty else pd.DataFrame(columns=final_cols),
+                    unmatched_chart_only[final_cols] if not unmatched_chart_only.empty else pd.DataFrame(columns=final_cols),
                 ],
                 ignore_index=True,
             ).fillna(0)
