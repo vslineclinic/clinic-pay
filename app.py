@@ -791,11 +791,13 @@ else:
 
     with t0:
         st.subheader("일자별 합계 대사")
+        d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
+        p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         sm = pd.DataFrame({
-            "구분": ["카드", "현금/영수증", "이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], "-", "-", tots["h_card"] + tots["h_cash"]],
-            "일일마감": [tots["d_card"], tots["d_cash"], tots["d_xfer"], tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], tots["p_cash"], tots["p_xfer"], tots["p_plat"], tots["p_tot"]],
+            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
+            "한솔페이": [tots["h_card"], tots["h_cash"], "-", tots["h_card"] + tots["h_cash"]],
+            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
+            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
         })
         st.dataframe(sm, use_container_width=True, hide_index=True)
 
