@@ -304,6 +304,7 @@ def parse_patient(raw):
     if mcol:
         memo = _pick_first_series(df, mcol)
         df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{6,}", str(x)) if pd.notna(x) else [])
+        df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
 
     df["p_idx"] = range(len(df))
     return df
