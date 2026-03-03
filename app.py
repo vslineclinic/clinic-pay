@@ -237,12 +237,16 @@ def parse_patient(raw):
     df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
 
     # 결제수단 정밀분류
-    pay = df.get("결제수단", pd.Series(dtype=str)).astype(str)
+    pay_col = df.loc[:, "결제수단"] if "결제수단" in df.columns else pd.Series(dtype=str)
+    if isinstance(pay_col, pd.DataFrame):
+        # 동일 컬럼명이 중복되면 DataFrame이 반환되어 loc 마스킹 시 TypeError가 발생할 수 있음
+        pay_col = pay_col.iloc[:, 0]
+    pay = pay_col.astype(str)
     df["분류"] = "기타"
-    df.loc[pay.str.startswith("카드"), "분류"] = "카드"
+    df.loc[pay.str.startswith("카드", na=False), "분류"] = "카드"
     df.loc[pay.str.contains("현금영수증", na=False), "분류"] = "현금"
     df.loc[(pay == "통장입금") | pay.str.contains("이체", na=False), "분류"] = "이체"
-    df.loc[pay.str.startswith("기타"), "분류"] = "플랫폼"
+    df.loc[pay.str.startswith("기타", na=False), "분류"] = "플랫폼"
 
     # 카드사 추출
     df["카드사"] = ""
