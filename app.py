@@ -99,14 +99,30 @@ def similar_chart_no(a, b):
     return any(lo[:i] + lo[i + 1:] == sh for i in range(len(lo)))
 
 
-def _read_excel_auto(buf, **kwargs):
-    """Try openpyxl first (.xlsx), then xlrd (.xls 97-2003)."""
-    try:
-        return pd.read_excel(buf, engine="openpyxl", **kwargs)
-    except Exception:
-        if hasattr(buf, "seek"):
-            buf.seek(0)
-        return pd.read_excel(buf, engine="xlrd", **kwargs)
+def _read_excel_any_engine(buf, **kwargs):
+    """Try every available engine to read an Excel buffer."""
+    last = None
+    for engine in (None, "openpyxl", "xlrd"):
+        try:
+            if hasattr(buf, "seek"):
+                buf.seek(0)
+            return pd.read_excel(buf, engine=engine, **kwargs)
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _try_decrypt(raw, pw):
+    """Decrypt with msoffcrypto and return BytesIO, or raise."""
+    if importlib.util.find_spec("msoffcrypto") is None:
+        raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
+    msoffcrypto = importlib.import_module("msoffcrypto")
+    office = msoffcrypto.OfficeFile(io.BytesIO(raw))
+    office.load_key(password=pw)
+    decrypted = io.BytesIO()
+    office.decrypt(decrypted)
+    decrypted.seek(0)
+    return decrypted
 
 
 def load_file(f, password=None, default_password="vsline99!!"):
@@ -120,27 +136,24 @@ def load_file(f, password=None, default_password="vsline99!!"):
     raw = f.read()
     f.seek(0)
 
-    attempts = [password.strip()] if isinstance(password, str) and password.strip() else [None, default_password]
-    last_error = None
-
-    for pw in attempts:
+    # 1) 사용자가 비밀번호를 직접 입력한 경우 — 복호화 후 읽기
+    if isinstance(password, str) and password.strip():
         try:
-            if pw is None:
-                return _read_excel_auto(io.BytesIO(raw), header=None)
-
-            if importlib.util.find_spec("msoffcrypto") is None:
-                raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
-            msoffcrypto = importlib.import_module("msoffcrypto")
-            office = msoffcrypto.OfficeFile(io.BytesIO(raw))
-            office.load_key(password=pw)
-            decrypted = io.BytesIO()
-            office.decrypt(decrypted)
-            decrypted.seek(0)
-            return _read_excel_auto(decrypted, header=None)
+            return _read_excel_any_engine(_try_decrypt(raw, password.strip()), header=None)
         except Exception as e:
-            last_error = e
+            raise ValueError(f"엑셀 파일을 열 수 없습니다. 비밀번호를 확인해주세요. ({e})")
 
-    raise ValueError(f"엑셀 파일을 열 수 없습니다. 비밀번호를 확인해주세요. ({last_error})")
+    # 2) 비밀번호 없이 직접 읽기 시도 (비암호화 xlsx / xls)
+    try:
+        return _read_excel_any_engine(io.BytesIO(raw), header=None)
+    except Exception:
+        pass
+
+    # 3) 기본 비밀번호로 복호화 시도
+    try:
+        return _read_excel_any_engine(_try_decrypt(raw, default_password), header=None)
+    except Exception as e:
+        raise ValueError(f"엑셀 파일을 열 수 없습니다. 지원하지 않는 형식이거나 비밀번호가 필요합니다. ({e})")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
