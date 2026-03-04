@@ -399,65 +399,19 @@ def parse_patient(raw):
     df = df.reset_index(drop=True)
 
     if "이름" in df.columns:
-        df = df[df["이름"].notna() & ~df["이름"].astype(str).str.contains("합계|소계|총계", na=False)]
+        df = df[df["이름"].notna() & ~df["이름"].astype(str).str.contains("합계", na=False)]
     df = df.reset_index(drop=True)
 
     df["차트번호"] = df["차트번호"].apply(clean_no)
     df["이름"] = df["이름"].apply(clean_name)
 
-    # 빈 차트번호 + 빈 이름인 행 제거 (데이터가 아닌 빈 행)
-    df = df[~((df["차트번호"] == "") & (df["이름"] == ""))].reset_index(drop=True)
-
-    # 금액 컬럼 자동 탐지: 기존 패턴 + 추가 패턴
     amt_cols = [c for c in ["비급여(과세총금액)", "비급여(비과세)"] if c in df.columns]
-    # 추가 금액 컬럼 탐지 (급여 본인부담금, 수납금액 등)
-    for c in df.columns:
-        cs = str(c).strip()
-        if cs in [str(x) for x in amt_cols]:
-            continue
-        if any(kw in cs for kw in ["급여본인부담", "급여(본인부담", "비급여(과세", "비급여(비과세"]):
-            if cs not in [str(x) for x in amt_cols]:
-                amt_cols.append(c)
     copay_cols = [c for c in df.columns if "본부금" in str(c) or "본인부담" in str(c)]
-    # copay_cols에서 amt_cols와 중복되는 것 제거
-    copay_cols = [c for c in copay_cols if c not in amt_cols]
     all_amt_cols = amt_cols + copay_cols
-
-    # 직접 합산 컬럼이 있으면 그것을 우선 사용
-    direct_total_col = None
-    for c in df.columns:
-        cs = str(c).strip()
-        if cs in ("수납금액", "총금액", "합계금액", "수납합계", "총수납액"):
-            direct_total_col = c
-            break
-
     for c in all_amt_cols:
         df[c] = df[c].apply(clean_money)
     df["본부금"] = df[copay_cols].sum(axis=1) if copay_cols else 0
-
-    if direct_total_col and all_amt_cols:
-        # 직접 합산 컬럼과 개별 컬럼 합계 비교 → 더 정확한 것 사용
-        df[direct_total_col] = df[direct_total_col].apply(clean_money)
-        computed_sum = df[all_amt_cols].sum(axis=1)
-        direct_sum = df[direct_total_col]
-        # 직접 합산 컬럼이 0이 아닌 행 기준으로 비교
-        mask = direct_sum > 0
-        if mask.any():
-            diff = abs(computed_sum[mask].sum() - direct_sum[mask].sum())
-            if diff > 0:
-                # 차이가 있으면 직접 합산 컬럼 사용 (더 신뢰)
-                df["금액"] = direct_sum
-            else:
-                df["금액"] = computed_sum
-        else:
-            df["금액"] = computed_sum
-    elif direct_total_col:
-        df[direct_total_col] = df[direct_total_col].apply(clean_money)
-        df["금액"] = df[direct_total_col]
-    elif all_amt_cols:
-        df["금액"] = df[all_amt_cols].sum(axis=1)
-    else:
-        df["금액"] = 0
+    df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
 
     def _pick_first_series(frame, col):
         """중복 컬럼명이 있는 경우 첫 번째 컬럼만 Series로 반환"""
@@ -1183,35 +1137,30 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                 writer, sheet_name="9_세무위험", index=False)
 
         # ── Sheet 11: 합계비교 ──
-        h_plat_ex = tots.get("h_plat", 0)
-        h_total = tots["h_card"] + tots["h_cash"] + h_plat_ex
+        h_total = tots["h_card"] + tots["h_cash"]
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         p_etc_ex = tots.get("p_etc", 0)
-        p_card_with_etc = tots["p_card"] + p_etc_ex
+        labels = ["카드", "현금/영수증+이체", "플랫폼"]
+        h_vals = [tots["h_card"], tots["h_cash"], 0]
+        d_vals = [tots["d_card"], d_cash_xfer, tots["d_plat"]]
+        p_vals = [tots["p_card"], p_cash_xfer, tots["p_plat"]]
+        if p_etc_ex > 0:
+            labels.append("기타(미분류)")
+            h_vals.append(0)
+            d_vals.append(0)
+            p_vals.append(p_etc_ex)
+        labels.append("합계")
+        h_vals.append(h_total)
+        d_vals.append(tots["d_tot"])
+        p_vals.append(tots["p_tot"])
         summary_data = {
-            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], h_plat_ex, h_total],
-            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [p_card_with_etc, p_cash_xfer, tots["p_plat"], tots["p_tot"]],
-            "한솔vs차트_차이": [
-                tots["h_card"] - p_card_with_etc,
-                tots["h_cash"] - p_cash_xfer,
-                h_plat_ex - tots["p_plat"],
-                h_total - tots["p_tot"],
-            ],
-            "일마vs차트_차이": [
-                tots["d_card"] - p_card_with_etc,
-                d_cash_xfer - p_cash_xfer,
-                tots["d_plat"] - tots["p_plat"],
-                tots["d_tot"] - tots["p_tot"],
-            ],
-            "비고": [
-                f"기타 {p_etc_ex:,}원 포함" if p_etc_ex > 0 else "",
-                "",
-                "일마·차트 일치 → 한솔 반영" if h_plat_ex > 0 else "",
-                "",
-            ],
+            "구분": labels,
+            "한솔페이": h_vals,
+            "일일마감": d_vals,
+            "차트마감": p_vals,
+            "한솔vs차트_차이": [h - p for h, p in zip(h_vals, p_vals)],
+            "일마vs차트_차이": [d - p for d, p in zip(d_vals, p_vals)],
         }
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
 
@@ -1272,24 +1221,18 @@ if "done" not in st.session_state:
                     st.stop()
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
-                h_cancel = hansol[hansol["tx_status"] == "취소"]
-                _d_plat = int(daily["플랫폼합"].sum())
-                _p_plat = int(patient[patient["분류"] == "플랫폼"]["금액"].sum())
-                # 일일마감·차트마감 플랫폼 금액이 일치하면 한솔페이에도 반영하여 합계 매칭
-                _h_plat = _d_plat if _d_plat == _p_plat else 0
                 tots = {
-                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum() if not h_cancel.empty else 0),
-                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum() if not h_cancel.empty else 0),
-                    "h_plat": _h_plat,
+                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()),
+                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()),
                     "d_card": int(daily["카드"].sum()),
                     "d_cash": int(daily["현금"].sum()),
                     "d_xfer": int(daily["이체"].sum()),
-                    "d_plat": _d_plat,
+                    "d_plat": int(daily["플랫폼합"].sum()),
                     "d_tot": int(daily["총액"].sum()),
                     "p_card": int(patient[patient["분류"] == "카드"]["금액"].sum()),
                     "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
                     "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
-                    "p_plat": _p_plat,
+                    "p_plat": int(patient[patient["분류"] == "플랫폼"]["금액"].sum()),
                     "p_etc": int(patient[patient["분류"] == "기타"]["금액"].sum()),
                     "p_tot": int(patient["금액"].sum()),
                 }
@@ -1370,34 +1313,26 @@ else:
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         p_etc = tots.get("p_etc", 0)
-        # "기타" 분류는 카드에 포함 (EMR에서 결제수단 미분류 시 기타로 처리됨)
-        p_card_with_etc = tots["p_card"] + p_etc
-        h_plat = tots["h_plat"]
-        h_total = tots["h_card"] + tots["h_cash"] + h_plat
-        plat_synced = h_plat > 0  # 플랫폼 금액 동기화 여부
-
+        # 차트마감 합계: 개별 항목 합산 (p_tot과 일치하는지 검증용)
+        p_sum = tots["p_card"] + p_cash_xfer + tots["p_plat"] + p_etc
         sm_rows = [
-            {"구분": "카드", "한솔페이": tots["h_card"], "일일마감": tots["d_card"], "차트마감": p_card_with_etc},
+            {"구분": "카드", "한솔페이": tots["h_card"], "일일마감": tots["d_card"], "차트마감": tots["p_card"]},
             {"구분": "현금/영수증+이체", "한솔페이": tots["h_cash"], "일일마감": d_cash_xfer, "차트마감": p_cash_xfer},
-            {"구분": "플랫폼", "한솔페이": h_plat if plat_synced else "-", "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
-            {"구분": "합계", "한솔페이": h_total, "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]},
+            {"구분": "플랫폼", "한솔페이": "-", "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
         ]
-        sm = pd.DataFrame(sm_rows)
-
         if p_etc > 0:
-            st.info(f"📌 차트마감 '기타' 분류 {p_etc:,}원이 카드 항목에 합산되었습니다.")
+            sm_rows.append({"구분": "기타(미분류)", "한솔페이": "-", "일일마감": "-", "차트마감": p_etc})
+        sm_rows.append({"구분": "합계", "한솔페이": tots["h_card"] + tots["h_cash"], "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]})
+        sm = pd.DataFrame(sm_rows)
+        if p_etc > 0:
+            st.info(f"📌 차트마감에 '기타(미분류)' {p_etc:,}원이 있습니다. 카드/현금/이체/플랫폼에 분류되지 않은 금액입니다.")
 
         def _highlight_vs_chart(row):
-            """차트마감 기준 비교: 차트마감=파란배경(기본), 일치=파란배경, 불일치=붉은배경"""
+            """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경"""
             styles = [""] * len(row)
             chart_val = row["차트마감"]
             for i, (col, val) in enumerate(row.items()):
-                if col == "구분":
-                    continue
-                # 차트마감 컬럼은 항상 파란색 배경
-                if col == "차트마감":
-                    if str(val) != "-":
-                        styles[i] = "background-color: #3b82f6; color: white; font-weight: bold"
+                if col in ("구분", "차트마감"):
                     continue
                 if str(val) == "-" or str(chart_val) == "-":
                     continue
@@ -1417,11 +1352,12 @@ else:
 
         # 구분별 차이 금액 정리
         st.markdown("#### 구분별 차이 금액")
+        h_total = tots["h_card"] + tots["h_cash"]
         diff_rows = []
         diff_rows.append({
             "구분": "카드",
-            "한솔 vs 차트": f"{tots['h_card'] - p_card_with_etc:+,}",
-            "일마 vs 차트": f"{tots['d_card'] - p_card_with_etc:+,}",
+            "한솔 vs 차트": f"{tots['h_card'] - tots['p_card']:+,}",
+            "일마 vs 차트": f"{tots['d_card'] - tots['p_card']:+,}",
             "한솔 vs 일마": f"{tots['h_card'] - tots['d_card']:+,}",
         })
         diff_rows.append({
@@ -1432,9 +1368,9 @@ else:
         })
         diff_rows.append({
             "구분": "플랫폼",
-            "한솔 vs 차트": f"{h_plat - tots['p_plat']:+,}" if plat_synced else "-",
+            "한솔 vs 차트": "-",
             "일마 vs 차트": f"{tots['d_plat'] - tots['p_plat']:+,}",
-            "한솔 vs 일마": f"{h_plat - tots['d_plat']:+,}" if plat_synced else "-",
+            "한솔 vs 일마": "-",
         })
         diff_rows.append({
             "구분": "합계",
@@ -1469,8 +1405,6 @@ else:
             st.warning("\n".join(diffs))
         else:
             st.success("✅ 주요 합계 일치")
-        if plat_synced:
-            st.info(f"📱 일마·차트 플랫폼 금액 일치({h_plat:,}원) → 한솔페이 합계에 반영")
 
         rej = hansol[hansol["tx_status"] == "승인거절"]
         can = hansol[hansol["tx_status"] == "취소"]
@@ -1640,12 +1574,12 @@ else:
         lines.append("VS라인클리닉 인천점")
         lines.append(f"총 내원 환자 : {total_patients}명")
         if type_col:
-            lines.append(f"신환예약 : {new_appt}명 수납 : {new_paid}명 {new_amt:,}원")
-            lines.append(f"구환예약 : {old_appt}명 수납 : {old_paid}명 {old_amt:,}원")
+            lines.append(f"신환예약 : [    ]명 수납 : {new_paid}명 {new_amt:,}원")
+            lines.append(f"구환예약 : [    ]명 수납 : {old_paid}명 {old_amt:,}원")
         else:
             paid_count = int((daily["총액"] > 0).sum())
-            lines.append(f"신환예약 : 명 수납 : 명 원")
-            lines.append(f"구환예약 : 명 수납 : 명 원")
+            lines.append(f"신환예약 : [    ]명 수납 : {paid_count}명 원")
+            lines.append(f"구환예약 : [    ]명 수납 : 명 원")
         lines.append(f"총 취소+부도 환자 : {cancel_count}명")
         lines.append(f"Today : {today_total:,}원")
         lines.append("")
@@ -1658,7 +1592,7 @@ else:
         lines.append(f"제로페이 : {zeropay:,}원")
         lines.append(f"지역화폐 : {local_currency:,}원" if local_currency > 0 else "지역화폐 : 원")
         lines.append(f"환불+취소 : {refund:,}원")
-        lines.append(f"Total : {today_total:,}원")
+        lines.append(f"월별 total :          원")
 
         template_text = "\n".join(lines)
         st.code(template_text, language=None)
