@@ -423,17 +423,35 @@ def parse_patient(raw):
 
     # 결제수단 정밀분류
     pay = _pick_first_series(df, "결제수단").astype(str)
+    pay_norm = pay.str.lower().str.replace(r"[\s\-_/+·()\[\]]", "", regex=True)
+
+    card_mask = pay_norm.str.startswith("카드", na=False)
+    cash_mask = (
+        pay_norm.str.contains("현금", na=False)
+        | pay_norm.str.contains("현금영수증", na=False)
+        | pay_norm.str.contains("영수증", na=False)
+    )
+    transfer_mask = (
+        pay_norm.isin(["통장", "통장입금"])
+        | pay_norm.str.contains("이체", na=False)
+        | pay_norm.str.contains("계좌", na=False)
+        | pay_norm.str.contains("입금", na=False)
+        | pay_norm.str.contains("무통장", na=False)
+    )
+    platform_mask = pay_norm.str.startswith("기타", na=False)
+
     df["분류"] = "기타"
-    df.loc[pay.str.startswith("카드", na=False), "분류"] = "카드"
-    df.loc[(pay == "현금") | pay.str.contains("현금영수증", na=False), "분류"] = "현금"
-    df.loc[(pay == "통장") | (pay == "통장입금") | pay.str.contains("이체", na=False), "분류"] = "이체"
-    df.loc[pay.str.startswith("기타", na=False), "분류"] = "플랫폼"
+    df.loc[card_mask, "분류"] = "카드"
+    df.loc[cash_mask, "분류"] = "현금"
+    # 현금/영수증+이체 같은 복합 표기는 현금/이체 합산 구간으로 들어가도록 우선 이체로 분류
+    df.loc[transfer_mask, "분류"] = "이체"
+    df.loc[platform_mask & ~card_mask & ~cash_mask & ~transfer_mask, "분류"] = "플랫폼"
 
     # 카드사 추출
     df["카드사"] = ""
-    card_mask = df["분류"] == "카드"
-    if card_mask.any():
-        df.loc[card_mask, "카드사"] = pay[card_mask].apply(_extract_card_company)
+    card_rows = df["분류"] == "카드"
+    if card_rows.any():
+        df.loc[card_rows, "카드사"] = pay[card_rows].apply(_extract_card_company)
 
     # 결제메모에서 승인번호 + 플랫폼 키워드 추출
     df["승인번호목록"] = [[] for _ in range(len(df))]
@@ -499,6 +517,7 @@ def run_matching(hansol, daily, patient):
             hr = hansol[hansol["h_idx"] == hi].iloc[0]
             results.append(dict(
                 매칭규칙=rule, 확신도=conf,
+                한솔_hidx=int(hr["h_idx"]),
                 한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(hr["금액"]),
                 한솔_카드번호=str(hr.get("카드번호", ""))[:12],
                 한솔_카드사=str(hr.get("카드사", "")),
@@ -812,6 +831,41 @@ def run_matching(hansol, daily, patient):
                                 add(f"P7_분할레퍼런스{r}건", conf, idxs, dr)
                                 break
 
+    # P8 - 차트 분할결제 보강: 차트 승인번호 힌트로 한솔 미매칭 카드건 추가 연결
+    # 일마감이 1건으로 뭉쳐 있어도(차트는 2건 이상 분할) 같은 차트로 매칭 보완
+    match_df3 = pd.DataFrame(results)
+    if not match_df3.empty:
+        matched_chart_rows = match_df3[match_df3["한솔_유형"] == "카드"]
+        if not matched_chart_rows.empty:
+            chart_row_ref = {
+                clean_no(r["일마_차트"]): r for _, r in matched_chart_rows.iterrows() if clean_no(r.get("일마_차트", ""))
+            }
+            daily_chart_ref = {
+                clean_no(r["차트번호"]): r for _, r in d_card.iterrows() if clean_no(r.get("차트번호", ""))
+            }
+            for _, hr in h_card[~h_card["h_idx"].isin(matched_h)].iterrows():
+                appr = clean_no(hr.get("승인번호", ""))
+                if not appr or appr not in appr_map:
+                    continue
+                chart_no = clean_no(appr_map.get(appr, ""))
+                if not chart_no:
+                    continue
+                base_row = chart_row_ref.get(chart_no)
+                if base_row is not None:
+                    d_row = {
+                        "내원순서": base_row.get("일마_순서", ""),
+                        "성명": base_row.get("일마_성명", ""),
+                        "차트번호": base_row.get("일마_차트", chart_no),
+                        "카드": int(base_row.get("일마_카드", int(hr["금액"]))),
+                        "d_idx": -1,
+                    }
+                    add("P8_차트분할보강", "🟡MED", [int(hr["h_idx"])], d_row)
+                    continue
+
+                dr = daily_chart_ref.get(chart_no)
+                if dr is not None:
+                    add("P8_차트분할보강", "🟡MED", [int(hr["h_idx"])], dr)
+
     return pd.DataFrame(results), matched_h, matched_dc
 
 
@@ -865,9 +919,10 @@ def build_missing_receipts(match_df, patient, daily):
     if not match_df.empty:
         h_card_match = match_df[match_df["한솔_유형"] == "카드"].copy()
         h_card_match["_chart"] = h_card_match["일마_차트"].apply(clean_no)
+        agg_cnt_col = "한솔_hidx" if "한솔_hidx" in h_card_match.columns else "한솔_금액"
         h_agg = h_card_match.groupby("_chart").agg(
             한솔매칭금액=("한솔_금액", "sum"),
-            한솔매칭건수=("한솔_금액", "count"),
+            한솔매칭건수=(agg_cnt_col, "nunique"),
         ).reset_index().rename(columns={"_chart": "차트번호"})
     else:
         h_agg = pd.DataFrame(columns=["차트번호", "한솔매칭금액", "한솔매칭건수"])
