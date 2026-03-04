@@ -6,3 +6,4 @@ xlrd>=2.0.0
 
 msoffcrypto-tool>=5.4.0
 lxml>=4.9.0
+python-calamine>=0.2.0
