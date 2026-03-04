@@ -1140,23 +1140,27 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         h_total = tots["h_card"] + tots["h_cash"]
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        p_etc_ex = tots.get("p_etc", 0)
+        labels = ["카드", "현금/영수증+이체", "플랫폼"]
+        h_vals = [tots["h_card"], tots["h_cash"], 0]
+        d_vals = [tots["d_card"], d_cash_xfer, tots["d_plat"]]
+        p_vals = [tots["p_card"], p_cash_xfer, tots["p_plat"]]
+        if p_etc_ex > 0:
+            labels.append("기타(미분류)")
+            h_vals.append(0)
+            d_vals.append(0)
+            p_vals.append(p_etc_ex)
+        labels.append("합계")
+        h_vals.append(h_total)
+        d_vals.append(tots["d_tot"])
+        p_vals.append(tots["p_tot"])
         summary_data = {
-            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], 0, h_total],
-            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
-            "한솔vs차트_차이": [
-                tots["h_card"] - tots["p_card"],
-                tots["h_cash"] - p_cash_xfer,
-                0,
-                h_total - tots["p_tot"],
-            ],
-            "일마vs차트_차이": [
-                tots["d_card"] - tots["p_card"],
-                d_cash_xfer - p_cash_xfer,
-                tots["d_plat"] - tots["p_plat"],
-                tots["d_tot"] - tots["p_tot"],
-            ],
+            "구분": labels,
+            "한솔페이": h_vals,
+            "일일마감": d_vals,
+            "차트마감": p_vals,
+            "한솔vs차트_차이": [h - p for h, p in zip(h_vals, p_vals)],
+            "일마vs차트_차이": [d - p for d, p in zip(d_vals, p_vals)],
         }
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
 
@@ -1229,6 +1233,7 @@ if "done" not in st.session_state:
                     "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
                     "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
                     "p_plat": int(patient[patient["분류"] == "플랫폼"]["금액"].sum()),
+                    "p_etc": int(patient[patient["분류"] == "기타"]["금액"].sum()),
                     "p_tot": int(patient["금액"].sum()),
                 }
 
@@ -1307,12 +1312,20 @@ else:
         st.subheader("일자별 합계매칭")
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
-        sm = pd.DataFrame({
-            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], "-", tots["h_card"] + tots["h_cash"]],
-            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
-        })
+        p_etc = tots.get("p_etc", 0)
+        # 차트마감 합계: 개별 항목 합산 (p_tot과 일치하는지 검증용)
+        p_sum = tots["p_card"] + p_cash_xfer + tots["p_plat"] + p_etc
+        sm_rows = [
+            {"구분": "카드", "한솔페이": tots["h_card"], "일일마감": tots["d_card"], "차트마감": tots["p_card"]},
+            {"구분": "현금/영수증+이체", "한솔페이": tots["h_cash"], "일일마감": d_cash_xfer, "차트마감": p_cash_xfer},
+            {"구분": "플랫폼", "한솔페이": "-", "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
+        ]
+        if p_etc > 0:
+            sm_rows.append({"구분": "기타(미분류)", "한솔페이": "-", "일일마감": "-", "차트마감": p_etc})
+        sm_rows.append({"구분": "합계", "한솔페이": tots["h_card"] + tots["h_cash"], "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]})
+        sm = pd.DataFrame(sm_rows)
+        if p_etc > 0:
+            st.info(f"📌 차트마감에 '기타(미분류)' {p_etc:,}원이 있습니다. 카드/현금/이체/플랫폼에 분류되지 않은 금액입니다.")
 
         def _highlight_vs_chart(row):
             """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경"""
