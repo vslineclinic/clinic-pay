@@ -474,7 +474,7 @@ def parse_patient(raw):
         memo = _pick_first_series(df, mcol)
 
         def _parse_memo(text):
-            """결제메모 파싱: 승인번호(6~8자리) 추출 + 플랫폼 키워드 감지
+            """결제메모 파싱: 승인번호(5~10자리) 추출 + 플랫폼 키워드 감지
             구분자: 쉼표(,) / 슬래시(/) / 공백 모두 지원"""
             if pd.isna(text) or str(text).strip() in ("", "nan", "NaN"):
                 return [], ""
@@ -485,8 +485,9 @@ def parse_patient(raw):
                 if kw in s:
                     platform = name
                     break
-            # 승인번호 추출: 6~8자리 숫자 (앞뒤가 숫자가 아닌 경계)
-            nums = re.findall(r"(?<!\d)\d{6,8}(?!\d)", s)
+            # 승인번호 추출: 5~10자리 숫자 (앞뒤가 숫자가 아닌 경계)
+            # 카드사/단말기별로 6~8자 외 5자/9~10자 케이스도 존재
+            nums = re.findall(r"(?<!\d)\d{5,10}(?!\d)", s)
             return nums, platform
 
         parsed = memo.apply(_parse_memo)
@@ -591,13 +592,14 @@ def run_matching(hansol, daily, patient):
             continue
 
         cand = d_card[(d_card["차트번호"].isin(charts)) & (~d_card["d_idx"].isin(matched_dc))].copy()
+        # 일마에 같은 차트가 여러 줄로 나뉜 경우까지 고려하기 위해 최소 2건 이상이면 탐색
         if len(cand) < 2:
             continue
 
         target = int(hr["금액"])
         cand_rows = list(cand.to_dict("records"))
         chosen = None
-        max_r = min(4, len(cand_rows))
+        max_r = min(6, len(cand_rows))
         for r in range(2, max_r + 1):
             for combo in combinations(range(len(cand_rows)), r):
                 rows = [cand_rows[k] for k in combo]
@@ -610,6 +612,7 @@ def run_matching(hansol, daily, patient):
         if not chosen:
             continue
 
+        chosen_charts = sorted({str(x["차트번호"]) for x in chosen})
         for d_row in chosen:
             add(
                 "P1b_공동결제합산",
@@ -617,7 +620,7 @@ def run_matching(hansol, daily, patient):
                 [hr["h_idx"]],
                 d_row,
                 amount_override=int(d_row["카드"]),
-                note=f"공동결제 승인번호 {appr_no} (원거래 {target:,}원)",
+                note=f"공동결제 승인번호 {appr_no} / 차트 {', '.join(chosen_charts)} (원거래 {target:,}원)",
             )
 
     # P2
