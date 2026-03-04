@@ -110,15 +110,42 @@ def _read_excel_auto(buf, **kwargs):
 
 
 def _try_read_as_html(raw_bytes):
-    """xls/xlsx 확장자이지만 실제로는 HTML 테이블인 파일을 읽는다."""
-    head = raw_bytes[:1024]
+    """xls/xlsx 확장자이지만 실제로는 HTML/XML Spreadsheet/MHTML인 파일을 읽는다."""
+    head = raw_bytes[:2048]
     # BOM 제거
     for bom in (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"):
         if head.startswith(bom):
             head = head[len(bom):]
+            raw_bytes = raw_bytes[len(bom):]
             break
     head_str = head.decode("utf-8", errors="ignore").strip().lower()
-    if not any(tag in head_str for tag in ("<html", "<table", "<tr", "<!doctype")):
+
+    # XML Spreadsheet (SpreadsheetML) 형식 감지 — EMR에서 흔함
+    if head_str.startswith("<?xml") and "spreadsheet" in head_str[:500]:
+        for enc in ("utf-8", "cp949", "euc-kr"):
+            try:
+                text = raw_bytes.decode(enc)
+                tables = pd.read_html(io.StringIO(text), header=None)
+                if tables:
+                    return tables[0]
+            except Exception:
+                continue
+        return None
+
+    # MHTML 형식 감지
+    if head_str.startswith("mime-version:") or head_str.startswith("content-type:"):
+        for enc in ("utf-8", "cp949", "euc-kr"):
+            try:
+                text = raw_bytes.decode(enc)
+                tables = pd.read_html(io.StringIO(text), header=None)
+                if tables:
+                    return tables[0]
+            except Exception:
+                continue
+        return None
+
+    # 일반 HTML 테이블 감지
+    if not any(tag in head_str for tag in ("<html", "<table", "<tr", "<!doctype", "<?xml")):
         return None
     for enc in ("utf-8", "cp949", "euc-kr"):
         try:
@@ -213,7 +240,22 @@ def load_file(f, password=None, default_password="vsline99!!"):
     if result is not None:
         return result
 
-    raise ValueError(f"지원하지 않는 형식이거나 비밀번호가 필요합니다. ({last_error})")
+    # 파일 형식 힌트 생성
+    head_peek = raw[:32]
+    fmt_hint = "알 수 없는 형식"
+    if head_peek.startswith(b"PK"):
+        fmt_hint = "ZIP/xlsx 구조"
+    elif head_peek.startswith(b"\xd0\xcf\x11\xe0"):
+        fmt_hint = "OLE2/xls 구조 (암호화 가능성)"
+    elif b"<?xml" in raw[:256].lower():
+        fmt_hint = "XML 기반 파일"
+    elif b"<html" in raw[:256].lower() or b"<table" in raw[:256].lower():
+        fmt_hint = "HTML 테이블 파일"
+    raise ValueError(
+        f"지원하지 않는 형식이거나 비밀번호가 필요합니다.\n"
+        f"감지된 형식: {fmt_hint}\n"
+        f"상세 오류: {last_error}"
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1095,9 +1137,24 @@ if "done" not in st.session_state:
     if f_h and f_d and f_p:
         if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
             with st.spinner("매칭 엔진 실행 중..."):
-                hansol = parse_hansol(load_file(f_h, password=h_pw))
-                daily = parse_daily(load_file(f_d, password=d_pw))
-                patient = parse_patient(load_file(f_p, password=p_pw))
+                try:
+                    raw_h = load_file(f_h, password=h_pw)
+                except Exception as e:
+                    st.error(f"한솔페이 파일 읽기 실패: {e}")
+                    st.stop()
+                try:
+                    raw_d = load_file(f_d, password=d_pw)
+                except Exception as e:
+                    st.error(f"일일마감 파일 읽기 실패: {e}")
+                    st.stop()
+                try:
+                    raw_p = load_file(f_p, password=p_pw)
+                except Exception as e:
+                    st.error(f"차트마감 파일 읽기 실패: {e}")
+                    st.stop()
+                hansol = parse_hansol(raw_h)
+                daily = parse_daily(raw_d)
+                patient = parse_patient(raw_p)
                 if daily.empty:
                     st.error("일일마감 파일 파싱 실패")
                     st.stop()
