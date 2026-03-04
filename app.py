@@ -99,6 +99,16 @@ def similar_chart_no(a, b):
     return any(lo[:i] + lo[i + 1:] == sh for i in range(len(lo)))
 
 
+def _read_excel_auto(buf, **kwargs):
+    """Try openpyxl first (.xlsx), then xlrd (.xls 97-2003)."""
+    try:
+        return pd.read_excel(buf, engine="openpyxl", **kwargs)
+    except Exception:
+        if hasattr(buf, "seek"):
+            buf.seek(0)
+        return pd.read_excel(buf, engine="xlrd", **kwargs)
+
+
 def load_file(f, password=None, default_password="vsline99!!"):
     if f.name.lower().endswith(".csv"):
         try:
@@ -116,7 +126,7 @@ def load_file(f, password=None, default_password="vsline99!!"):
     for pw in attempts:
         try:
             if pw is None:
-                return pd.read_excel(io.BytesIO(raw), header=None)
+                return _read_excel_auto(io.BytesIO(raw), header=None)
 
             if importlib.util.find_spec("msoffcrypto") is None:
                 raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
@@ -126,7 +136,7 @@ def load_file(f, password=None, default_password="vsline99!!"):
             decrypted = io.BytesIO()
             office.decrypt(decrypted)
             decrypted.seek(0)
-            return pd.read_excel(decrypted, header=None)
+            return _read_excel_auto(decrypted, header=None)
         except Exception as e:
             last_error = e
 
