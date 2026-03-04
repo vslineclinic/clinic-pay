@@ -100,13 +100,27 @@ def similar_chart_no(a, b):
 
 
 def _read_excel_auto(buf, **kwargs):
-    """Try openpyxl first (.xlsx), then xlrd (.xls 97-2003)."""
+    """Try openpyxl first (.xlsx), then xlrd (.xls 97-2003), then calamine (.xlsb/.xls)."""
     try:
         return pd.read_excel(buf, engine="openpyxl", **kwargs)
     except Exception:
-        if hasattr(buf, "seek"):
-            buf.seek(0)
+        pass
+    if hasattr(buf, "seek"):
+        buf.seek(0)
+    try:
         return pd.read_excel(buf, engine="xlrd", **kwargs)
+    except Exception:
+        pass
+    if hasattr(buf, "seek"):
+        buf.seek(0)
+    # calamine 엔진 시도 (xlsb, 일부 xls/xlsx 호환)
+    try:
+        return pd.read_excel(buf, engine="calamine", **kwargs)
+    except Exception:
+        pass
+    if hasattr(buf, "seek"):
+        buf.seek(0)
+    return pd.read_excel(buf, **kwargs)
 
 
 def _try_read_as_html(raw_bytes):
@@ -154,7 +168,8 @@ def _try_read_as_csv(raw_bytes):
 
 
 def load_file(f, password=None, default_password="vsline99!!"):
-    if f.name.lower().endswith(".csv"):
+    fname = f.name.lower()
+    if fname.endswith(".csv"):
         try:
             return pd.read_csv(f, encoding="utf-8")
         except UnicodeDecodeError:
@@ -167,22 +182,26 @@ def load_file(f, password=None, default_password="vsline99!!"):
     last_error = None
     user_pw = password.strip() if isinstance(password, str) and password.strip() else None
 
+    def _try_decrypt(pw):
+        """msoffcrypto 복호화 시도 후 엑셀 읽기"""
+        if importlib.util.find_spec("msoffcrypto") is None:
+            raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
+        ms = importlib.import_module("msoffcrypto")
+        office = ms.OfficeFile(io.BytesIO(raw))
+        office.load_key(password=pw)
+        decrypted = io.BytesIO()
+        office.decrypt(decrypted)
+        decrypted.seek(0)
+        return _read_excel_auto(decrypted, header=None)
+
     # 1단계: 사용자가 비밀번호를 입력한 경우 → 복호화 시도
     if user_pw is not None:
         try:
-            if importlib.util.find_spec("msoffcrypto") is None:
-                raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
-            msoffcrypto = importlib.import_module("msoffcrypto")
-            office = msoffcrypto.OfficeFile(io.BytesIO(raw))
-            office.load_key(password=user_pw)
-            decrypted = io.BytesIO()
-            office.decrypt(decrypted)
-            decrypted.seek(0)
-            return _read_excel_auto(decrypted, header=None)
+            return _try_decrypt(user_pw)
         except Exception as e:
             last_error = e
 
-    # 2단계: 비암호화 파일 직접 읽기 (.xlsx / .xls)
+    # 2단계: 비암호화 파일 직접 읽기 (.xlsx / .xls / .xlsb)
     try:
         return _read_excel_auto(io.BytesIO(raw), header=None)
     except Exception as e:
@@ -191,27 +210,43 @@ def load_file(f, password=None, default_password="vsline99!!"):
     # 3단계: 기본 비밀번호로 복호화 시도
     if user_pw != default_password:
         try:
-            if importlib.util.find_spec("msoffcrypto") is None:
-                raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
-            msoffcrypto = importlib.import_module("msoffcrypto")
-            office = msoffcrypto.OfficeFile(io.BytesIO(raw))
-            office.load_key(password=default_password)
-            decrypted = io.BytesIO()
-            office.decrypt(decrypted)
-            decrypted.seek(0)
-            return _read_excel_auto(decrypted, header=None)
+            return _try_decrypt(default_password)
         except Exception as e:
             last_error = e
 
-    # 4단계: 확장자는 xls/xlsx이지만 실제로 HTML 테이블인 경우
+    # 4단계: 추가 기본 비밀번호들 시도
+    extra_passwords = ["1234", "0000", "1111", "password"]
+    for pw in extra_passwords:
+        if pw == user_pw or pw == default_password:
+            continue
+        try:
+            return _try_decrypt(pw)
+        except Exception:
+            continue
+
+    # 5단계: 확장자는 xls/xlsx이지만 실제로 HTML 테이블인 경우
     result = _try_read_as_html(raw)
     if result is not None:
         return result
 
-    # 5단계: 확장자는 xls/xlsx이지만 실제로 CSV/TSV인 경우
+    # 6단계: 확장자는 xls/xlsx이지만 실제로 CSV/TSV인 경우
     result = _try_read_as_csv(raw)
     if result is not None:
         return result
+
+    # 7단계: 마지막으로 다양한 인코딩으로 CSV 재시도 (확장자 무관)
+    for enc in ("utf-8-sig", "cp949", "euc-kr", "utf-16"):
+        try:
+            text = raw.decode(enc)
+            for sep in (",", "\t", "|"):
+                try:
+                    df = pd.read_csv(io.StringIO(text), sep=sep, header=None, encoding=enc)
+                    if len(df.columns) >= 2 and len(df) >= 2:
+                        return df
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
     raise ValueError(f"지원하지 않는 형식이거나 비밀번호가 필요합니다. ({last_error})")
 
@@ -364,19 +399,65 @@ def parse_patient(raw):
     df = df.reset_index(drop=True)
 
     if "이름" in df.columns:
-        df = df[df["이름"].notna() & ~df["이름"].astype(str).str.contains("합계", na=False)]
+        df = df[df["이름"].notna() & ~df["이름"].astype(str).str.contains("합계|소계|총계", na=False)]
     df = df.reset_index(drop=True)
 
     df["차트번호"] = df["차트번호"].apply(clean_no)
     df["이름"] = df["이름"].apply(clean_name)
 
+    # 빈 차트번호 + 빈 이름인 행 제거 (데이터가 아닌 빈 행)
+    df = df[~((df["차트번호"] == "") & (df["이름"] == ""))].reset_index(drop=True)
+
+    # 금액 컬럼 자동 탐지: 기존 패턴 + 추가 패턴
     amt_cols = [c for c in ["비급여(과세총금액)", "비급여(비과세)"] if c in df.columns]
+    # 추가 금액 컬럼 탐지 (급여 본인부담금, 수납금액 등)
+    for c in df.columns:
+        cs = str(c).strip()
+        if cs in [str(x) for x in amt_cols]:
+            continue
+        if any(kw in cs for kw in ["급여본인부담", "급여(본인부담", "비급여(과세", "비급여(비과세"]):
+            if cs not in [str(x) for x in amt_cols]:
+                amt_cols.append(c)
     copay_cols = [c for c in df.columns if "본부금" in str(c) or "본인부담" in str(c)]
+    # copay_cols에서 amt_cols와 중복되는 것 제거
+    copay_cols = [c for c in copay_cols if c not in amt_cols]
     all_amt_cols = amt_cols + copay_cols
+
+    # 직접 합산 컬럼이 있으면 그것을 우선 사용
+    direct_total_col = None
+    for c in df.columns:
+        cs = str(c).strip()
+        if cs in ("수납금액", "총금액", "합계금액", "수납합계", "총수납액"):
+            direct_total_col = c
+            break
+
     for c in all_amt_cols:
         df[c] = df[c].apply(clean_money)
     df["본부금"] = df[copay_cols].sum(axis=1) if copay_cols else 0
-    df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
+
+    if direct_total_col and all_amt_cols:
+        # 직접 합산 컬럼과 개별 컬럼 합계 비교 → 더 정확한 것 사용
+        df[direct_total_col] = df[direct_total_col].apply(clean_money)
+        computed_sum = df[all_amt_cols].sum(axis=1)
+        direct_sum = df[direct_total_col]
+        # 직접 합산 컬럼이 0이 아닌 행 기준으로 비교
+        mask = direct_sum > 0
+        if mask.any():
+            diff = abs(computed_sum[mask].sum() - direct_sum[mask].sum())
+            if diff > 0:
+                # 차이가 있으면 직접 합산 컬럼 사용 (더 신뢰)
+                df["금액"] = direct_sum
+            else:
+                df["금액"] = computed_sum
+        else:
+            df["금액"] = computed_sum
+    elif direct_total_col:
+        df[direct_total_col] = df[direct_total_col].apply(clean_money)
+        df["금액"] = df[direct_total_col]
+    elif all_amt_cols:
+        df["금액"] = df[all_amt_cols].sum(axis=1)
+    else:
+        df["금액"] = 0
 
     def _pick_first_series(frame, col):
         """중복 컬럼명이 있는 경우 첫 번째 컬럼만 Series로 반환"""
@@ -690,6 +771,91 @@ def run_matching(hansol, daily, patient):
             hc_co = hc[hc["카드사"].apply(lambda x: any(card_company_match(x, c) for c in card_cos))]
             if len(hc_co) == 1:
                 add("P6b_차트카드사보정", "🟡MED", [int(hc_co.iloc[0]["h_idx"])], dr)
+
+    # P7 - 분할결제 크로스레퍼런스: 차트번호↔승인번호↔카드번호 자동매칭
+    # 이미 매칭된 결과에서 차트번호별 카드번호 맵을 구축하고,
+    # 차트정보에 승인번호가 없는 결제건도 카드번호+금액으로 자동 매칭
+    match_df2 = pd.DataFrame(results)
+    if not match_df2.empty and "카드번호" in hansol.columns:
+        # 차트번호별 카드번호·카드사 레퍼런스 맵 재구축 (P6 이후 갱신)
+        chart_card_map = {}   # chart_no → set of card_numbers
+        chart_appr_map = {}   # chart_no → set of approval_numbers
+        card_rows2 = match_df2[match_df2["한솔_유형"] == "카드"]
+        for _, mr in card_rows2.iterrows():
+            ch = clean_no(mr.get("일마_차트", ""))
+            if not ch:
+                continue
+            card_no = clean_no(mr.get("한솔_카드번호", ""))[:12]
+            appr_no = str(mr.get("한솔_승인번호", "")).strip()
+            if card_no:
+                chart_card_map.setdefault(ch, set()).add(card_no)
+            if appr_no:
+                chart_appr_map.setdefault(ch, set()).add(appr_no)
+
+        # 차트정보(patient)에서 승인번호가 없는 카드결제건 탐지
+        # → 같은 차트번호의 매칭된 카드번호로 한솔페이 미매칭 건과 매칭 시도
+        for _, dr in d_card.iterrows():
+            if dr["d_idx"] in matched_dc:
+                continue
+            chart_no = clean_no(dr["차트번호"])
+            target = int(dr["카드"])
+
+            # 이 차트번호에 대한 카드번호 레퍼런스가 있는지 확인
+            ref_cards = chart_card_map.get(chart_no, set())
+            if not ref_cards:
+                continue
+
+            hc = h_card[(h_card["금액"] == target) & (~h_card["h_idx"].isin(matched_h))]
+            if hc.empty:
+                continue
+
+            # 카드번호 매칭
+            if "카드번호" in hc.columns:
+                hc_match = hc[hc["카드번호"].apply(lambda x: clean_no(x)[:12] in ref_cards)]
+                if len(hc_match) == 1:
+                    add("P7_분할레퍼런스카드번호", "🟢HIGH", [int(hc_match.iloc[0]["h_idx"])], dr)
+                    continue
+                elif len(hc_match) > 1:
+                    # 시간 근접도로 최적 선택
+                    ci = chart_info.get(chart_no, {})
+                    # 같은 차트의 매칭된 시간 참조
+                    ref_times = []
+                    for _, mr in card_rows2[card_rows2["일마_차트"].apply(clean_no) == chart_no].iterrows():
+                        t = mr.get("한솔_시간", "")
+                        if t:
+                            p = str(t).split(":")
+                            if len(p) >= 2:
+                                ref_times.append(int(p[0]) * 60 + int(p[1]))
+                    if ref_times:
+                        avg_time = sum(ref_times) / len(ref_times)
+                        best = hc_match.iloc[(hc_match["시간_분"] - avg_time).abs().argsort()[:1]]
+                        add("P7_분할레퍼런스카드번호", "🟡MED", [int(best.iloc[0]["h_idx"])], dr)
+                        continue
+
+            # 분할결제 탐지: 같은 카드번호의 미매칭 한솔 건 중 2~3건 합산 매칭
+            for card_ref in ref_cards:
+                if dr["d_idx"] in matched_dc:
+                    break
+                hc_by_card = h_card[
+                    (~h_card["h_idx"].isin(matched_h)) &
+                    (h_card["카드번호"].apply(lambda x: clean_no(x)[:12] == card_ref))
+                ]
+                if hc_by_card.empty:
+                    continue
+                for r in [2, 3]:
+                    if dr["d_idx"] in matched_dc or len(hc_by_card) < r:
+                        break
+                    items_list = hc_by_card[["h_idx", "금액", "시간_분"]].values.tolist()
+                    for combo in combinations(range(len(items_list)), r):
+                        items = [items_list[k] for k in combo]
+                        if sum(it[1] for it in items) == target:
+                            times = [it[2] for it in items]
+                            spread = max(times) - min(times) if times else 999
+                            if spread <= 15:
+                                idxs = [int(it[0]) for it in items]
+                                conf = "🟢HIGH" if spread <= 5 else "🟡MED"
+                                add(f"P7_분할레퍼런스{r}건", conf, idxs, dr)
+                                break
 
     return pd.DataFrame(results), matched_h, matched_dc
 
@@ -1021,25 +1187,28 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         h_total = tots["h_card"] + tots["h_cash"] + h_plat_ex
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        p_etc_ex = tots.get("p_etc", 0)
+        p_card_with_etc = tots["p_card"] + p_etc_ex
         summary_data = {
             "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
             "한솔페이": [tots["h_card"], tots["h_cash"], h_plat_ex, h_total],
             "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
+            "차트마감": [p_card_with_etc, p_cash_xfer, tots["p_plat"], tots["p_tot"]],
             "한솔vs차트_차이": [
-                tots["h_card"] - tots["p_card"],
+                tots["h_card"] - p_card_with_etc,
                 tots["h_cash"] - p_cash_xfer,
                 h_plat_ex - tots["p_plat"],
                 h_total - tots["p_tot"],
             ],
             "일마vs차트_차이": [
-                tots["d_card"] - tots["p_card"],
+                tots["d_card"] - p_card_with_etc,
                 d_cash_xfer - p_cash_xfer,
                 tots["d_plat"] - tots["p_plat"],
                 tots["d_tot"] - tots["p_tot"],
             ],
             "비고": [
-                "", "",
+                f"기타 {p_etc_ex:,}원 포함" if p_etc_ex > 0 else "",
+                "",
                 "일마·차트 일치 → 한솔 반영" if h_plat_ex > 0 else "",
                 "",
             ],
@@ -1068,7 +1237,7 @@ if "done" not in st.session_state:
     # ════════════════════════════════════════════
     c1, c2, c3 = st.columns(3)
     with c1:
-        f_h = st.file_uploader("📥 한솔페이", type=["csv", "xlsx", "xls"], key="h")
+        f_h = st.file_uploader("📥 한솔페이", type=["csv", "xlsx", "xls", "xlsb"], key="h")
         h_pw = st.text_input(
             "🔐 한솔 파일 비밀번호 (선택)",
             type="password",
@@ -1076,7 +1245,7 @@ if "done" not in st.session_state:
             help="비워두면 비밀번호 없음 → 기본값(vsline99!!) 순서로 자동 시도합니다.",
         )
     with c2:
-        f_d = st.file_uploader("📥 일일마감", type=["csv", "xlsx", "xls"], key="d")
+        f_d = st.file_uploader("📥 일일마감", type=["csv", "xlsx", "xls", "xlsb"], key="d")
         d_pw = st.text_input(
             "🔐 일일마감 파일 비밀번호 (선택)",
             type="password",
@@ -1084,7 +1253,7 @@ if "done" not in st.session_state:
             help="비워두면 비밀번호 없음 → 기본값(vsline99!!) 순서로 자동 시도합니다.",
         )
     with c3:
-        f_p = st.file_uploader("📥 차트마감", type=["csv", "xlsx", "xls"], key="p")
+        f_p = st.file_uploader("📥 차트마감", type=["csv", "xlsx", "xls", "xlsb"], key="p")
         p_pw = st.text_input(
             "🔐 차트 파일 비밀번호 (선택)",
             type="password",
@@ -1121,6 +1290,7 @@ if "done" not in st.session_state:
                     "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
                     "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
                     "p_plat": _p_plat,
+                    "p_etc": int(patient[patient["분류"] == "기타"]["금액"].sum()),
                     "p_tot": int(patient["금액"].sum()),
                 }
 
@@ -1199,24 +1369,35 @@ else:
         st.subheader("일자별 합계매칭")
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        p_etc = tots.get("p_etc", 0)
+        # "기타" 분류는 카드에 포함 (EMR에서 결제수단 미분류 시 기타로 처리됨)
+        p_card_with_etc = tots["p_card"] + p_etc
         h_plat = tots["h_plat"]
         h_total = tots["h_card"] + tots["h_cash"] + h_plat
         plat_synced = h_plat > 0  # 플랫폼 금액 동기화 여부
-        sm = pd.DataFrame({
-            "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"],
-                      h_plat if plat_synced else "-",
-                      h_total],
-            "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
-            "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
-        })
+
+        sm_rows = [
+            {"구분": "카드", "한솔페이": tots["h_card"], "일일마감": tots["d_card"], "차트마감": p_card_with_etc},
+            {"구분": "현금/영수증+이체", "한솔페이": tots["h_cash"], "일일마감": d_cash_xfer, "차트마감": p_cash_xfer},
+            {"구분": "플랫폼", "한솔페이": h_plat if plat_synced else "-", "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
+            {"구분": "합계", "한솔페이": h_total, "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]},
+        ]
+        sm = pd.DataFrame(sm_rows)
+
+        if p_etc > 0:
+            st.info(f"📌 차트마감 '기타' 분류 {p_etc:,}원이 카드 항목에 합산되었습니다.")
 
         def _highlight_vs_chart(row):
-            """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경"""
+            """차트마감 기준 비교: 차트마감=파란배경(기본), 일치=파란배경, 불일치=붉은배경"""
             styles = [""] * len(row)
             chart_val = row["차트마감"]
             for i, (col, val) in enumerate(row.items()):
-                if col in ("구분", "차트마감"):
+                if col == "구분":
+                    continue
+                # 차트마감 컬럼은 항상 파란색 배경
+                if col == "차트마감":
+                    if str(val) != "-":
+                        styles[i] = "background-color: #3b82f6; color: white; font-weight: bold"
                     continue
                 if str(val) == "-" or str(chart_val) == "-":
                     continue
@@ -1239,8 +1420,8 @@ else:
         diff_rows = []
         diff_rows.append({
             "구분": "카드",
-            "한솔 vs 차트": f"{tots['h_card'] - tots['p_card']:+,}",
-            "일마 vs 차트": f"{tots['d_card'] - tots['p_card']:+,}",
+            "한솔 vs 차트": f"{tots['h_card'] - p_card_with_etc:+,}",
+            "일마 vs 차트": f"{tots['d_card'] - p_card_with_etc:+,}",
             "한솔 vs 일마": f"{tots['h_card'] - tots['d_card']:+,}",
         })
         diff_rows.append({
@@ -1375,7 +1556,24 @@ else:
                                 "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
                                 "[일마]현금+이체", "[차트]현금+이체",
                                 "[일마]플랫폼", "[차트]플랫폼"] if c in disp.columns]
-            st.dataframe(disp[cols], use_container_width=True, hide_index=True)
+
+            # 차트 컬럼에 파란색 배경 적용
+            chart_cols_in_display = [c for c in cols if c.startswith("[차트]")]
+
+            def _highlight_chart_cols(row):
+                styles = [""] * len(row)
+                for i, (col, val) in enumerate(row.items()):
+                    if col in chart_cols_in_display:
+                        try:
+                            v = float(str(val).replace(",", ""))
+                            if v != 0:
+                                styles[i] = "background-color: #3b82f6; color: white"
+                        except (ValueError, TypeError):
+                            pass
+                return styles
+
+            styled_pc = disp[cols].style.apply(_highlight_chart_cols, axis=1)
+            st.dataframe(styled_pc, use_container_width=True, hide_index=True)
 
     with t4:
         st.subheader("🔒 세무위험")
