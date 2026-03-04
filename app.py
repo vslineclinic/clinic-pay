@@ -307,6 +307,7 @@ def parse_hansol(raw):
         df.loc[s.str.contains("포인트사용승인", na=False), "tx_status"] = "정상"
         df.loc[s.str.contains("거절", na=False), "tx_status"] = "승인거절"
         df.loc[s.str.contains("포인트실패", na=False), "tx_status"] = "포인트실패"
+        # 취소승인(=취소가 승인된 건)도 취소로 분류
         df.loc[s.str.contains("취소", na=False), "tx_status"] = "취소"
 
     typcol = next((c for c in ["구분"] if c in df.columns), None)
@@ -1221,9 +1222,10 @@ if "done" not in st.session_state:
                     st.stop()
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
+                h_cancel = hansol[hansol["tx_status"] == "취소"]
                 tots = {
-                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()),
-                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()),
+                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()),
+                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum()),
                     "d_card": int(daily["카드"].sum()),
                     "d_cash": int(daily["현금"].sum()),
                     "d_xfer": int(daily["이체"].sum()),
@@ -1409,7 +1411,11 @@ else:
         rej = hansol[hansol["tx_status"] == "승인거절"]
         can = hansol[hansol["tx_status"] == "취소"]
         if len(rej) + len(can) > 0:
-            st.info(f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건 (유효건에서 제외)")
+            cancel_amt = int(can["금액"].sum()) if len(can) > 0 else 0
+            msg = f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건"
+            if cancel_amt > 0:
+                msg += f" (취소금액 {cancel_amt:,}원 → 순매출에서 차감됨)"
+            st.info(msg)
 
     with t1:
         st.subheader("🚨 즉시 확인 필요")
