@@ -109,6 +109,50 @@ def _read_excel_auto(buf, **kwargs):
         return pd.read_excel(buf, engine="xlrd", **kwargs)
 
 
+def _try_read_as_html(raw_bytes):
+    """xls/xlsx 확장자이지만 실제로는 HTML 테이블인 파일을 읽는다."""
+    head = raw_bytes[:1024]
+    # BOM 제거
+    for bom in (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"):
+        if head.startswith(bom):
+            head = head[len(bom):]
+            break
+    head_str = head.decode("utf-8", errors="ignore").strip().lower()
+    if not any(tag in head_str for tag in ("<html", "<table", "<tr", "<!doctype")):
+        return None
+    for enc in ("utf-8", "cp949", "euc-kr"):
+        try:
+            text = raw_bytes.decode(enc)
+            tables = pd.read_html(io.StringIO(text), header=None)
+            if tables:
+                return tables[0]
+        except Exception:
+            continue
+    return None
+
+
+def _try_read_as_csv(raw_bytes):
+    """xls/xlsx 확장자이지만 실제로는 CSV/TSV인 파일을 읽는다."""
+    head = raw_bytes[:512]
+    # ZIP(xlsx) 또는 OLE2(xls) 시그니처가 있으면 CSV가 아님
+    if head.startswith(b"PK") or head.startswith(b"\xd0\xcf\x11\xe0"):
+        return None
+    for enc in ("utf-8", "cp949", "euc-kr"):
+        try:
+            text = raw_bytes.decode(enc)
+            first_lines = text.strip().split("\n")[:5]
+            if not first_lines:
+                return None
+            # 탭 또는 콤마 구분 탐지
+            for sep in (",", "\t"):
+                counts = [line.count(sep) for line in first_lines if line.strip()]
+                if counts and min(counts) >= 1:
+                    return pd.read_csv(io.StringIO(text), sep=sep, header=None, encoding=enc)
+        except Exception:
+            continue
+    return None
+
+
 def load_file(f, password=None, default_password="vsline99!!"):
     if f.name.lower().endswith(".csv"):
         try:
@@ -158,6 +202,16 @@ def load_file(f, password=None, default_password="vsline99!!"):
             return _read_excel_auto(decrypted, header=None)
         except Exception as e:
             last_error = e
+
+    # 4단계: 확장자는 xls/xlsx이지만 실제로 HTML 테이블인 경우
+    result = _try_read_as_html(raw)
+    if result is not None:
+        return result
+
+    # 5단계: 확장자는 xls/xlsx이지만 실제로 CSV/TSV인 경우
+    result = _try_read_as_csv(raw)
+    if result is not None:
+        return result
 
     raise ValueError(f"지원하지 않는 형식이거나 비밀번호가 필요합니다. ({last_error})")
 
