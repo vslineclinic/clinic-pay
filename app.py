@@ -184,13 +184,20 @@ def parse_hansol(raw):
     df["tx_status"] = "정상"
     if scol:
         s = df[scol].astype(str)
+        df.loc[s.str.contains("포인트사용승인", na=False), "tx_status"] = "정상"
         df.loc[s.str.contains("거절", na=False), "tx_status"] = "승인거절"
+        df.loc[s.str.contains("포인트실패", na=False), "tx_status"] = "포인트실패"
         df.loc[s.str.contains("취소", na=False), "tx_status"] = "취소"
 
     typcol = next((c for c in ["구분"] if c in df.columns), None)
     df["is_현금"] = False
     if typcol:
         df["is_현금"] = df[typcol].astype(str).str.contains("현금", na=False)
+
+    # 발급사/매입사에 "현금"이 포함되면 현금영수증 → 카드 승인내역에서 제외
+    for ccol in ["발급사", "매입사"]:
+        if ccol in df.columns:
+            df.loc[df[ccol].astype(str).str.contains("현금", na=False), "is_현금"] = True
 
     # K/S: K=현금영수증, S=카드 → 모두 유지 (is_현금으로 구분)
 
@@ -993,9 +1000,10 @@ if "done" not in st.session_state:
                     st.stop()
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
+                h_cancel = hansol[hansol["tx_status"] == "취소"]
                 tots = {
-                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()),
-                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()),
+                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum() if not h_cancel.empty else 0),
+                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum() if not h_cancel.empty else 0),
                     "d_card": int(daily["카드"].sum()),
                     "d_cash": int(daily["현금"].sum()),
                     "d_xfer": int(daily["이체"].sum()),
