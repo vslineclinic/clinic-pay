@@ -396,11 +396,15 @@ _PLATFORM_KEYWORDS = {
 
 def parse_patient(raw):
     """환자별집계 파싱: 결제수단 정밀분류"""
-    hdr = 0
+    hdr = None
     for i, row in raw.iterrows():
         if row.astype(str).str.contains("차트번호|이름|결제수단", na=False).sum() >= 2:
             hdr = i
             break
+    if hdr is None:
+        st.error(f"차트마감 파일에서 헤더를 찾을 수 없습니다. (첫 행 미리보기: {list(raw.iloc[0]) if len(raw) > 0 else '빈 파일'})")
+        return pd.DataFrame()
+
     df = raw.iloc[hdr + 1:].copy()
     df.columns = [str(c).strip().replace("\n", "") for c in raw.iloc[hdr]]
     df = df.reset_index(drop=True)
@@ -408,6 +412,12 @@ def parse_patient(raw):
     if "이름" in df.columns:
         df = df[df["이름"].notna() & ~df["이름"].astype(str).str.contains("합계", na=False)]
     df = df.reset_index(drop=True)
+
+    # 필수 컬럼 확인
+    for req_col in ["차트번호", "이름"]:
+        if req_col not in df.columns:
+            st.error(f"차트마감 파일에서 '{req_col}' 컬럼을 찾을 수 없습니다. (현재 컬럼: {', '.join(map(str, df.columns[:15]))})")
+            return pd.DataFrame()
 
     df["차트번호"] = df["차트번호"].apply(clean_no)
     df["이름"] = df["이름"].apply(clean_name)
@@ -1157,6 +1167,9 @@ if "done" not in st.session_state:
                 patient = parse_patient(raw_p)
                 if daily.empty:
                     st.error("일일마감 파일 파싱 실패")
+                    st.stop()
+                if patient.empty:
+                    st.error("차트마감 파일 파싱 실패")
                     st.stop()
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
