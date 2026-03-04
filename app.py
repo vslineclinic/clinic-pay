@@ -425,6 +425,19 @@ def parse_patient(raw):
     pay = _pick_first_series(df, "결제수단").astype(str)
     pay_norm = pay.str.lower().str.replace(r"[\s\-_/+·()\[\]]", "", regex=True)
 
+    # 결제취소/환불 라인 탐지 (메모/비고의 단순 문의 문구는 제외)
+    cancel_text_cols = [
+        c for c in ["결제수단", "수납구분", "결제구분", "구분", "상태"]
+        if c in df.columns
+    ]
+    cancel_text = pd.Series("", index=df.index, dtype=str)
+    for c in cancel_text_cols:
+        cancel_text = cancel_text + " " + _pick_first_series(df, c).astype(str)
+    df["is_취소"] = cancel_text.str.contains(r"취소|환불", na=False)
+    if df["is_취소"].any():
+        df.loc[df["is_취소"], "금액"] = -df.loc[df["is_취소"], "금액"].abs()
+        df.loc[df["is_취소"], "본부금"] = -df.loc[df["is_취소"], "본부금"].abs()
+
     card_mask = pay_norm.str.startswith("카드", na=False)
     cash_mask = (
         pay_norm.str.contains("현금", na=False)
@@ -908,14 +921,55 @@ def build_hansol_chart_compare(match_df, patient):
     return out.sort_values(["카드사검증", "차트번호"]).reset_index(drop=True)
 
 
-def build_missing_receipts(match_df, patient, daily):
+def build_missing_receipts(match_df, patient, daily, hansol):
     """한솔-차트 매칭 기반 누락 추정 수납건 분석"""
     p_card = patient[patient["분류"] == "카드"].copy()
+
+    # 차트 카드건수: 행 개수가 아니라 승인번호 개수 기준(없으면 1건)
+    if "승인번호목록" in p_card.columns:
+        p_card["승인번호건수"] = p_card["승인번호목록"].apply(
+            lambda xs: max(1, len({clean_no(x) for x in (xs if isinstance(xs, list) else []) if clean_no(x)}))
+        )
+    else:
+        p_card["승인번호건수"] = 1
+
     chart_card = p_card.groupby(["차트번호", "이름"]).agg(
         차트카드금액=("금액", "sum"),
-        차트카드건수=("금액", "count"),
+        차트카드건수=("승인번호건수", "sum"),
     ).reset_index()
 
+    # 차트 승인번호 기반 한솔 매칭(차트 1건에 승인번호 2개 이상 입력한 케이스 보강)
+    chart_appr = {}
+    if "승인번호목록" in p_card.columns:
+        for _, pr in p_card.iterrows():
+            ch = clean_no(pr.get("차트번호", ""))
+            if not ch:
+                continue
+            chart_appr.setdefault(ch, set())
+            vals = pr.get("승인번호목록", [])
+            if isinstance(vals, list):
+                for a in vals:
+                    aa = clean_no(a)
+                    if aa:
+                        chart_appr[ch].add(aa)
+
+    h_ok_card = hansol[(hansol["tx_status"] == "정상") & (~hansol["is_현금"])].copy()
+    h_ok_card["승인번호_norm"] = h_ok_card["승인번호"].apply(clean_no)
+
+    appr_rows = []
+    if chart_appr:
+        for ch, apprs in chart_appr.items():
+            if not apprs:
+                continue
+            hm = h_ok_card[h_ok_card["승인번호_norm"].isin(apprs)]
+            appr_rows.append({
+                "차트번호": ch,
+                "한솔매칭금액_appr": int(hm["금액"].sum()) if not hm.empty else 0,
+                "한솔매칭건수_appr": int(hm["h_idx"].nunique()) if not hm.empty else 0,
+            })
+    h_appr_agg = pd.DataFrame(appr_rows)
+
+    # 기존 매칭 결과 기반 집계(승인번호가 없거나 누락된 케이스 fallback)
     if not match_df.empty:
         h_card_match = match_df[match_df["한솔_유형"] == "카드"].copy()
         h_card_match["_chart"] = h_card_match["일마_차트"].apply(clean_no)
@@ -931,9 +985,25 @@ def build_missing_receipts(match_df, patient, daily):
     d_agg = d_card.groupby("차트번호").agg(일마카드금액=("카드", "sum")).reset_index()
 
     result = chart_card.merge(h_agg, on="차트번호", how="left")
+    if not h_appr_agg.empty:
+        result = result.merge(h_appr_agg, on="차트번호", how="left")
+    else:
+        result["한솔매칭금액_appr"] = 0
+        result["한솔매칭건수_appr"] = 0
+
+    # 승인번호 기반 결과를 우선 사용, 없으면 기존 매칭 결과 fallback
+    result["한솔매칭금액(기존)"] = result["한솔매칭금액"].fillna(0)
+    result["한솔매칭건수(기존)"] = result["한솔매칭건수"].fillna(0)
+    result["한솔매칭금액"] = result["한솔매칭금액_appr"].fillna(0)
+    result["한솔매칭건수"] = result["한솔매칭건수_appr"].fillna(0)
+    no_appr_match = result["한솔매칭금액"] == 0
+    result.loc[no_appr_match, "한솔매칭금액"] = result.loc[no_appr_match, "한솔매칭금액(기존)"]
+    result.loc[no_appr_match, "한솔매칭건수"] = result.loc[no_appr_match, "한솔매칭건수(기존)"]
+
     result = result.merge(d_agg, on="차트번호", how="left")
-    for c in ["한솔매칭금액", "한솔매칭건수", "일마카드금액"]:
-        result[c] = result[c].fillna(0).astype(int)
+    for c in ["한솔매칭금액", "한솔매칭건수", "일마카드금액", "차트카드건수", "차트카드금액"]:
+        if c in result.columns:
+            result[c] = result[c].fillna(0).astype(int)
     result["차이(차트-한솔)"] = result["차트카드금액"] - result["한솔매칭금액"]
 
     def _status(row):
@@ -948,6 +1018,7 @@ def build_missing_receipts(match_df, patient, daily):
     result["매칭상태"] = result.apply(_status, axis=1)
     missing = result[result["매칭상태"] != "✅일치"].copy()
     return result, missing
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1026,6 +1097,8 @@ def build_patient_compare(daily, patient):
         return " / ".join(r) if r else "✅일치"
 
     mg["불일치상세"] = mg.apply(detail, axis=1)
+    int_cols = mg.select_dtypes(include="number").columns
+    mg[int_cols] = mg[int_cols].astype(int)
     mg = mg.drop(columns=["_merge"], errors="ignore")
     return mg
 
@@ -1304,7 +1377,7 @@ if "done" not in st.session_state:
 
                 match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
                 hc_compare = build_hansol_chart_compare(match_df, patient)
-                missing_all, missing_only = build_missing_receipts(match_df, patient, daily)
+                missing_all, missing_only = build_missing_receipts(match_df, patient, daily, hansol)
                 pc = build_patient_compare(daily, patient)
                 tx = tax_risk(hansol, daily, patient, matched_h)
 
