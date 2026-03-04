@@ -1138,12 +1138,20 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                 writer, sheet_name="9_세무위험", index=False)
 
         # ── Sheet 11: 합계비교 ──
-        h_total = tots["h_card"] + tots["h_cash"]
+        h_total_base = tots["h_card"] + tots["h_cash"]
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         p_etc_ex = tots.get("p_etc", 0)
-        labels = ["카드", "현금/영수증+이체", "플랫폼"]
-        h_vals = [tots["h_card"], tots["h_cash"], 0]
+        # 일마감 플랫폼 == 차트마감 플랫폼이면 검증된 금액으로 한솔 합계에 반영
+        plat_confirmed_ex = tots["d_plat"] == tots["p_plat"] and tots["d_plat"] > 0
+        h_plat_ex = tots["d_plat"] if plat_confirmed_ex else 0
+        h_total_ex = h_total_base + h_plat_ex
+        labels = ["카드", "현금/영수증+이체"]
+        if plat_confirmed_ex:
+            labels.append("플랫폼(일마=차트 일치→반영)")
+        else:
+            labels.append("플랫폼")
+        h_vals = [tots["h_card"], tots["h_cash"], h_plat_ex]
         d_vals = [tots["d_card"], d_cash_xfer, tots["d_plat"]]
         p_vals = [tots["p_card"], p_cash_xfer, tots["p_plat"]]
         if p_etc_ex > 0:
@@ -1152,7 +1160,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             d_vals.append(0)
             p_vals.append(p_etc_ex)
         labels.append("합계")
-        h_vals.append(h_total)
+        h_vals.append(h_total_ex)
         d_vals.append(tots["d_tot"])
         p_vals.append(tots["p_tot"])
         summary_data = {
@@ -1317,15 +1325,24 @@ else:
         p_etc = tots.get("p_etc", 0)
         # 차트마감 합계: 개별 항목 합산 (p_tot과 일치하는지 검증용)
         p_sum = tots["p_card"] + p_cash_xfer + tots["p_plat"] + p_etc
+
+        # 일마감 플랫폼 == 차트마감 플랫폼이면 검증된 금액으로 한솔 합계에 반영
+        plat_confirmed = tots["d_plat"] == tots["p_plat"] and tots["d_plat"] > 0
+        h_plat_display = tots["d_plat"] if plat_confirmed else "-"
+        h_total_base = tots["h_card"] + tots["h_cash"]
+        h_total_with_plat = h_total_base + (tots["d_plat"] if plat_confirmed else 0)
+
         sm_rows = [
             {"구분": "카드", "한솔페이": tots["h_card"], "일일마감": tots["d_card"], "차트마감": tots["p_card"]},
             {"구분": "현금/영수증+이체", "한솔페이": tots["h_cash"], "일일마감": d_cash_xfer, "차트마감": p_cash_xfer},
-            {"구분": "플랫폼", "한솔페이": "-", "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
+            {"구분": "플랫폼", "한솔페이": h_plat_display, "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
         ]
         if p_etc > 0:
             sm_rows.append({"구분": "기타(미분류)", "한솔페이": "-", "일일마감": "-", "차트마감": p_etc})
-        sm_rows.append({"구분": "합계", "한솔페이": tots["h_card"] + tots["h_cash"], "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]})
+        sm_rows.append({"구분": "합계", "한솔페이": h_total_with_plat, "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]})
         sm = pd.DataFrame(sm_rows)
+        if plat_confirmed:
+            st.success(f"✅ 플랫폼 결제 {tots['d_plat']:,}원: 일마감=차트마감 일치 → 한솔 합계에 반영 (중복 계산 없음)")
         if p_etc > 0:
             st.info(f"📌 차트마감에 '기타(미분류)' {p_etc:,}원이 있습니다. 카드/현금/이체/플랫폼에 분류되지 않은 금액입니다.")
 
@@ -1354,7 +1371,6 @@ else:
 
         # 구분별 차이 금액 정리
         st.markdown("#### 구분별 차이 금액")
-        h_total = tots["h_card"] + tots["h_cash"]
         diff_rows = []
         diff_rows.append({
             "구분": "카드",
@@ -1368,17 +1384,25 @@ else:
             "일마 vs 차트": f"{d_cash_xfer - p_cash_xfer:+,}",
             "한솔 vs 일마": "-",
         })
-        diff_rows.append({
-            "구분": "플랫폼",
-            "한솔 vs 차트": "-",
-            "일마 vs 차트": f"{tots['d_plat'] - tots['p_plat']:+,}",
-            "한솔 vs 일마": "-",
-        })
+        if plat_confirmed:
+            diff_rows.append({
+                "구분": "플랫폼 ✅",
+                "한솔 vs 차트": "+0",
+                "일마 vs 차트": "+0",
+                "한솔 vs 일마": "+0",
+            })
+        else:
+            diff_rows.append({
+                "구분": "플랫폼",
+                "한솔 vs 차트": "-",
+                "일마 vs 차트": f"{tots['d_plat'] - tots['p_plat']:+,}",
+                "한솔 vs 일마": "-",
+            })
         diff_rows.append({
             "구분": "합계",
-            "한솔 vs 차트": f"{h_total - tots['p_tot']:+,}",
+            "한솔 vs 차트": f"{h_total_with_plat - tots['p_tot']:+,}",
             "일마 vs 차트": f"{tots['d_tot'] - tots['p_tot']:+,}",
-            "한솔 vs 일마": f"{h_total - tots['d_tot']:+,}",
+            "한솔 vs 일마": f"{h_total_with_plat - tots['d_tot']:+,}",
         })
         diff_df = pd.DataFrame(diff_rows)
 
