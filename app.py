@@ -1009,12 +1009,51 @@ def build_missing_receipts(match_df, patient, daily, hansol):
     h_ok_card = hansol[(hansol["tx_status"] == "정상") & (~hansol["is_현금"])].copy()
     h_ok_card["승인번호_norm"] = h_ok_card["승인번호"].apply(clean_no)
 
+    chart_amount_map = chart_card.groupby("차트번호")["차트카드금액"].sum().to_dict()
+
+    def _best_subset(cands, target):
+        """승인번호 후보 중 차트금액(target)에 가장 근접한 조합 선택 (행 재사용 방지용)."""
+        if cands.empty:
+            return []
+        idxs = list(cands.index)
+        if len(idxs) == 1:
+            return idxs
+
+        best, best_diff, best_len = [], float("inf"), 999
+        max_r = min(len(idxs), 5)
+        for r in range(1, max_r + 1):
+            for comb in combinations(idxs, r):
+                s = int(cands.loc[list(comb), "금액"].sum())
+                diff = abs(target - s)
+                if diff < best_diff or (diff == best_diff and r < best_len):
+                    best, best_diff, best_len = list(comb), diff, r
+                    if best_diff == 0 and best_len == 1:
+                        return best
+        return best
+
     appr_rows = []
     if chart_appr:
+        used_hidx = set()
+        chart_items = []
         for ch, apprs in chart_appr.items():
             if not apprs:
                 continue
-            hm = h_ok_card[h_ok_card["승인번호_norm"].isin(apprs)]
+            cand = h_ok_card[h_ok_card["승인번호_norm"].isin(apprs)][["h_idx", "금액"]].drop_duplicates("h_idx")
+            chart_items.append((ch, apprs, cand))
+
+        # 후보가 적은 차트부터 배정하면 같은 승인번호가 여러 차트에 걸친 경우 중복매칭을 줄일 수 있음
+        chart_items.sort(key=lambda x: len(x[2]))
+
+        for ch, apprs, cand in chart_items:
+            avail = cand[~cand["h_idx"].isin(used_hidx)].copy()
+            target = int(chart_amount_map.get(ch, 0))
+            chosen = _best_subset(avail, target)
+            if chosen:
+                used_hidx.update(chosen)
+                hm = avail[avail["h_idx"].isin(chosen)]
+            else:
+                hm = pd.DataFrame(columns=avail.columns)
+
             appr_rows.append({
                 "차트번호": ch,
                 "한솔매칭금액_appr": int(hm["금액"].sum()) if not hm.empty else 0,
