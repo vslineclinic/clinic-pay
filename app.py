@@ -120,19 +120,17 @@ def load_file(f, password=None, default_password="vsline99!!"):
     raw = f.read()
     f.seek(0)
 
-    attempts = [password.strip()] if isinstance(password, str) and password.strip() else [None, default_password]
     last_error = None
+    user_pw = password.strip() if isinstance(password, str) and password.strip() else None
 
-    for pw in attempts:
+    # 1단계: 사용자가 비밀번호를 입력한 경우 → 복호화 시도
+    if user_pw is not None:
         try:
-            if pw is None:
-                return _read_excel_auto(io.BytesIO(raw), header=None)
-
             if importlib.util.find_spec("msoffcrypto") is None:
                 raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
             msoffcrypto = importlib.import_module("msoffcrypto")
             office = msoffcrypto.OfficeFile(io.BytesIO(raw))
-            office.load_key(password=pw)
+            office.load_key(password=user_pw)
             decrypted = io.BytesIO()
             office.decrypt(decrypted)
             decrypted.seek(0)
@@ -140,7 +138,28 @@ def load_file(f, password=None, default_password="vsline99!!"):
         except Exception as e:
             last_error = e
 
-    raise ValueError(f"엑셀 파일을 열 수 없습니다. 비밀번호를 확인해주세요. ({last_error})")
+    # 2단계: 비암호화 파일 직접 읽기 (.xlsx / .xls)
+    try:
+        return _read_excel_auto(io.BytesIO(raw), header=None)
+    except Exception as e:
+        last_error = e
+
+    # 3단계: 기본 비밀번호로 복호화 시도
+    if user_pw != default_password:
+        try:
+            if importlib.util.find_spec("msoffcrypto") is None:
+                raise ValueError("암호화된 엑셀 처리를 위해 msoffcrypto-tool 설치가 필요합니다.")
+            msoffcrypto = importlib.import_module("msoffcrypto")
+            office = msoffcrypto.OfficeFile(io.BytesIO(raw))
+            office.load_key(password=default_password)
+            decrypted = io.BytesIO()
+            office.decrypt(decrypted)
+            decrypted.seek(0)
+            return _read_excel_auto(decrypted, header=None)
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"지원하지 않는 형식이거나 비밀번호가 필요합니다. ({last_error})")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
