@@ -525,19 +525,23 @@ def run_matching(hansol, daily, patient):
     matched_h, matched_dc = set(), set()
     results = []
 
-    def add(rule, conf, h_idxs, d_row):
+    def add(rule, conf, h_idxs, d_row, amount_override=None, note=""):
         for hi in h_idxs:
             hr = hansol[hansol["h_idx"] == hi].iloc[0]
+            matched_amt = int(amount_override) if amount_override is not None else int(hr["금액"])
             results.append(dict(
                 매칭규칙=rule, 확신도=conf,
                 한솔_hidx=int(hr["h_idx"]),
-                한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(hr["금액"]),
+                한솔_시간=hr.get("시간표시", ""),
+                한솔_금액=matched_amt,
+                한솔_원거래금액=int(hr["금액"]),
                 한솔_카드번호=str(hr.get("카드번호", ""))[:12],
                 한솔_카드사=str(hr.get("카드사", "")),
                 한솔_승인번호=str(hr.get("승인번호", "")),
                 한솔_유형="현금" if hr["is_현금"] else "카드",
                 일마_순서=d_row["내원순서"], 일마_성명=d_row["성명"],
                 일마_차트=d_row["차트번호"], 일마_카드=int(d_row["카드"]),
+                비고=note,
             ))
             matched_h.add(hi)
         matched_dc.add(d_row["d_idx"])
@@ -548,7 +552,10 @@ def run_matching(hansol, daily, patient):
         if pr.get("플랫폼구분", ""):
             continue
         for a in pr["승인번호목록"]:
-            appr_map[clean_no(a)] = pr["차트번호"]
+            aa = clean_no(a)
+            if not aa:
+                continue
+            appr_map.setdefault(aa, set()).add(clean_no(pr["차트번호"]))
 
     # 차트→본부금/카드사 맵
     chart_info = {}
@@ -567,11 +574,51 @@ def run_matching(hansol, daily, patient):
             if hr["h_idx"] in matched_h:
                 continue
             a = hr.get("승인번호", "")
-            if a and a in appr_map:
-                ch = appr_map[a]
+            if a and a in appr_map and len(appr_map[a]) == 1:
+                ch = list(appr_map[a])[0]
                 dc = d_card[(d_card["차트번호"] == ch) & (~d_card["d_idx"].isin(matched_dc))]
                 if not dc.empty:
                     add("P1_승인번호", "🟢HIGH", [hr["h_idx"]], dc.iloc[0])
+
+    # P1b - 동일 승인번호가 여러 차트에 기재된 합산결제 매칭
+    # 예: A(52,800) + B(173,800)을 1회 226,600 결제한 경우
+    for _, hr in h_card.iterrows():
+        if hr["h_idx"] in matched_h:
+            continue
+        appr_no = clean_no(hr.get("승인번호", ""))
+        charts = list(appr_map.get(appr_no, set()))
+        if not appr_no or len(charts) < 2:
+            continue
+
+        cand = d_card[(d_card["차트번호"].isin(charts)) & (~d_card["d_idx"].isin(matched_dc))].copy()
+        if len(cand) < 2:
+            continue
+
+        target = int(hr["금액"])
+        cand_rows = list(cand.to_dict("records"))
+        chosen = None
+        max_r = min(4, len(cand_rows))
+        for r in range(2, max_r + 1):
+            for combo in combinations(range(len(cand_rows)), r):
+                rows = [cand_rows[k] for k in combo]
+                if sum(int(x["카드"]) for x in rows) == target:
+                    chosen = rows
+                    break
+            if chosen:
+                break
+
+        if not chosen:
+            continue
+
+        for d_row in chosen:
+            add(
+                "P1b_공동결제합산",
+                "🟢HIGH",
+                [hr["h_idx"]],
+                d_row,
+                amount_override=int(d_row["카드"]),
+                note=f"공동결제 승인번호 {appr_no} (원거래 {target:,}원)",
+            )
 
     # P2
     for _, dr in d_card.iterrows():
@@ -860,7 +907,10 @@ def run_matching(hansol, daily, patient):
                 appr = clean_no(hr.get("승인번호", ""))
                 if not appr or appr not in appr_map:
                     continue
-                chart_no = clean_no(appr_map.get(appr, ""))
+                chart_candidates = list(appr_map.get(appr, set()))
+                if len(chart_candidates) != 1:
+                    continue
+                chart_no = clean_no(chart_candidates[0])
                 if not chart_no:
                     continue
                 base_row = chart_row_ref.get(chart_no)
