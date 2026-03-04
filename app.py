@@ -934,18 +934,19 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                 writer, sheet_name="9_세무위험", index=False)
 
         # ── Sheet 11: 합계비교 ──
-        h_total = tots["h_card"] + tots["h_cash"]
+        h_plat_ex = tots.get("h_plat", 0)
+        h_total = tots["h_card"] + tots["h_cash"] + h_plat_ex
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         summary_data = {
             "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], 0, h_total],
+            "한솔페이": [tots["h_card"], tots["h_cash"], h_plat_ex, h_total],
             "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
             "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
             "한솔vs차트_차이": [
                 tots["h_card"] - tots["p_card"],
                 tots["h_cash"] - p_cash_xfer,
-                0,
+                h_plat_ex - tots["p_plat"],
                 h_total - tots["p_tot"],
             ],
             "일마vs차트_차이": [
@@ -953,6 +954,11 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                 d_cash_xfer - p_cash_xfer,
                 tots["d_plat"] - tots["p_plat"],
                 tots["d_tot"] - tots["p_tot"],
+            ],
+            "비고": [
+                "", "",
+                "일마·차트 일치 → 한솔 반영" if h_plat_ex > 0 else "",
+                "",
             ],
         }
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
@@ -1003,18 +1009,23 @@ if "done" not in st.session_state:
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
                 h_cancel = hansol[hansol["tx_status"] == "취소"]
+                _d_plat = int(daily["플랫폼합"].sum())
+                _p_plat = int(patient[patient["분류"] == "플랫폼"]["금액"].sum())
+                # 일일마감·차트마감 플랫폼 금액이 일치하면 한솔페이에도 반영하여 합계 매칭
+                _h_plat = _d_plat if _d_plat == _p_plat else 0
                 tots = {
                     "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum() if not h_cancel.empty else 0),
                     "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum() if not h_cancel.empty else 0),
+                    "h_plat": _h_plat,
                     "d_card": int(daily["카드"].sum()),
                     "d_cash": int(daily["현금"].sum()),
                     "d_xfer": int(daily["이체"].sum()),
-                    "d_plat": int(daily["플랫폼합"].sum()),
+                    "d_plat": _d_plat,
                     "d_tot": int(daily["총액"].sum()),
                     "p_card": int(patient[patient["분류"] == "카드"]["금액"].sum()),
                     "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
                     "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
-                    "p_plat": int(patient[patient["분류"] == "플랫폼"]["금액"].sum()),
+                    "p_plat": _p_plat,
                     "p_tot": int(patient["금액"].sum()),
                 }
 
@@ -1093,9 +1104,14 @@ else:
         st.subheader("일자별 합계매칭")
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+        h_plat = tots["h_plat"]
+        h_total = tots["h_card"] + tots["h_cash"] + h_plat
+        plat_synced = h_plat > 0  # 플랫폼 금액 동기화 여부
         sm = pd.DataFrame({
             "구분": ["카드", "현금/영수증+이체", "플랫폼", "합계"],
-            "한솔페이": [tots["h_card"], tots["h_cash"], "-", tots["h_card"] + tots["h_cash"]],
+            "한솔페이": [tots["h_card"], tots["h_cash"],
+                      h_plat if plat_synced else "-",
+                      h_total],
             "일일마감": [tots["d_card"], d_cash_xfer, tots["d_plat"], tots["d_tot"]],
             "차트마감": [tots["p_card"], p_cash_xfer, tots["p_plat"], tots["p_tot"]],
         })
@@ -1125,7 +1141,6 @@ else:
 
         # 구분별 차이 금액 정리
         st.markdown("#### 구분별 차이 금액")
-        h_total = tots["h_card"] + tots["h_cash"]
         diff_rows = []
         diff_rows.append({
             "구분": "카드",
@@ -1141,9 +1156,9 @@ else:
         })
         diff_rows.append({
             "구분": "플랫폼",
-            "한솔 vs 차트": "-",
+            "한솔 vs 차트": f"{h_plat - tots['p_plat']:+,}" if plat_synced else "-",
             "일마 vs 차트": f"{tots['d_plat'] - tots['p_plat']:+,}",
-            "한솔 vs 일마": "-",
+            "한솔 vs 일마": f"{h_plat - tots['d_plat']:+,}" if plat_synced else "-",
         })
         diff_rows.append({
             "구분": "합계",
@@ -1178,6 +1193,8 @@ else:
             st.warning("\n".join(diffs))
         else:
             st.success("✅ 주요 합계 일치")
+        if plat_synced:
+            st.info(f"📱 일마·차트 플랫폼 금액 일치({h_plat:,}원) → 한솔페이 합계에 반영")
 
         rej = hansol[hansol["tx_status"] == "승인거절"]
         can = hansol[hansol["tx_status"] == "취소"]
