@@ -169,6 +169,8 @@ def parse_hansol(raw):
 
     if "승인번호" in df.columns:
         df["승인번호"] = df["승인번호"].apply(clean_no)
+        # 승인번호가 없는 건은 실제 결제가 이뤄지지 않은 미승인 건이므로 제외
+        df = df[df["승인번호"].astype(str).str.strip() != ""].copy()
 
     # 시간 파싱
     df["시간_분"] = 0
