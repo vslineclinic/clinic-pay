@@ -996,8 +996,20 @@ if "done" not in st.session_state:
     c1, c2, c3 = st.columns(3)
     with c1:
         f_h = st.file_uploader("📥 한솔페이", type=["csv", "xlsx", "xls"], key="h")
+        h_pw = st.text_input(
+            "🔐 한솔 파일 비밀번호 (선택)",
+            type="password",
+            key="h_pw",
+            help="비워두면 비밀번호 없음 → 기본값(vsline99!!) 순서로 자동 시도합니다.",
+        )
     with c2:
         f_d = st.file_uploader("📥 일일마감", type=["csv", "xlsx", "xls"], key="d")
+        d_pw = st.text_input(
+            "🔐 일일마감 파일 비밀번호 (선택)",
+            type="password",
+            key="d_pw",
+            help="비워두면 비밀번호 없음 → 기본값(vsline99!!) 순서로 자동 시도합니다.",
+        )
     with c3:
         f_p = st.file_uploader("📥 차트마감", type=["csv", "xlsx", "xls"], key="p")
         p_pw = st.text_input(
@@ -1010,8 +1022,8 @@ if "done" not in st.session_state:
     if f_h and f_d and f_p:
         if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
             with st.spinner("매칭 엔진 실행 중..."):
-                hansol = parse_hansol(load_file(f_h))
-                daily = parse_daily(load_file(f_d))
+                hansol = parse_hansol(load_file(f_h, password=h_pw))
+                daily = parse_daily(load_file(f_d, password=d_pw))
                 patient = parse_patient(load_file(f_p, password=p_pw))
                 if daily.empty:
                     st.error("일일마감 파일 파싱 실패")
