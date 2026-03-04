@@ -252,6 +252,14 @@ def parse_daily(raw):
     return df
 
 
+# 결제메모 플랫폼 키워드 → 플랫폼명 매핑
+_PLATFORM_KEYWORDS = {
+    "강남언니": "강남언니", "강언": "강남언니",
+    "나만의닥터": "나만의닥터", "나닥": "나만의닥터",
+    "여신티켓": "여신티켓", "여신": "여신티켓",
+}
+
+
 def parse_patient(raw):
     """환자별집계 파싱: 결제수단 정밀분류"""
     hdr = 0
@@ -299,12 +307,35 @@ def parse_patient(raw):
     if card_mask.any():
         df.loc[card_mask, "카드사"] = pay[card_mask].apply(_extract_card_company)
 
-    # 승인번호 추출
+    # 결제메모에서 승인번호 + 플랫폼 키워드 추출
     df["승인번호목록"] = [[] for _ in range(len(df))]
+    df["플랫폼구분"] = ""
     mcol = next((c for c in ["결제메모", "승인번호", "메모"] if c in df.columns), None)
     if mcol:
         memo = _pick_first_series(df, mcol)
-        df["승인번호목록"] = memo.apply(lambda x: re.findall(r"\d{7,8}", str(x)) if pd.notna(x) else [])
+
+        def _parse_memo(text):
+            """결제메모 파싱: 승인번호(6~8자리) 추출 + 플랫폼 키워드 감지
+            구분자: 쉼표(,) / 슬래시(/) / 공백 모두 지원"""
+            if pd.isna(text) or str(text).strip() in ("", "nan", "NaN"):
+                return [], ""
+            s = str(text).strip()
+            # 플랫폼 키워드 감지 (강언→강남언니, 나닥→나만의닥터, 여신→여신티켓)
+            platform = ""
+            for kw, name in _PLATFORM_KEYWORDS.items():
+                if kw in s:
+                    platform = name
+                    break
+            # 승인번호 추출: 6~8자리 숫자 (앞뒤가 숫자가 아닌 경계)
+            nums = re.findall(r"(?<!\d)\d{6,8}(?!\d)", s)
+            return nums, platform
+
+        parsed = memo.apply(_parse_memo)
+        df["승인번호목록"] = parsed.apply(lambda x: x[0])
+        df["플랫폼구분"] = parsed.apply(lambda x: x[1])
+        # 플랫폼 키워드가 감지된 행 → 분류를 "플랫폼"으로 변경
+        plat_mask = df["플랫폼구분"] != ""
+        df.loc[plat_mask, "분류"] = "플랫폼"
 
     df["p_idx"] = range(len(df))
     return df
@@ -343,6 +374,7 @@ def run_matching(hansol, daily, patient):
                 한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(hr["금액"]),
                 한솔_카드번호=str(hr.get("카드번호", ""))[:12],
                 한솔_카드사=str(hr.get("카드사", "")),
+                한솔_승인번호=str(hr.get("승인번호", "")),
                 한솔_유형="현금" if hr["is_현금"] else "카드",
                 일마_순서=d_row["내원순서"], 일마_성명=d_row["성명"],
                 일마_차트=d_row["차트번호"], 일마_카드=int(d_row["카드"]),
@@ -350,9 +382,11 @@ def run_matching(hansol, daily, patient):
             matched_h.add(hi)
         matched_dc.add(d_row["d_idx"])
 
-    # 승인번호→차트번호 맵
+    # 승인번호→차트번호 맵 (플랫폼 결제 제외 – 플랫폼은 한솔페이를 경유하지 않음)
     appr_map = {}
     for _, pr in patient.iterrows():
+        if pr.get("플랫폼구분", ""):
+            continue
         for a in pr["승인번호목록"]:
             appr_map[clean_no(a)] = pr["차트번호"]
 
@@ -516,6 +550,7 @@ def run_matching(hansol, daily, patient):
                     한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(amt),
                     한솔_카드번호=str(hr.get("카드번호", "")),
                     한솔_카드사="",
+                    한솔_승인번호=str(hr.get("승인번호", "")),
                     한솔_유형="현금영수증",
                     일마_순서=dr["내원순서"], 일마_성명=dr["성명"],
                     일마_차트=dr["차트번호"], 일마_카드=int(dr["카드"]),
@@ -789,10 +824,10 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             ["[데이터 출처 설명]", ""],
             ["한솔페이(Sheet: 1_한솔페이)", "PG사(결제대행사)에서 실제 승인/취소된 카드·현금영수증 거래 원본. 금액·시간·승인번호·카드사 포함."],
             ["일일마감(Sheet: 2_일일마감)", "병원 프론트에서 작성하는 일일 환자별 수납 기록. 차트번호·성명·결제수단별 금액 포함."],
-            ["차트마감(Sheet: 3_차트마감)", "EMR(전자의무기록)의 환자별 결제 집계. 차트번호·이름·결제수단·금액·본부금 포함."],
+            ["차트마감(Sheet: 3_차트마감)", "EMR(전자의무기록)의 환자별 결제 집계. 차트번호·이름·결제수단·금액·본부금 포함. 승인번호목록(결제메모에서 6~8자리 추출)과 플랫폼구분(강언→강남언니, 나닥→나만의닥터, 여신→여신티켓) 포함."],
             ["", ""],
             ["[핵심 시트 설명]", ""],
-            ["4_매칭결과", "한솔페이↔일일마감 자동 매칭 결과. 매칭규칙·확신도(HIGH/MED/LOW) 포함. 확신도가 낮을수록 수동 확인 필요."],
+            ["4_매칭결과", "한솔페이↔일일마감 자동 매칭 결과. 매칭규칙·확신도(HIGH/MED/LOW)·한솔_승인번호 포함. 승인번호는 한솔페이-일일마감-차트정보 연결 키값."],
             ["5_한솔미매칭", "한솔페이에 정상 승인되었으나 일일마감과 매칭되지 않은 건. 누락·오류 가능성 높음."],
             ["6_일마미매칭", "일일마감에 카드 수납이 있으나 한솔페이와 매칭되지 않은 건."],
             ["7_한솔vs차트_누락추정", "한솔페이↔차트마감 간 금액 비교. 매칭없음/금액부족/초과매칭 등 상태 표시."],
@@ -835,9 +870,12 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 
         # ── Sheet 4: 차트마감 원본 ──
         p_export = patient.copy()
-        p_cols = [c for c in ["p_idx", "차트번호", "이름", "분류", "금액", "카드사",
+        p_cols = [c for c in ["p_idx", "차트번호", "이름", "분류", "플랫폼구분", "금액", "카드사",
                                "본부금", "승인번호목록"] if c in p_export.columns]
         p_export = p_export[p_cols].rename(columns={"p_idx": "순번"})
+        if "승인번호목록" in p_export.columns:
+            p_export["승인번호목록"] = p_export["승인번호목록"].apply(
+                lambda x: ", ".join(x) if isinstance(x, list) else str(x))
         p_export.to_excel(writer, sheet_name="3_차트마감", index=False)
 
         # ── Sheet 5: 매칭결과 ──
