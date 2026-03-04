@@ -425,8 +425,8 @@ def parse_patient(raw):
     pay = _pick_first_series(df, "결제수단").astype(str)
     df["분류"] = "기타"
     df.loc[pay.str.startswith("카드", na=False), "분류"] = "카드"
-    df.loc[pay.str.contains("현금영수증", na=False), "분류"] = "현금"
-    df.loc[(pay == "통장입금") | pay.str.contains("이체", na=False), "분류"] = "이체"
+    df.loc[(pay == "현금") | pay.str.contains("현금영수증", na=False), "분류"] = "현금"
+    df.loc[(pay == "통장") | (pay == "통장입금") | pay.str.contains("이체", na=False), "분류"] = "이체"
     df.loc[pay.str.startswith("기타", na=False), "분류"] = "플랫폼"
 
     # 카드사 추출
@@ -1059,7 +1059,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             ["[누적 분석 시 AI 활용 가이드]", ""],
             ["활용법", "이 파일을 여러 일자 분석 결과와 함께 AI에 업로드하여 패턴을 분석하세요."],
             ["누적 패턴 탐지", "특정 환자/차트번호가 반복적으로 미매칭되거나, 특정 시간대에 취소가 집중되는 패턴을 확인하세요."],
-            ["프롬프트 예시", "이 엑셀 파일들은 병원 정산 3-Way 대사 결과입니다. 각 파일의 '9_세무위험' 시트와 '5_한솔미매칭' 시트를 분석하여 반복되는 의심 패턴을 찾아주세요."],
+            ["프롬프트 예시", "차트정보(3_차트마감)를 기준 원장으로 보고, 4_매칭결과·5_한솔미매칭·6_일마미매칭·7_한솔vs차트_누락추정·8_일마vs차트_수단별비교를 교차검토해 의심거래를 환자별로 찾아주세요. 우선순위는 (1) 차트 반영 없음/부족 금액, (2) 승인번호 불일치, (3) 결제수단 불일치입니다. 결과는 '어떤 환자 수납건부터 확인할지'를 차트번호·이름·금액·근거시트와 함께 Top 10으로 제시해주세요."],
         ]
         guide_df = pd.DataFrame(guide_rows, columns=["항목", "설명"])
         guide_df.to_excel(writer, sheet_name="0_AI안내_데이터사전", index=False)
@@ -1551,10 +1551,7 @@ else:
 
     with t5:
         st.subheader("📝 메신저 정산 요약")
-        st.caption("차트(일일마감) 기준으로 생성 · 복사 버튼으로 바로 붙여넣기")
-
-        # 환자수
-        total_patients = len(daily)
+        st.caption("최종매칭 완료 후 차트정보 기준으로 생성 · 복사 버튼으로 바로 붙여넣기")
 
         # 신환/구환 구분 시도
         type_col = None
@@ -1582,27 +1579,28 @@ else:
         # 취소+부도
         cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
 
-        # 결제수단별 합계 (일일마감 기준)
-        card_total = int(daily["카드"].sum())
-        cash_total = int(daily["현금"].sum())
-        transfer_total = int(daily["이체"].sum())
-        yeoshin = int(daily["여신티켓"].sum())
-        gangnam = int(daily["강남언니"].sum())
-        naman = int(daily["나만의닥터"].sum())
+        # 결제수단별 합계 (최종매칭 시 차트정보 기준)
+        card_total = int(patient[patient["분류"] == "카드"]["금액"].sum())
+        cash_total = int(patient[patient["분류"] == "현금"]["금액"].sum())
+        transfer_total = int(patient[patient["분류"] == "이체"]["금액"].sum())
+        platform_group = patient[patient["분류"] == "플랫폼"]
+        yeoshin = int(platform_group[platform_group["플랫폼구분"] == "여신티켓"]["금액"].sum())
+        gangnam = int(platform_group[platform_group["플랫폼구분"] == "강남언니"]["금액"].sum())
+        naman = int(platform_group[platform_group["플랫폼구분"] == "나만의닥터"]["금액"].sum())
         zeropay = int(daily["제로페이"].sum())
         local_currency = int(daily["기타지역화폐"].sum())
 
         # 환불+취소 금액
         refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
 
-        # Today
-        today_total = int(daily["총액"].sum())
+        # Today (차트 기준)
+        today_total = int(patient["금액"].sum())
 
         # 템플릿 생성
         lines = []
         lines.append("--------------------------------------")
         lines.append("VS라인클리닉 인천점")
-        lines.append(f"총 내원 환자 : {total_patients}명")
+        lines.append("총 내원 환자 : ")
         if type_col:
             lines.append(f"신환예약 : [    ]명 수납 : {new_paid}명 {new_amt:,}원")
             lines.append(f"구환예약 : [    ]명 수납 : {old_paid}명 {old_amt:,}원")
@@ -1645,12 +1643,12 @@ else:
 > '0_AI안내_데이터사전' 시트를 먼저 읽고 데이터 구조를 파악한 후,
 > 아래 항목을 분석해주세요:
 >
-> 1. '5_한솔미매칭' 시트에서 미매칭 건의 패턴 (시간대, 금액대, 카드사 집중 여부)
-> 2. '9_세무위험' 시트의 고위험 건 상세 분석
-> 3. '7_한솔vs차트_누락추정' 시트에서 누락/금액부족 건 분석
-> 4. 전체 데이터에서 의심거래 패턴 종합 의견
+> 1. 차트정보(3_차트마감)를 기준 원장으로 확정하고, '7_한솔vs차트_누락추정'에서 차트 대비 미반영/금액부족 건을 우선순위로 정렬해주세요.
+> 2. '4_매칭결과'와 '6_일마미매칭'을 함께 보고 승인번호/금액/결제수단이 어긋난 건을 환자별로 묶어주세요.
+> 3. '5_한솔미매칭'과 '9_세무위험'을 교차검토해 실제 점검이 필요한 의심거래 Top 10을 제시해주세요.
+> 4. 출력 형식은 "검토 시작 환자 → 차트번호/이름/수납금액/의심사유/근거시트" 순서로 작성해주세요.
 >
-> 여러 날짜의 파일이 있다면 누적 패턴도 분석해주세요.
+> 여러 날짜의 파일이 있다면 동일 차트번호/동일 패턴 반복 여부까지 누적 분석해주세요.
 
 ---
 
