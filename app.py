@@ -1191,18 +1191,40 @@ def build_missing_receipts(match_df, patient, daily, hansol):
     """한솔-차트 매칭 기반 누락 추정 수납건 분석"""
     p_card = patient[patient["분류"] == "카드"].copy()
 
-    # 차트 카드건수: 행 개수가 아니라 승인번호 개수 기준(없으면 1건)
+    # 차트 카드건수: 차트 단위로 고유 승인번호 개수 기준(없으면 행 수)
+    # 동일 승인번호가 여러 행에 중복 기재된 경우를 정확히 처리
     if "승인번호목록" in p_card.columns:
-        p_card["승인번호건수"] = p_card["승인번호목록"].apply(
-            lambda xs: max(1, len({clean_no(x) for x in (xs if isinstance(xs, list) else []) if clean_no(x)}))
-        )
+        _chart_appr_sets = {}
+        _chart_row_counts = {}
+        for _, row in p_card.iterrows():
+            ch = row["차트번호"]
+            _chart_appr_sets.setdefault(ch, set())
+            _chart_row_counts[ch] = _chart_row_counts.get(ch, 0) + 1
+            vals = row.get("승인번호목록", [])
+            if isinstance(vals, list):
+                for a in vals:
+                    aa = clean_no(a)
+                    if aa:
+                        _chart_appr_sets[ch].add(aa)
+        # 승인번호가 있으면 고유 개수, 없으면 행 수를 카드건수로 사용
+        _chart_card_cnt = {
+            ch: len(apprs) if apprs else _chart_row_counts.get(ch, 1)
+            for ch, apprs in _chart_appr_sets.items()
+        }
+        p_card["승인번호건수"] = 0  # placeholder, 아래에서 차트 단위로 집계
     else:
+        _chart_card_cnt = {}
         p_card["승인번호건수"] = 1
 
     chart_card = p_card.groupby(["차트번호", "이름"]).agg(
         차트카드금액=("금액", "sum"),
         차트카드건수=("승인번호건수", "sum"),
     ).reset_index()
+    # 차트 단위 고유 승인번호 개수로 덮어쓰기
+    if _chart_card_cnt:
+        chart_card["차트카드건수"] = chart_card["차트번호"].map(
+            lambda ch: _chart_card_cnt.get(ch, 1)
+        )
 
     # 차트 승인번호 기반 한솔 매칭(차트 1건에 승인번호 2개 이상 입력한 케이스 보강)
     chart_appr = {}
@@ -1245,13 +1267,23 @@ def build_missing_receipts(match_df, patient, daily, hansol):
         return best
 
     appr_rows = []
+    # 카드번호 정보도 함께 관리 (2차 카드번호 매칭용)
+    _card_no_col = "카드번호" if "카드번호" in h_ok_card.columns else None
+    if _card_no_col:
+        h_ok_card["카드번호_norm"] = h_ok_card[_card_no_col].apply(lambda x: clean_no(x)[:12] if pd.notna(x) else "")
+    else:
+        h_ok_card["카드번호_norm"] = ""
+
+    chart_matched_hidx = {}   # ch → set(h_idx)  : 1차 매칭된 한솔 행
+    chart_matched_cards = {}  # ch → set(카드번호) : 1차 매칭된 카드번호
+
     if chart_appr:
         used_hidx = set()
         chart_items = []
         for ch, apprs in chart_appr.items():
             if not apprs:
                 continue
-            cand = h_ok_card[h_ok_card["승인번호_norm"].isin(apprs)][["h_idx", "금액"]].drop_duplicates("h_idx")
+            cand = h_ok_card[h_ok_card["승인번호_norm"].isin(apprs)][["h_idx", "금액", "카드번호_norm"]].drop_duplicates("h_idx")
             chart_items.append((ch, apprs, cand))
 
         # 후보가 적은 차트부터 배정하면 같은 승인번호가 여러 차트에 걸친 경우 중복매칭을 줄일 수 있음
@@ -1262,16 +1294,69 @@ def build_missing_receipts(match_df, patient, daily, hansol):
             target = int(chart_amount_map.get(ch, 0))
             chosen = _best_subset(avail, target)
             if chosen:
-                used_hidx.update(chosen)
-                hm = avail[avail["h_idx"].isin(chosen)]
+                hm = avail.loc[chosen]
+                matched_hidxs = hm["h_idx"].tolist()
+                used_hidx.update(matched_hidxs)
+                chart_matched_hidx[ch] = set(matched_hidxs)
+                # 매칭된 행의 카드번호 수집
+                matched_cards = set(hm["카드번호_norm"].dropna().unique()) - {""}
+                chart_matched_cards[ch] = matched_cards
             else:
                 hm = pd.DataFrame(columns=avail.columns)
+                chart_matched_hidx[ch] = set()
+                chart_matched_cards[ch] = set()
 
             appr_rows.append({
                 "차트번호": ch,
                 "한솔매칭금액_appr": int(hm["금액"].sum()) if not hm.empty else 0,
                 "한솔매칭건수_appr": int(hm["h_idx"].nunique()) if not hm.empty else 0,
             })
+
+        # ── 2차: 카드번호 기반 보완 매칭 ──
+        # 1차에서 부분매칭(금액부족)된 차트에 대해, 매칭된 건의 카드번호로
+        # 미매칭 한솔 건을 추가 탐색하여 매칭률을 높임
+        # 케이스: 승인번호 미기재/오기재(중복·오타), 동일카드 다건 결제 등
+        for i, ar in enumerate(appr_rows):
+            ch = ar["차트번호"]
+            target = int(chart_amount_map.get(ch, 0))
+            current_amt = ar["한솔매칭금액_appr"]
+            if current_amt >= target or target == 0:
+                continue  # 이미 완전 매칭이면 스킵
+            cards = chart_matched_cards.get(ch, set())
+            if not cards:
+                continue  # 카드번호 정보가 없으면 스킵
+
+            # 같은 카드번호의 미사용 한솔 건 검색
+            card_cand = h_ok_card[
+                (h_ok_card["카드번호_norm"].isin(cards)) &
+                (~h_ok_card["h_idx"].isin(used_hidx))
+            ][["h_idx", "금액", "카드번호_norm"]].drop_duplicates("h_idx")
+            if card_cand.empty:
+                continue
+
+            # 기존 매칭 건 + 카드번호 후보를 합쳐서 전체 금액에 최적 조합 재탐색
+            prev_matched = h_ok_card[h_ok_card["h_idx"].isin(chart_matched_hidx.get(ch, set()))][["h_idx", "금액", "카드번호_norm"]]
+            combined = pd.concat([prev_matched, card_cand]).drop_duplicates("h_idx")
+            chosen2 = _best_subset(combined, target)
+            if chosen2:
+                hm2 = combined.loc[chosen2]
+                new_amt = int(hm2["금액"].sum())
+                if abs(target - new_amt) < abs(target - current_amt):
+                    # 개선된 경우에만 적용
+                    new_hidxs = set(hm2["h_idx"].tolist())
+                    # 기존 매칭에서 빠진 h_idx는 used에서 제거, 새로 추가된 건은 used에 추가
+                    old_hidxs = chart_matched_hidx.get(ch, set())
+                    used_hidx -= (old_hidxs - new_hidxs)
+                    used_hidx |= new_hidxs
+                    chart_matched_hidx[ch] = new_hidxs
+                    new_cards = set(hm2["카드번호_norm"].dropna().unique()) - {""}
+                    chart_matched_cards[ch] = new_cards
+                    appr_rows[i] = {
+                        "차트번호": ch,
+                        "한솔매칭금액_appr": new_amt,
+                        "한솔매칭건수_appr": int(hm2["h_idx"].nunique()),
+                    }
+
     h_appr_agg = pd.DataFrame(appr_rows)
 
     # 기존 매칭 결과 기반 집계(승인번호가 없거나 누락된 케이스 fallback)
@@ -1321,6 +1406,115 @@ def build_missing_receipts(match_df, patient, daily, hansol):
         return "✅일치"
 
     result["매칭상태"] = result.apply(_status, axis=1)
+
+    # --- 불일치 원인 분석 ---
+    # 차트별 승인번호 보유 여부
+    chart_has_appr = {}
+    if "승인번호목록" in p_card.columns:
+        for _, row in p_card.iterrows():
+            ch = row["차트번호"]
+            vals = row.get("승인번호목록", [])
+            if isinstance(vals, list) and any(clean_no(a) for a in vals):
+                chart_has_appr[ch] = True
+            elif ch not in chart_has_appr:
+                chart_has_appr[ch] = False
+
+    # 한솔 전체 승인번호 집합 (정상 카드)
+    h_all_appr = set(h_ok_card["승인번호_norm"].dropna().unique()) - {""}
+
+    # 일마 차트번호 집합
+    d_all_charts = set(daily["차트번호"].apply(clean_no).dropna().unique()) - {""}
+
+    # 차트별 승인번호 상세 분석 (행별 승인번호 목록)
+    chart_appr_per_row = {}  # ch → list of (금액, set(승인번호))
+    if "승인번호목록" in p_card.columns:
+        for _, row in p_card.iterrows():
+            ch = row["차트번호"]
+            chart_appr_per_row.setdefault(ch, [])
+            vals = row.get("승인번호목록", [])
+            apprs = set()
+            if isinstance(vals, list):
+                for a in vals:
+                    aa = clean_no(a)
+                    if aa:
+                        apprs.add(aa)
+            chart_appr_per_row[ch].append((int(row.get("금액", 0)), apprs))
+
+    def _reason(row):
+        ch = row["차트번호"]
+        status = row["매칭상태"]
+        if status == "✅일치":
+            return ""
+
+        reasons = []
+        has_appr = chart_has_appr.get(ch, False)
+        chart_amt = int(row["차트카드금액"])
+        hansol_amt = int(row["한솔매칭금액"])
+        daily_amt = int(row.get("일마카드금액", 0))
+        chart_cnt = int(row.get("차트카드건수", 1))
+
+        # 행별 승인번호 분석
+        per_row = chart_appr_per_row.get(ch, [])
+        all_apprs = set()
+        rows_without_appr = []
+        rows_with_appr = []
+        for amt, apprs in per_row:
+            all_apprs |= apprs
+            if not apprs:
+                rows_without_appr.append(amt)
+            else:
+                rows_with_appr.append((amt, apprs))
+
+        # 1) 승인번호 미기재 분석 (부분/전체)
+        if not has_appr:
+            reasons.append("승인번호 미기재(전체)")
+        elif rows_without_appr:
+            missing_amt = sum(rows_without_appr)
+            reasons.append(f"승인번호 부분 미기재({len(rows_without_appr)}건, {missing_amt:,}원)")
+
+        # 2) 승인번호 중복 기재 감지 (다건 결제인데 동일 승인번호 복사)
+        if has_appr and len(per_row) > 1:
+            # 모든 행의 승인번호 집합이 동일한지 확인
+            appr_sets = [apprs for _, apprs in per_row if apprs]
+            if len(appr_sets) >= 2 and all(s == appr_sets[0] for s in appr_sets):
+                if len(appr_sets[0]) < len(appr_sets):
+                    reasons.append(f"승인번호 동일복사 의심({len(appr_sets)}건에 동일번호 기재)")
+
+        # 3) 승인번호가 한솔에서 매칭 안 되는 경우 상세 분석
+        if has_appr and all_apprs:
+            found_in_hansol = all_apprs & h_all_appr
+            not_found = all_apprs - h_all_appr
+            if not found_in_hansol:
+                reasons.append(f"승인번호 {len(all_apprs)}건 모두 한솔에 없음(번호오류/다른날짜)")
+            elif not_found:
+                reasons.append(f"승인번호 일부 한솔에 없음({', '.join(sorted(not_found))})")
+
+        # 4) 차트번호가 일마에 없음
+        if ch not in d_all_charts:
+            reasons.append("차트번호가 일마에 없음(차트번호 오류 추정)")
+
+        # 5) 일마 금액과 차트 금액 불일치
+        if daily_amt > 0 and daily_amt != chart_amt:
+            reasons.append(f"일마카드({daily_amt:,}) ≠ 차트카드({chart_amt:,})")
+
+        # 6) 부분매칭 상세
+        if 0 < hansol_amt < chart_amt:
+            diff = chart_amt - hansol_amt
+            reasons.append(f"부분매칭({hansol_amt:,}원OK, {diff:,}원 누락추정)")
+
+        # 7) 일마에도 없고 한솔에도 없으면 차트 단독 기재
+        if daily_amt == 0 and hansol_amt == 0:
+            reasons.append("일마/한솔 모두 없음(차트 단독기재, 누락 추정)")
+
+        # 8) 초과매칭 원인
+        if hansol_amt > chart_amt > 0:
+            reasons.append(f"한솔이 {hansol_amt - chart_amt:,}원 초과(다른환자 결제 혼입 가능)")
+
+        return " | ".join(reasons) if reasons else "원인 미상"
+
+    result["불일치원인"] = result.apply(_reason, axis=1)
+    result.loc[result["매칭상태"] == "✅일치", "불일치원인"] = ""
+
     missing = result[result["매칭상태"] != "✅일치"].copy()
     return result, missing
 
@@ -2052,7 +2246,7 @@ else:
             view = st.radio("표시", ["누락/불일치만", "전체"], horizontal=True, key="t2b_view")
             disp = missing_only if view == "누락/불일치만" else missing_all
             disp_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액", "차트카드건수",
-                                     "한솔매칭금액", "한솔매칭건수", "일마카드금액", "차이(차트-한솔)"] if c in disp.columns]
+                                     "한솔매칭금액", "한솔매칭건수", "일마카드금액", "차이(차트-한솔)", "불일치원인"] if c in disp.columns]
             st.dataframe(disp[disp_cols].sort_values("매칭상태"), use_container_width=True, hide_index=True)
 
             # 누락 요약 통계
