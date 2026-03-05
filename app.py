@@ -823,8 +823,8 @@ def run_matching(hansol, daily, patient):
                     한솔_승인번호=str(hr.get("승인번호", "")),
                     한솔_유형="현금영수증",
                     일마_순서=dr["내원순서"], 일마_성명=dr["성명"],
-                    일마_차트=dr["차트번호"], 일마_카드=int(dr["카드"]),
-                    비고="",
+                    일마_차트=dr["차트번호"], 일마_카드=int(amt),
+                    비고=f"일마_{amt_col}={amt:,}",
                 ))
                 matched_h.add(hr["h_idx"])
 
@@ -861,7 +861,7 @@ def run_matching(hansol, daily, patient):
                         한솔_승인번호=str(hr.get("승인번호", "")),
                         한솔_유형="현금영수증",
                         일마_순서=dr["내원순서"], 일마_성명=dr["성명"],
-                        일마_차트=dr["차트번호"], 일마_카드=int(dr["카드"]),
+                        일마_차트=dr["차트번호"], 일마_카드=int(amt),
                         비고=f"복합결제 ({amt:,}원 {'현금' if '현금' in rule_tag else '이체'})",
                     ))
                     matched_h.add(hr["h_idx"])
@@ -1483,9 +1483,10 @@ def _build_cross_reference_sheet(match_df, patient, hansol):
                 p_apprs.extend(pr["승인번호목록"])
         p_card_cos = [str(x) for x in p_rows[p_rows["분류"] == "카드"]["카드사"].unique() if str(x).strip()]
 
-        # 매칭 정보
+        # 매칭 정보 (카드 매칭만 카드금액 비교에 사용, 현금영수증 매칭은 별도)
         m_rows = match_df[match_df["일마_차트"].apply(clean_no) == ch] if "일마_차트" in match_df.columns else pd.DataFrame()
-        m_card_amt = int(m_rows["한솔_금액"].sum()) if not m_rows.empty else 0
+        m_card_rows = m_rows[m_rows["한솔_유형"] != "현금영수증"] if not m_rows.empty and "한솔_유형" in m_rows.columns else m_rows
+        m_card_amt = int(m_card_rows["한솔_금액"].sum()) if not m_card_rows.empty else 0
         m_count = len(m_rows)
         m_card_nos = list(set(clean_no(str(x))[:12] for x in m_rows.get("한솔_카드번호", []) if clean_no(str(x))))
         m_apprs = list(set(str(x) for x in m_rows.get("한솔_승인번호", []) if str(x).strip()))
@@ -1904,11 +1905,16 @@ else:
             st.info(f"📌 차트마감에 '기타(미분류)' {p_etc:,}원이 있습니다. 카드/현금/이체/플랫폼에 분류되지 않은 금액입니다.")
 
         def _highlight_vs_chart(row):
-            """차트마감 기준 비교: 일치=파란배경, 불일치=붉은배경"""
+            """차트마감 기준 비교: 차트마감=항상 파란배경, 일치=파란배경, 불일치=붉은배경"""
             styles = [""] * len(row)
             chart_val = row["차트마감"]
             for i, (col, val) in enumerate(row.items()):
-                if col in ("구분", "차트마감"):
+                if col == "구분":
+                    continue
+                # 차트마감 컬럼은 항상 파란색 배경
+                if col == "차트마감":
+                    if str(val) != "-":
+                        styles[i] = "background-color: #3b82f6; color: white"
                     continue
                 if str(val) == "-" or str(chart_val) == "-":
                     continue
