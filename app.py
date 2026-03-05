@@ -1,6 +1,15 @@
 """
-병원 정산 3-Way 대사 시스템 v2.1
+병원 정산 3-Way 대사 시스템 v3.0
 한솔페이 × 일일마감 × 차트마감(환자별집계) 자동 매칭 + 의심건 즉시 탐지
+
+v2.1 → v3.0 주요 개선:
+  12. 공유카드 매칭 – 2인 이상이 1개 카드로 결제한 경우 카드번호 기반 자동 매칭
+  13. 복합결제 매칭 – 1인이 카드+현금+이체 등 여러 수단으로 결제 시 통합 추적
+  14. 카드번호 자동연결 – 승인번호 미기재 시 동일 차트의 다른 결제건 카드번호로 자동 연결
+  15. 누락건 소급재검토(P9) – 후속 매칭 정보로 이전 누락건 재매칭
+  16. AI 통합파일 구조 최적화 – 관계형 키 연결 + 크로스레퍼런스 시트 추가
+  17. AI 프롬프트 고도화 – 불일치 거래건 추론 특화 프롬프트
+  18. 정확도 검증 강화 – 매칭 후 데이터 무결성 자동 검증
 
 v1 대비 주요 개선:
   1. parse_hansol_time 이중파싱 버그 수정
@@ -26,7 +35,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="병원 정산 3-Way 대사", layout="wide")
+st.set_page_config(page_title="병원 정산 3-Way 대사 v3.0", layout="wide")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -508,15 +517,21 @@ def parse_patient(raw):
 
 def run_matching(hansol, daily, patient):
     """
-    8-Pass 매칭:
+    10-Pass 매칭 (v3.0):
       P1: 승인번호 직접매칭
+      P1b: 공동결제 합산 (1카드 N차트)
+      P1c: 공유카드 매칭 (동일 카드번호, 다른 환자)
       P2: 유일 금액 1:1
       P2b: 카드사+금액 (동일금액 다건 → 카드사 구분)
       P3: 분할결제 2~3건 합 (시간근접)
       P3b: 본부금 기반 분할결제 (차트 본부금 힌트)
       P4: 시간-순서 상관 (동일금액 다건, 카드사 우선)
       P5: 현금영수증 + 이체
+      P5b: 복합결제 매칭 (1인 다수단 → 카드+현금+이체 통합)
       P6: 한솔↔일마 결과 기반 한솔↔차트 크로스레퍼런스 재매칭
+      P7: 분할결제 크로스레퍼런스
+      P8: 차트 분할결제 보강
+      P9: 누락건 소급재검토 (후속 정보로 이전 누락건 재매칭)
     """
     h_ok = hansol[hansol["tx_status"] == "정상"]
     h_card = h_ok[~h_ok["is_현금"]].copy()
@@ -623,6 +638,48 @@ def run_matching(hansol, daily, patient):
                 note=f"공동결제 승인번호 {appr_no} / 차트 {', '.join(chosen_charts)} (원거래 {target:,}원)",
             )
 
+    # P1c - 공유카드 매칭: 동일 카드번호를 2인 이상이 사용한 경우
+    # 한솔페이의 카드번호를 기반으로 같은 카드를 사용한 여러 환자를 시간순으로 매칭
+    if "카드번호" in h_card.columns:
+        # 미매칭 한솔 카드건 중 동일 카드번호가 여러 건인 경우 탐지
+        h_unmatched_card = h_card[~h_card["h_idx"].isin(matched_h)].copy()
+        if not h_unmatched_card.empty and "카드번호" in h_unmatched_card.columns:
+            h_unmatched_card["카드번호_norm"] = h_unmatched_card["카드번호"].apply(lambda x: clean_no(x)[:12])
+            # 승인번호→차트 맵에서 이미 매칭된 카드번호 수집
+            matched_card_chart = {}  # card_no -> set(chart_no)
+            for r in results:
+                card_n = clean_no(r.get("한솔_카드번호", ""))[:12]
+                chart_n = clean_no(r.get("일마_차트", ""))
+                if card_n and chart_n:
+                    matched_card_chart.setdefault(card_n, set()).add(chart_n)
+
+            for card_no, group in h_unmatched_card.groupby("카드번호_norm"):
+                if not card_no or len(group) < 1:
+                    continue
+                # 이 카드번호로 이미 매칭된 차트 확인
+                known_charts = matched_card_chart.get(card_no, set())
+                if not known_charts:
+                    continue
+                # 같은 카드를 사용하는 다른 차트(환자)의 미매칭 일마 건 탐색
+                for _, hr in group.iterrows():
+                    if hr["h_idx"] in matched_h:
+                        continue
+                    amt = int(hr["금액"])
+                    # 같은 카드번호의 차트에 속한 미매칭 일마 건 중 금액 일치하는 건
+                    for ch in known_charts:
+                        dc = d_card[(d_card["차트번호"] == ch) & (d_card["카드"] == amt) & (~d_card["d_idx"].isin(matched_dc))]
+                        if len(dc) == 1:
+                            add("P1c_공유카드", "🟢HIGH", [hr["h_idx"]], dc.iloc[0],
+                                note=f"카드번호 {card_no[-4:]} 공유 (차트 {ch})")
+                            break
+                    # 다른 차트(같은 카드번호를 쓰는 새로운 환자) 검색
+                    if hr["h_idx"] not in matched_h:
+                        dc_all = d_card[(d_card["카드"] == amt) & (~d_card["d_idx"].isin(matched_dc))]
+                        if len(dc_all) == 1:
+                            # 유일 금액이면서 같은 카드번호 → 높은 확신도
+                            add("P1c_공유카드", "🟡MED", [hr["h_idx"]], dc_all.iloc[0],
+                                note=f"카드번호 {card_no[-4:]} / 유일금액 매칭")
+
     # P2
     for _, dr in d_card.iterrows():
         if dr["d_idx"] in matched_dc:
@@ -701,14 +758,15 @@ def run_matching(hansol, daily, patient):
         if best_pair and best_spread <= 15:
             add("P3b_본부금분할", "🟢HIGH" if best_spread <= 5 else "🟡MED", list(best_pair), dr)
 
+    # 시간 문자열 → 분 변환 유틸 (여러 패스에서 공용)
+    def _t2m(ts):
+        p = str(ts).split(":")
+        return int(p[0]) * 60 + int(p[1]) if len(p) >= 2 else 0
+
     # P4
     confirmed = [(r["한솔_시간"], r["일마_순서"]) for r in results if r["확신도"] == "🟢HIGH" and r["한솔_시간"]]
     if confirmed:
         confirmed.sort()
-
-        def _t2m(ts):
-            p = str(ts).split(":")
-            return int(p[0]) * 60 + int(p[1]) if len(p) >= 2 else 0
 
         for _, dr in d_card.sort_values("내원순서").iterrows():
             if dr["d_idx"] in matched_dc:
@@ -757,15 +815,56 @@ def run_matching(hansol, daily, patient):
                 hr = hc.iloc[0]
                 results.append(dict(
                     매칭규칙=rule_tag, 확신도="🟢HIGH" if len(hc) == 1 else "🟡MED",
+                    한솔_hidx=int(hr["h_idx"]),
                     한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(amt),
+                    한솔_원거래금액=int(hr["금액"]),
                     한솔_카드번호=str(hr.get("카드번호", "")),
                     한솔_카드사="",
                     한솔_승인번호=str(hr.get("승인번호", "")),
                     한솔_유형="현금영수증",
                     일마_순서=dr["내원순서"], 일마_성명=dr["성명"],
                     일마_차트=dr["차트번호"], 일마_카드=int(dr["카드"]),
+                    비고="",
                 ))
                 matched_h.add(hr["h_idx"])
+
+    # P5b - 복합결제 매칭: 1인이 카드+현금/이체로 결제한 경우
+    # 일마에 카드+현금 또는 카드+이체가 모두 있는 환자의 현금/이체 부분을 한솔 현금영수증과 매칭
+    for _, dr in daily.iterrows():
+        card_amt = dr.get("카드", 0)
+        cash_amt = dr.get("현금", 0)
+        xfer_amt = dr.get("이체", 0)
+        # 카드가 이미 매칭된 환자의 현금/이체 부분을 추가 매칭
+        if dr["d_idx"] in matched_dc and (cash_amt > 0 or xfer_amt > 0):
+            chart_no = clean_no(dr["차트번호"])
+            for amt, rule_tag in [(cash_amt, "P5b_복합결제_현금"), (xfer_amt, "P5b_복합결제_이체")]:
+                if amt <= 0:
+                    continue
+                hc = h_cash[(h_cash["금액"] == amt) & (~h_cash["h_idx"].isin(matched_h))]
+                if not hc.empty:
+                    # 시간 근접도로 최적 선택 (같은 환자의 카드 매칭 시간 참조)
+                    ref_times = [r["한솔_시간"] for r in results
+                                 if clean_no(r.get("일마_차트", "")) == chart_no and r.get("한솔_시간")]
+                    if ref_times and len(hc) > 1:
+                        avg_t = sum(_t2m(t) for t in ref_times) / len(ref_times)
+                        best = hc.iloc[(hc["시간_분"] - avg_t).abs().argsort()[:1]]
+                        hr = best.iloc[0]
+                    else:
+                        hr = hc.iloc[0]
+                    results.append(dict(
+                        매칭규칙=rule_tag, 확신도="🟢HIGH" if len(hc) == 1 else "🟡MED",
+                        한솔_hidx=int(hr["h_idx"]),
+                        한솔_시간=hr.get("시간표시", ""), 한솔_금액=int(amt),
+                        한솔_원거래금액=int(hr["금액"]),
+                        한솔_카드번호=str(hr.get("카드번호", "")),
+                        한솔_카드사="",
+                        한솔_승인번호=str(hr.get("승인번호", "")),
+                        한솔_유형="현금영수증",
+                        일마_순서=dr["내원순서"], 일마_성명=dr["성명"],
+                        일마_차트=dr["차트번호"], 일마_카드=int(dr["카드"]),
+                        비고=f"복합결제 ({amt:,}원 {'현금' if '현금' in rule_tag else '이체'})",
+                    ))
+                    matched_h.add(hr["h_idx"])
 
     # P6 - Round2: 한솔↔일마 매칭 결과로 구축한 차트 레퍼런스 재활용
     match_df = pd.DataFrame(results)
@@ -931,6 +1030,120 @@ def run_matching(hansol, daily, patient):
                 dr = daily_chart_ref.get(chart_no)
                 if dr is not None:
                     add("P8_차트분할보강", "🟡MED", [int(hr["h_idx"])], dr)
+
+    # P9 - 누락건 소급재검토: 모든 패스 완료 후 축적된 정보로 미매칭 건 재검토
+    # 이전 패스에서 정보 부족으로 누락됐지만, 이후 매칭으로 확보된 정보(카드번호, 카드사, 시간대)로 재매칭
+    match_df_final = pd.DataFrame(results)
+    if not match_df_final.empty:
+        # 전체 매칭 결과에서 차트별 카드번호·카드사 레퍼런스 최종 구축
+        final_card_refs = {}   # chart_no -> set(card_no)
+        final_co_refs = {}     # chart_no -> set(card_company)
+        final_time_refs = {}   # chart_no -> [time_in_minutes]
+        card_rows_final = match_df_final[match_df_final.get("한솔_유형", pd.Series(dtype=str)) == "카드"] if "한솔_유형" in match_df_final.columns else pd.DataFrame()
+
+        for _, mr in card_rows_final.iterrows():
+            ch = clean_no(mr.get("일마_차트", ""))
+            if not ch:
+                continue
+            card_no = clean_no(mr.get("한솔_카드번호", ""))[:12]
+            co = str(mr.get("한솔_카드사", "")).strip()
+            t = mr.get("한솔_시간", "")
+            if card_no:
+                final_card_refs.setdefault(ch, set()).add(card_no)
+            if co:
+                final_co_refs.setdefault(ch, set()).add(co)
+            if t:
+                p = str(t).split(":")
+                if len(p) >= 2:
+                    final_time_refs.setdefault(ch, []).append(int(p[0]) * 60 + int(p[1]))
+
+        # 미매칭 일마 카드건 재검토
+        for _, dr in d_card.iterrows():
+            if dr["d_idx"] in matched_dc:
+                continue
+            chart_no = clean_no(dr["차트번호"])
+            target = int(dr["카드"])
+            hc = h_card[(h_card["금액"] == target) & (~h_card["h_idx"].isin(matched_h))]
+            if hc.empty:
+                continue
+
+            # P9a: 카드번호 레퍼런스로 재매칭 (승인번호 없어도 카드번호로 연결)
+            ref_cards = final_card_refs.get(chart_no, set())
+            if ref_cards and "카드번호" in hc.columns:
+                hc_ref = hc[hc["카드번호"].apply(lambda x: clean_no(x)[:12] in ref_cards)]
+                if len(hc_ref) == 1:
+                    add("P9a_소급_카드번호", "🟢HIGH", [int(hc_ref.iloc[0]["h_idx"])], dr,
+                        note="소급재검토: 후속매칭 카드번호 일치")
+                    continue
+                elif len(hc_ref) > 1:
+                    # 시간 근접도로 선택
+                    ref_times = final_time_refs.get(chart_no, [])
+                    if ref_times:
+                        avg_t = sum(ref_times) / len(ref_times)
+                        best = hc_ref.iloc[(hc_ref["시간_분"] - avg_t).abs().argsort()[:1]]
+                        add("P9a_소급_카드번호", "🟡MED", [int(best.iloc[0]["h_idx"])], dr,
+                            note="소급재검토: 카드번호+시간근접")
+                        continue
+
+            # P9b: 카드사 레퍼런스로 재매칭
+            ref_cos = final_co_refs.get(chart_no, set())
+            p_cos = chart_info.get(chart_no, {}).get("카드사_list", [])
+            all_cos = list(ref_cos) + [c for c in p_cos if c not in ref_cos]
+            if all_cos and len(hc) > 1:
+                hc_co = hc[hc["카드사"].apply(lambda x: any(card_company_match(x, c) for c in all_cos))]
+                if len(hc_co) == 1:
+                    add("P9b_소급_카드사", "🟡MED", [int(hc_co.iloc[0]["h_idx"])], dr,
+                        note="소급재검토: 후속매칭 카드사 일치")
+                    continue
+
+            # P9c: 분할결제 소급 - 같은 카드번호의 미매칭 건 2~3건 합산
+            if ref_cards and "카드번호" in h_card.columns:
+                for card_ref in ref_cards:
+                    if dr["d_idx"] in matched_dc:
+                        break
+                    hc_by_card = h_card[
+                        (~h_card["h_idx"].isin(matched_h)) &
+                        (h_card["카드번호"].apply(lambda x: clean_no(x)[:12] == card_ref))
+                    ]
+                    if len(hc_by_card) < 2:
+                        continue
+                    for r in [2, 3]:
+                        if dr["d_idx"] in matched_dc or len(hc_by_card) < r:
+                            break
+                        items_list = hc_by_card[["h_idx", "금액", "시간_분"]].values.tolist()
+                        for combo in combinations(range(len(items_list)), r):
+                            items = [items_list[k] for k in combo]
+                            if sum(it[1] for it in items) == target:
+                                times = [it[2] for it in items]
+                                spread = max(times) - min(times) if times else 999
+                                if spread <= 15:
+                                    idxs = [int(it[0]) for it in items]
+                                    conf = "🟢HIGH" if spread <= 5 else "🟡MED"
+                                    add(f"P9c_소급_분할{r}건", conf, idxs, dr,
+                                        note=f"소급재검토: 카드번호 {card_ref[-4:]} 분할")
+                                    break
+
+        # P9d: 미매칭 한솔건 소급 - 차트 승인번호가 없지만 카드번호가 다른 차트에 매칭된 경우
+        for _, hr in h_card[~h_card["h_idx"].isin(matched_h)].iterrows():
+            if "카드번호" not in hr.index:
+                continue
+            card_no = clean_no(hr.get("카드번호", ""))[:12]
+            if not card_no:
+                continue
+            # 이 카드번호가 매칭된 차트 확인
+            linked_charts = set()
+            for ch, refs in final_card_refs.items():
+                if card_no in refs:
+                    linked_charts.add(ch)
+            if not linked_charts:
+                continue
+            amt = int(hr["금액"])
+            for ch in linked_charts:
+                dc = d_card[(d_card["차트번호"] == ch) & (d_card["카드"] == amt) & (~d_card["d_idx"].isin(matched_dc))]
+                if len(dc) == 1:
+                    add("P9d_소급_한솔카드번호", "🟡MED", [int(hr["h_idx"])], dc.iloc[0],
+                        note=f"소급재검토: 카드번호 {card_no[-4:]} → 차트 {ch}")
+                    break
 
     return pd.DataFrame(results), matched_h, matched_dc
 
@@ -1240,46 +1453,160 @@ def tax_risk(hansol, daily, patient, matched_h):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def _build_cross_reference_sheet(match_df, patient, hansol):
+    """크로스레퍼런스 시트: 차트번호별 모든 연결 정보를 한눈에 볼 수 있게 구성"""
+    if match_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    # 차트번호별 매칭 정보 집계
+    charts = set()
+    if "일마_차트" in match_df.columns:
+        charts = set(match_df["일마_차트"].apply(clean_no).unique())
+    for ch in patient["차트번호"].unique():
+        charts.add(clean_no(ch))
+
+    for ch in sorted(charts):
+        if not ch:
+            continue
+        # 차트마감 정보
+        p_rows = patient[patient["차트번호"] == ch]
+        p_name = p_rows["이름"].iloc[0] if not p_rows.empty else ""
+        p_card_amt = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum())
+        p_cash_amt = int(p_rows[p_rows["분류"] == "현금"]["금액"].sum())
+        p_xfer_amt = int(p_rows[p_rows["분류"] == "이체"]["금액"].sum())
+        p_plat_amt = int(p_rows[p_rows["분류"] == "플랫폼"]["금액"].sum())
+        p_total = int(p_rows["금액"].sum())
+        p_apprs = []
+        for _, pr in p_rows.iterrows():
+            if isinstance(pr.get("승인번호목록"), list):
+                p_apprs.extend(pr["승인번호목록"])
+        p_card_cos = [str(x) for x in p_rows[p_rows["분류"] == "카드"]["카드사"].unique() if str(x).strip()]
+
+        # 매칭 정보
+        m_rows = match_df[match_df["일마_차트"].apply(clean_no) == ch] if "일마_차트" in match_df.columns else pd.DataFrame()
+        m_card_amt = int(m_rows["한솔_금액"].sum()) if not m_rows.empty else 0
+        m_count = len(m_rows)
+        m_card_nos = list(set(clean_no(str(x))[:12] for x in m_rows.get("한솔_카드번호", []) if clean_no(str(x))))
+        m_apprs = list(set(str(x) for x in m_rows.get("한솔_승인번호", []) if str(x).strip()))
+        m_rules = list(m_rows["매칭규칙"].unique()) if not m_rows.empty else []
+        m_confs = list(m_rows["확신도"].unique()) if not m_rows.empty else []
+
+        rows.append({
+            "차트번호": ch,
+            "환자명": p_name,
+            "차트_카드금액": p_card_amt,
+            "차트_현금금액": p_cash_amt,
+            "차트_이체금액": p_xfer_amt,
+            "차트_플랫폼금액": p_plat_amt,
+            "차트_총액": p_total,
+            "차트_승인번호": ", ".join(p_apprs),
+            "차트_카드사": ", ".join(p_card_cos),
+            "매칭_건수": m_count,
+            "매칭_금액합": m_card_amt,
+            "매칭_카드번호": ", ".join(m_card_nos),
+            "매칭_승인번호": ", ".join(m_apprs),
+            "매칭_규칙": ", ".join(m_rules),
+            "매칭_확신도": ", ".join(m_confs),
+            "차이(차트-매칭)": p_card_amt - m_card_amt,
+            "상태": "✅일치" if p_card_amt == m_card_amt else ("⚠️차이" if m_card_amt > 0 else "❌미매칭"),
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_dc):
+    """데이터 무결성 검증 결과"""
+    checks = []
+
+    # 1. 한솔 정상건 총액 vs 매칭 총액
+    h_ok = hansol[hansol["tx_status"] == "정상"]
+    h_ok_card = h_ok[~h_ok["is_현금"]]
+    h_ok_cash = h_ok[h_ok["is_현금"]]
+    h_total = int(h_ok["금액"].sum())
+    m_total = int(match_df["한솔_금액"].sum()) if not match_df.empty else 0
+    checks.append({"검증항목": "한솔 정상건 총액", "값": f"{h_total:,}", "비교대상": "매칭 총액", "비교값": f"{m_total:,}",
+                    "결과": "✅" if h_total == m_total else f"⚠️ 차이 {h_total - m_total:,}"})
+
+    # 2. 매칭된 한솔 건수 중복 체크
+    if not match_df.empty and "한솔_hidx" in match_df.columns:
+        h_idxs = match_df["한솔_hidx"].tolist()
+        dup_count = len(h_idxs) - len(set(h_idxs))
+        checks.append({"검증항목": "한솔 중복매칭", "값": f"{dup_count}건", "비교대상": "기대값", "비교값": "0건",
+                        "결과": "✅" if dup_count == 0 else f"⚠️ {dup_count}건 중복"})
+
+    # 3. 일마 카드 총액 vs 매칭 총액
+    d_card_total = int(daily["카드"].sum())
+    checks.append({"검증항목": "일마 카드 총액", "값": f"{d_card_total:,}", "비교대상": "한솔 카드 총액", "비교값": f"{int(h_ok_card['금액'].sum()):,}",
+                    "결과": "✅" if d_card_total == int(h_ok_card["금액"].sum()) else f"⚠️ 차이 {d_card_total - int(h_ok_card['금액'].sum()):,}"})
+
+    # 4. 차트 총액 vs 일마 총액
+    p_total = int(patient["금액"].sum())
+    d_total = int(daily["총액"].sum())
+    checks.append({"검증항목": "차트 총액", "값": f"{p_total:,}", "비교대상": "일마 총액", "비교값": f"{d_total:,}",
+                    "결과": "✅" if p_total == d_total else f"⚠️ 차이 {p_total - d_total:,}"})
+
+    # 5. 미매칭 건수
+    h_unmatched = len(h_ok) - len(matched_h)
+    d_unmatched = len(daily[daily["카드"] > 0]) - len(matched_dc & set(daily[daily["카드"] > 0]["d_idx"]))
+    checks.append({"검증항목": "한솔 미매칭", "값": f"{h_unmatched}건", "비교대상": "일마 미매칭", "비교값": f"{d_unmatched}건",
+                    "결과": "✅" if h_unmatched == 0 and d_unmatched == 0 else f"⚠️ 한솔{h_unmatched}/일마{d_unmatched}"})
+
+    return pd.DataFrame(checks)
+
+
 def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                           missing_all, missing_only, pc, tx, tots,
-                          h_um, d_um, matched_h):
-    """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성"""
+                          h_um, d_um, matched_h, matched_dc=None):
+    """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성 (v3.0)"""
+    if matched_dc is None:
+        matched_dc = set()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
 
         # ── Sheet 1: AI_안내 (시스템 개요 + 데이터 사전) ──
         guide_rows = [
             ["[시스템 개요]", ""],
-            ["시스템명", "병원 정산 3-Way 대사 시스템 v2.1"],
-            ["목적", "한솔페이(PG사) × 일일마감(프론트) × 차트마감(EMR) 교차 검증으로 의심거래 탐지"],
+            ["시스템명", "병원 정산 3-Way 대사 시스템 v3.0"],
+            ["목적", "한솔페이(PG사) × 일일마감(프론트) × 차트마감(EMR) 3개 자료의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 추론"],
             ["분석일시", datetime.now().strftime("%Y-%m-%d %H:%M")],
             ["", ""],
-            ["[데이터 출처 설명]", ""],
-            ["한솔페이(Sheet: 1_한솔페이)", "PG사(결제대행사)에서 실제 승인/취소된 카드·현금영수증 거래 원본. 금액·시간·승인번호·카드사 포함."],
-            ["일일마감(Sheet: 2_일일마감)", "병원 프론트에서 작성하는 일일 환자별 수납 기록. 차트번호·성명·결제수단별 금액 포함."],
-            ["차트마감(Sheet: 3_차트마감)", "EMR(전자의무기록)의 환자별 결제 집계. 차트번호·이름·결제수단·금액·본부금 포함. 승인번호목록(결제메모에서 6~8자리 추출)과 플랫폼구분(강언→강남언니, 나닥→나만의닥터, 여신→여신티켓) 포함."],
+            ["[핵심 원칙]", ""],
+            ["기준 원장", "3_차트마감(EMR)이 최종 기준 원장. 모든 비교는 차트마감 기준으로 수행."],
+            ["연결 키", "승인번호(6~8자리) → 한솔페이↔차트마감 직접 연결. 카드번호(뒤 12자리) → 동일 환자 다건 연결. 차트번호 → 일마↔차트 연결."],
+            ["매칭 방향", "한솔페이 → 일일마감 매칭(4_매칭결과) → 차트마감과 교차검증(7, 8시트)"],
             ["", ""],
-            ["[핵심 시트 설명]", ""],
-            ["4_매칭결과", "한솔페이↔일일마감 자동 매칭 결과. 매칭규칙·확신도(HIGH/MED/LOW)·한솔_승인번호 포함. 승인번호는 한솔페이-일일마감-차트정보 연결 키값."],
-            ["5_한솔미매칭", "한솔페이에 정상 승인되었으나 일일마감과 매칭되지 않은 건. 누락·오류 가능성 높음."],
-            ["6_일마미매칭", "일일마감에 카드 수납이 있으나 한솔페이와 매칭되지 않은 건."],
-            ["7_한솔vs차트_누락추정", "한솔페이↔차트마감 간 금액 비교. 매칭없음/금액부족/초과매칭 등 상태 표시."],
-            ["8_일마vs차트_수단별비교", "일일마감↔차트마감 결제수단별 금액 비교. 불일치 상세 포함."],
-            ["9_세무위험", "자동 탐지된 세무 위험 항목. 과소신고·차트번호불일치·취소거래 등. 위험등급(높음/중간) 포함."],
-            ["10_합계비교", "3개 데이터 소스의 결제수단별 합계 교차 비교."],
+            ["[데이터 출처 및 관계]", ""],
+            ["1_한솔페이", "PG사(결제대행사) 실제 승인/취소 카드·현금영수증 거래 원본. [키: 승인번호, 카드번호, 금액, 시간]"],
+            ["2_일일마감", "병원 프론트 일일 환자별 수납 기록. [키: 차트번호, 성명] → 결제수단별 금액(카드/현금/이체/플랫폼)"],
+            ["3_차트마감", "EMR 환자별 결제 집계 (★기준 원장). [키: 차트번호, 이름] → 결제수단·금액·본부금·승인번호목록"],
             ["", ""],
-            ["[의심거래 판단 기준 (AI 분석 시 참고)]", ""],
-            ["과소신고 위험(높음)", "한솔페이에 정상 승인되었으나 차트에 미반영된 건 → 매출 누락 가능성"],
-            ["차트번호 불일치(중간)", "일마/차트 간 동일 환자이나 차트번호가 다른 경우 → 이중 차트 또는 입력 오류"],
-            ["취소거래 확인(중간)", "한솔페이에 취소 기록 → 정상 환불 여부 확인 필요"],
-            ["한솔 미매칭(높음)", "PG사에 기록 있으나 병원 장부에 없음 → 수납 누락 또는 현금 전환 의심"],
-            ["금액 불일치(중간)", "같은 환자의 결제수단별 금액이 소스 간 다름 → 수납 오류 또는 조작 가능성"],
-            ["분할결제 패턴(참고)", "동일 시간대 2~3건 소액 분할 → 의도적 분할 여부 확인"],
+            ["[분석 결과 시트 연결 관계]", ""],
+            ["4_매칭결과", "한솔페이↔일일마감 자동매칭. [연결키: 한솔_hidx↔1_한솔페이.순번, 일마_차트↔2_일일마감.차트번호] 매칭규칙·확신도(HIGH/MED/LOW) 포함."],
+            ["5_한솔미매칭", "한솔에 있으나 일마에 없는 건 → ★최우선 점검 대상"],
+            ["6_일마미매칭", "일마에 있으나 한솔에 없는 건 → 수기 수납 또는 PG 미경유 건"],
+            ["7_한솔vs차트_누락추정", "차트마감 기준 한솔 매칭 금액 비교 → 미반영/부족/초과 상태"],
+            ["8_일마vs차트_수단별비교", "일마↔차트 결제수단별 금액 교차비교 → 수단 간 불일치 상세"],
+            ["9_세무위험", "자동 탐지 세무위험. 위험등급(🔴높음/🟡중간) 포함."],
+            ["10_합계비교", "3개 소스 결제수단별 합계 교차비교 → 전체 균형 확인"],
+            ["11_크로스레퍼런스", "★ 차트번호별 모든 연결정보 통합 뷰 (차트금액·매칭금액·카드번호·승인번호·매칭규칙·차이)"],
+            ["12_무결성검증", "데이터 연결 정확도 자동 검증 결과 → 중복매칭·총액불일치 등 감지"],
             ["", ""],
-            ["[누적 분석 시 AI 활용 가이드]", ""],
-            ["활용법", "이 파일을 여러 일자 분석 결과와 함께 AI에 업로드하여 패턴을 분석하세요."],
-            ["누적 패턴 탐지", "특정 환자/차트번호가 반복적으로 미매칭되거나, 특정 시간대에 취소가 집중되는 패턴을 확인하세요."],
-            ["프롬프트 예시", "차트정보(3_차트마감)를 기준 원장으로 보고, 4_매칭결과·5_한솔미매칭·6_일마미매칭·7_한솔vs차트_누락추정·8_일마vs차트_수단별비교를 교차검토해 의심거래를 환자별로 찾아주세요. 우선순위는 (1) 차트 반영 없음/부족 금액, (2) 승인번호 불일치, (3) 결제수단 불일치입니다. 결과는 '어떤 환자 수납건부터 확인할지'를 차트번호·이름·금액·근거시트와 함께 Top 10으로 제시해주세요."],
+            ["[3개 자료 불일치 거래건 추론 가이드 - AI 필독]", ""],
+            ["★ 분석 목적", "3개 자료(한솔페이·일일마감·차트마감)의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾는 것"],
+            ["Step 1", "10_합계비교에서 구분별(카드/현금/플랫폼) 차이 금액 확인 → 불일치가 어디서 발생하는지 파악"],
+            ["Step 2", "11_크로스레퍼런스에서 '상태' 컬럼이 ❌미매칭 또는 ⚠️차이인 환자를 추출"],
+            ["Step 3", "5_한솔미매칭 건의 승인번호·카드번호를 3_차트마감에서 검색 → 차트에 기록은 있으나 매칭이 안 된 건인지 확인"],
+            ["Step 4", "8_일마vs차트_수단별비교에서 불일치상세가 '✅일치'가 아닌 건의 원인 분석 (수단 오분류/금액 차이)"],
+            ["Step 5", "위 결과를 종합하여 '이 거래건이 총합을 맞지 않게 한다'는 근거와 함께 우선순위 리스트 작성"],
+            ["", ""],
+            ["[의심거래 판단 기준]", ""],
+            ["🔴 과소신고 위험", "한솔페이에 정상 승인되었으나 차트에 미반영 → 매출 누락 가능성"],
+            ["🔴 한솔 미매칭", "PG사에 기록 있으나 병원 장부에 없음 → 수납 누락 또는 현금 전환 의심"],
+            ["🟡 금액 불일치", "같은 환자의 결제수단별 금액이 소스 간 다름 → 수납 오류 또는 조작 가능성"],
+            ["🟡 차트번호 불일치", "일마/차트 간 동일 환자이나 차트번호가 다른 경우 → 이중 차트 또는 입력 오류"],
+            ["🟡 취소거래 확인", "한솔페이에 취소 기록 → 정상 환불 여부 확인 필요"],
+            ["ℹ️ 분할결제 패턴", "동일 시간대 2~3건 소액 분할 → 의도적 분할 여부 확인"],
+            ["ℹ️ 공유카드 패턴", "동일 카드번호가 다른 환자에게 사용 → 가족 결제 등 확인"],
         ]
         guide_df = pd.DataFrame(guide_rows, columns=["항목", "설명"])
         guide_df.to_excel(writer, sheet_name="0_AI안내_데이터사전", index=False)
@@ -1362,7 +1689,6 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
         p_etc_ex = tots.get("p_etc", 0)
-        # 일마감 플랫폼 == 차트마감 플랫폼이면 검증된 금액으로 한솔 합계에 반영
         plat_confirmed_ex = tots["d_plat"] == tots["p_plat"] and tots["d_plat"] > 0
         h_plat_ex = tots["d_plat"] if plat_confirmed_ex else 0
         h_total_ex = h_total_base + h_plat_ex
@@ -1393,6 +1719,16 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         }
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
 
+        # ── Sheet 12: 크로스레퍼런스 (차트번호별 통합 뷰) ──
+        cross_ref = _build_cross_reference_sheet(match_df, patient, hansol)
+        if not cross_ref.empty:
+            cross_ref.to_excel(writer, sheet_name="11_크로스레퍼런스", index=False)
+
+        # ── Sheet 13: 무결성 검증 ──
+        integrity = _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_dc)
+        if not integrity.empty:
+            integrity.to_excel(writer, sheet_name="12_무결성검증", index=False)
+
     buf.seek(0)
     return buf.getvalue()
 
@@ -1401,8 +1737,8 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 # UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-st.title("📊 병원 정산 3-Way 대사 v2.1")
-st.caption("한솔페이 × 일일마감 × 차트마감 | 자동 매칭 → 의심건 즉시 탐지")
+st.title("📊 병원 정산 3-Way 대사 v3.0")
+st.caption("한솔페이 × 일일마감 × 차트마감 | 자동 매칭 → 의심건 즉시 탐지 | 공유카드·복합결제·소급재검토 지원")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2-Phase UI: 분석 전 → 파일업로드 / 분석 후 → 결과만 표시
@@ -1483,6 +1819,7 @@ if "done" not in st.session_state:
                 st.session_state["patient"] = patient
                 st.session_state["tots"] = tots
                 st.session_state["match_df"] = match_df
+                st.session_state["matched_dc"] = matched_dc
                 st.session_state["hc_compare"] = hc_compare
                 st.session_state["missing_all"] = missing_all
                 st.session_state["missing_only"] = missing_only
@@ -1858,30 +2195,67 @@ else:
 ---
 
 **권장 프롬프트 (복사해서 사용):**
+        """)
 
-> 첨부된 엑셀 파일은 병원 정산 3-Way 대사(한솔페이 PG사 × 일일마감 × 차트마감) 분석 결과입니다.
-> '0_AI안내_데이터사전' 시트를 먼저 읽고 데이터 구조를 파악한 후,
-> 아래 항목을 분석해주세요:
->
-> 1. 차트정보(3_차트마감)를 기준 원장으로 확정하고, '7_한솔vs차트_누락추정'에서 차트 대비 미반영/금액부족 건을 우선순위로 정렬해주세요.
-> 2. '4_매칭결과'와 '6_일마미매칭'을 함께 보고 승인번호/금액/결제수단이 어긋난 건을 환자별로 묶어주세요.
-> 3. '5_한솔미매칭'과 '9_세무위험'을 교차검토해 실제 점검이 필요한 의심거래 Top 10을 제시해주세요.
-> 4. 출력 형식은 "검토 시작 환자 → 차트번호/이름/수납금액/의심사유/근거시트" 순서로 작성해주세요.
->
-> 여러 날짜의 파일이 있다면 동일 차트번호/동일 패턴 반복 여부까지 누적 분석해주세요.
+        ai_prompt = """첨부된 엑셀은 병원 정산 3-Way 대사 결과입니다. 당신의 목적은 단 하나: 한솔페이(PG사)·일일마감(프론트)·차트마감(EMR) 3개 자료의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾는 것입니다.
 
+[필수 사전 작업]
+1. '0_AI안내_데이터사전' 시트를 반드시 먼저 읽고 데이터 구조·연결키·분석 가이드를 숙지하세요.
+2. '12_무결성검증' 시트에서 데이터 연결 정확도를 확인하세요. ⚠️가 있으면 해당 항목을 우선 점검합니다.
+
+[분석 절차 – 이 순서를 반드시 따르세요]
+
+Step 1. 총합 차이 파악
+- '10_합계비교'에서 구분별(카드/현금+이체/플랫폼) 차이 금액을 확인합니다.
+- 차이가 0이 아닌 구분이 불일치의 원인입니다. 어떤 결제수단에서 얼마의 차이가 나는지 먼저 정리하세요.
+
+Step 2. 차트번호별 불일치 환자 특정
+- '11_크로스레퍼런스'에서 '상태' 컬럼이 ❌미매칭 또는 ⚠️차이인 환자를 모두 추출합니다.
+- 각 환자의 '차이(차트-매칭)' 금액을 확인합니다. 이 금액들의 합이 Step 1의 차이와 일치하는지 검증합니다.
+
+Step 3. 미매칭 거래 역추적
+- '5_한솔미매칭': 각 건의 승인번호·카드번호를 '3_차트마감'의 승인번호목록에서 검색 → 차트에 기록은 있으나 매칭 로직에서 누락된 건인지 확인
+- '6_일마미매칭': 프론트에서 수납했으나 PG사에 없는 건 → 현금/이체 결제를 카드로 잘못 기재했을 가능성 확인
+
+Step 4. 결제수단 불일치 원인 분석
+- '8_일마vs차트_수단별비교'에서 불일치상세가 '✅일치'가 아닌 건을 확인합니다.
+- 카드↔현금/이체 간 수단 오분류가 있는지, 본부금(참고) 컬럼과 대조합니다.
+
+Step 5. 결론 도출
+위 분석을 종합하여 아래 형식으로 출력하세요:
+
+### 총합 불일치 원인 분석 결과
+
+| 우선순위 | 차트번호 | 환자명 | 불일치금액 | 의심사유 | 근거시트 | 조치방안 |
+|---------|---------|-------|----------|---------|---------|---------|
+| 1 | ... | ... | ... | ... | ... | ... |
+
+- 불일치 금액이 큰 순서대로 정렬
+- 모든 불일치 건의 금액 합계가 Step 1의 총합 차이와 일치하는지 최종 검증
+- 일치하지 않으면 누락된 건이 있으므로 재분석
+
+[추가 분석 – 여러 날짜 파일이 있는 경우]
+- 동일 차트번호가 여러 날짜에서 반복적으로 미매칭되는 패턴 탐지
+- 특정 시간대에 취소가 집중되는 패턴 확인
+- 동일 카드번호가 다른 환자에게 반복 사용되는 패턴 확인"""
+
+        st.code(ai_prompt, language=None)
+
+        st.markdown("""
 ---
 
 **누적 분석 팁:** 여러 날짜의 파일을 한꺼번에 AI에 올리면 반복 패턴(동일 차트번호 반복 미매칭, 특정 시간대 취소 집중 등)을 탐지할 수 있습니다.
         """)
 
         h_ok = hansol[hansol["tx_status"] == "정상"]
+        _matched_h_set = set(match_df["한솔_hidx"].tolist()) if not match_df.empty and "한솔_hidx" in match_df.columns else set()
+        _matched_dc_set = st.session_state.get("matched_dc", set())
         excel_data = build_ai_merged_excel(
             hansol=hansol, daily=daily, patient=patient,
             match_df=match_df, hc_compare=hc_compare,
             missing_all=missing_all, missing_only=missing_only,
             pc=pc, tx=tx, tots=tots,
-            h_um=h_um, d_um=d_um, matched_h=set(match_df["한솔_idx"].tolist()) if not match_df.empty and "한솔_idx" in match_df.columns else set(),
+            h_um=h_um, d_um=d_um, matched_h=_matched_h_set, matched_dc=_matched_dc_set,
         )
         today_str = datetime.now().strftime("%Y%m%d")
         st.download_button(
@@ -1901,19 +2275,22 @@ else:
                 "4_매칭결과", "5_한솔미매칭", "6_일마미매칭",
                 "7_한솔vs차트_누락추정", "8_일마vs차트_수단별비교",
                 "9_세무위험", "10_합계비교",
+                "11_크로스레퍼런스", "12_무결성검증",
             ],
             "설명": [
-                "AI가 데이터를 이해하기 위한 안내 및 용어 사전",
+                "AI가 데이터를 이해하기 위한 안내·용어·분석 가이드",
                 f"PG사 거래 원본 ({len(hansol)}건)",
                 f"프론트 일일마감 ({len(daily)}건)",
                 f"EMR 차트마감 ({len(patient)}건)",
-                f"한솔↔일마 자동매칭 ({len(match_df)}건)",
+                f"한솔↔일마 자동매칭 ({len(match_df)}건) – P1~P9 포함",
                 f"한솔 미매칭 ({len(h_um)}건)",
                 f"일마 미매칭 ({len(d_um)}건)",
                 f"한솔↔차트 누락추정 ({len(missing_all)}건)",
                 f"일마↔차트 수단별 비교 ({len(pc)}건)",
                 f"세무위험 ({len(tx)}건)",
                 "3개 소스 합계 교차비교",
+                "★ 차트번호별 모든 연결정보 통합 뷰",
+                "데이터 연결 정확도 자동 검증",
             ],
         }
         st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True)
