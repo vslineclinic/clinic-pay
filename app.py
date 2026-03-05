@@ -1397,12 +1397,21 @@ def build_missing_receipts(match_df, patient, daily, hansol):
     result["차이(차트-한솔)"] = result["차트카드금액"] - result["한솔매칭금액"]
 
     def _status(row):
-        if row["한솔매칭금액"] == 0:
+        h_amt = row["한솔매칭금액"]
+        diff = row["차이(차트-한솔)"]
+        d_amt = row.get("일마카드금액", 0)
+        c_amt = row["차트카드금액"]
+        if h_amt == 0:
             return "❌한솔매칭없음"
-        if row["차이(차트-한솔)"] > 0:
+        if diff > 0:
             return "⚠️금액부족"
-        if row["차이(차트-한솔)"] < 0:
+        if diff < 0:
             return "⚠️초과매칭"
+        # 한솔-차트 일치하지만 일마 데이터 누락/불일치 확인
+        if c_amt > 0 and d_amt == 0:
+            return "⚠️일마누락"
+        if d_amt > 0 and d_amt != c_amt:
+            return "⚠️일마금액불일치"
         return "✅일치"
 
     result["매칭상태"] = result.apply(_status, axis=1)
@@ -1643,6 +1652,182 @@ def tax_risk(hansol, daily, patient, matched_h):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3-Way 통합 의심건 분석
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def build_integrated_suspects(match_df, patient, daily, hansol,
+                               missing_all, pc, h_um, d_um, tx):
+    """한솔-일마, 한솔-차트, 일마-차트 3가지 비교를 통합하여
+    가장 의심되는 수납건/환자를 우선순위로 정렬해 반환.
+
+    각 차트번호에 대해 3개 소스에서의 불일치를 종합 분석하고
+    의심 점수(높을수록 우선 확인 필요)를 부여한다.
+    """
+    suspects = {}  # ch → dict
+
+    def _get(ch):
+        if ch not in suspects:
+            suspects[ch] = {
+                "차트번호": ch, "환자명": "", "의심점수": 0,
+                "의심사유": [],
+                "한솔상태": "", "일마상태": "", "차트상태": "",
+                "차트카드금액": 0, "한솔매칭금액": 0, "일마카드금액": 0,
+                "한솔미매칭금액": 0, "일마미매칭금액": 0,
+            }
+        return suspects[ch]
+
+    # ── 1) 한솔↔차트 누락추정 (missing_all) ──
+    if not missing_all.empty:
+        for _, row in missing_all.iterrows():
+            ch = row["차트번호"]
+            s = _get(ch)
+            s["환자명"] = s["환자명"] or str(row.get("이름", ""))
+            status = str(row.get("매칭상태", ""))
+            s["한솔상태"] = status
+            s["차트카드금액"] = int(row.get("차트카드금액", 0))
+            s["한솔매칭금액"] = int(row.get("한솔매칭금액", 0))
+            s["일마카드금액"] = int(row.get("일마카드금액", 0))
+            reason = str(row.get("불일치원인", ""))
+
+            if status == "❌한솔매칭없음":
+                s["의심점수"] += 30
+                s["의심사유"].append("한솔매칭 없음")
+            elif status == "⚠️금액부족":
+                diff = int(row.get("차이(차트-한솔)", 0))
+                s["의심점수"] += 20
+                s["의심사유"].append(f"한솔매칭 금액부족({diff:,}원)")
+            elif status == "⚠️초과매칭":
+                s["의심점수"] += 15
+                s["의심사유"].append("한솔 초과매칭")
+            elif status == "⚠️일마누락":
+                s["의심점수"] += 25
+                s["의심사유"].append("일마 데이터 누락(한솔-차트는 일치)")
+            elif status == "⚠️일마금액불일치":
+                s["의심점수"] += 15
+                s["의심사유"].append("일마 금액 불일치(한솔-차트는 일치)")
+
+            if "승인번호 동일복사" in reason:
+                s["의심점수"] += 5
+                s["의심사유"].append("승인번호 동일복사 의심")
+            if "승인번호 미기재" in reason or "부분 미기재" in reason:
+                s["의심점수"] += 5
+
+    # ── 2) 일마↔차트 비교 (pc) ──
+    if not pc.empty:
+        for _, row in pc.iterrows():
+            ch = clean_no(str(row.get("차트번호", "")))
+            if not ch:
+                continue
+            match_status = str(row.get("매칭", ""))
+            detail = str(row.get("불일치상세", ""))
+            s = _get(ch)
+            s["환자명"] = s["환자명"] or str(row.get("성명", row.get("성명_차트", "")))
+            s["일마상태"] = match_status
+
+            if match_status == "❌차트누락":
+                s["의심점수"] += 25
+                s["의심사유"].append("차트에 없음(일마에만 존재)")
+            elif match_status == "❌일마누락":
+                s["의심점수"] += 25
+                s["의심사유"].append("일마에 없음(차트에만 존재)")
+            elif "유사" in match_status:
+                s["의심점수"] += 15
+                s["의심사유"].append(f"차트번호 유사매칭({match_status})")
+            elif detail != "✅일치" and detail:
+                s["의심점수"] += 10
+                s["의심사유"].append(f"수단별불일치: {detail}")
+
+    # ── 3) 한솔 미매칭 건 (h_um) ──
+    # 한솔 미매칭은 차트번호와 직접 연결이 어려우나, 승인번호로 차트와 연결 시도
+    h_um_appr_map = {}  # 승인번호 → 차트번호
+    if not patient.empty and "승인번호목록" in patient.columns:
+        for _, pr in patient.iterrows():
+            vals = pr.get("승인번호목록", [])
+            if isinstance(vals, list):
+                for a in vals:
+                    aa = clean_no(a)
+                    if aa:
+                        h_um_appr_map[aa] = clean_no(str(pr["차트번호"]))
+
+    if not h_um.empty:
+        for _, hr in h_um.iterrows():
+            appr = clean_no(str(hr.get("승인번호", "")))
+            amt = int(hr.get("금액", 0))
+            ch = h_um_appr_map.get(appr, "")
+            if ch:
+                s = _get(ch)
+                s["한솔미매칭금액"] += amt
+                s["의심점수"] += 20
+                s["의심사유"].append(f"한솔미매칭 {amt:,}원(승인번호 {appr})")
+
+    # ── 4) 일마 미매칭 건 (d_um) ──
+    if not d_um.empty:
+        for _, dr in d_um.iterrows():
+            ch = clean_no(str(dr.get("차트번호", "")))
+            if not ch:
+                continue
+            amt = int(dr.get("카드", 0))
+            s = _get(ch)
+            s["환자명"] = s["환자명"] or str(dr.get("성명", ""))
+            s["일마미매칭금액"] += amt
+            s["의심점수"] += 20
+            s["의심사유"].append(f"일마미매칭 카드 {amt:,}원")
+
+    # ── 5) 세무위험 (tx) ──
+    if not tx.empty:
+        for _, tr in tx.iterrows():
+            content = str(tr.get("내용", ""))
+            # 차트번호 추출 시도
+            ch_match = re.search(r"차트\s*[:#]?\s*(\d{4,})", content)
+            if ch_match:
+                ch = clean_no(ch_match.group(1))
+                s = _get(ch)
+                risk = str(tr.get("위험등급", ""))
+                s["의심점수"] += 15 if "🔴" in risk else 8
+                s["의심사유"].append(f"세무위험: {str(tr.get('유형', ''))}")
+
+    # ── 결과 생성 ──
+    rows = []
+    for ch, s in suspects.items():
+        if s["의심점수"] == 0:
+            continue
+        # 의심등급 부여
+        score = s["의심점수"]
+        if score >= 40:
+            grade = "🔴긴급확인"
+        elif score >= 25:
+            grade = "🟠우선확인"
+        elif score >= 15:
+            grade = "🟡검토필요"
+        else:
+            grade = "ℹ️참고"
+
+        # 의심사유 중복 제거 & 정리
+        unique_reasons = list(dict.fromkeys(s["의심사유"]))
+
+        rows.append({
+            "의심등급": grade,
+            "의심점수": score,
+            "차트번호": ch,
+            "환자명": s["환자명"],
+            "차트카드금액": s["차트카드금액"],
+            "한솔매칭금액": s["한솔매칭금액"],
+            "일마카드금액": s["일마카드금액"],
+            "한솔미매칭": s["한솔미매칭금액"],
+            "일마미매칭": s["일마미매칭금액"],
+            "한솔↔차트": s["한솔상태"] or "-",
+            "일마↔차트": s["일마상태"] or "-",
+            "의심사유": " | ".join(unique_reasons[:5]),  # 최대 5개
+        })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("의심점수", ascending=False).reset_index(drop=True)
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AI용 통합 엑셀 생성
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1751,7 +1936,8 @@ def _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_
 
 def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                           missing_all, missing_only, pc, tx, tots,
-                          h_um, d_um, matched_h, matched_dc=None):
+                          h_um, d_um, matched_h, matched_dc=None,
+                          integrated=None):
     """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성 (v3.0)"""
     if matched_dc is None:
         matched_dc = set()
@@ -1784,7 +1970,9 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             ["9_세무위험", "자동 탐지 세무위험. 위험등급(🔴높음/🟡중간) 포함."],
             ["10_합계비교", "3개 소스 결제수단별 합계 교차비교 → 전체 균형 확인"],
             ["11_크로스레퍼런스", "★ 차트번호별 모든 연결정보 통합 뷰 (차트금액·매칭금액·카드번호·승인번호·매칭규칙·차이)"],
-            ["12_무결성검증", "데이터 연결 정확도 자동 검증 결과 → 중복매칭·총액불일치 등 감지"],
+            ["12_한솔vs일마_누락추정", "한솔페이에 있으나 일마에 없거나, 일마에 있으나 한솔에 없는 건 → 수납 누락 추정"],
+            ["13_3Way통합의심건", "★★ 3개 소스 비교를 종합한 의심건 우선순위 리스트 (의심점수 높을수록 우선 확인)"],
+            ["14_무결성검증", "데이터 연결 정확도 자동 검증 결과 → 중복매칭·총액불일치 등 감지"],
             ["", ""],
             ["[3개 자료 불일치 거래건 추론 가이드 - AI 필독]", ""],
             ["★ 분석 목적", "3개 자료(한솔페이·일일마감·차트마감)의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾는 것"],
@@ -1861,7 +2049,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         if not missing_all.empty:
             miss_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
                                       "차트카드건수", "한솔매칭금액", "한솔매칭건수",
-                                      "일마카드금액", "차이(차트-한솔)"] if c in missing_all.columns]
+                                      "일마카드금액", "차이(차트-한솔)", "불일치원인"] if c in missing_all.columns]
             missing_all[miss_cols].to_excel(writer, sheet_name="7_한솔vs차트_누락추정", index=False)
 
         # ── Sheet 9: 일마↔차트 수단별 비교 ──
@@ -1919,10 +2107,20 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         if not cross_ref.empty:
             cross_ref.to_excel(writer, sheet_name="11_크로스레퍼런스", index=False)
 
-        # ── Sheet 13: 무결성 검증 ──
+        # ── Sheet 13: 3-Way 통합 의심건 ──
+        if integrated is not None and not integrated.empty:
+            int_cols = [c for c in [
+                "의심등급", "의심점수", "차트번호", "환자명",
+                "차트카드금액", "한솔매칭금액", "일마카드금액",
+                "한솔미매칭", "일마미매칭",
+                "한솔↔차트", "일마↔차트", "의심사유",
+            ] if c in integrated.columns]
+            integrated[int_cols].to_excel(writer, sheet_name="13_3Way통합의심건", index=False)
+
+        # ── Sheet 14: 무결성 검증 ──
         integrity = _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_dc)
         if not integrity.empty:
-            integrity.to_excel(writer, sheet_name="12_무결성검증", index=False)
+            integrity.to_excel(writer, sheet_name="14_무결성검증", index=False)
 
     buf.seek(0)
     return buf.getvalue()
@@ -2007,8 +2205,14 @@ if "done" not in st.session_state:
                 h_um = h_ok[~h_ok["h_idx"].isin(matched_h)]
                 d_um = daily[(daily["카드"] > 0) & (~daily["d_idx"].isin(matched_dc))]
 
+                # 3-Way 통합 의심건 분석
+                integrated = build_integrated_suspects(
+                    match_df, patient, daily, hansol,
+                    missing_all, pc, h_um, d_um, tx)
+
                 # session_state에 저장
                 st.session_state["done"] = True
+                st.session_state["integrated"] = integrated
                 st.session_state["hansol"] = hansol
                 st.session_state["daily"] = daily
                 st.session_state["patient"] = patient
@@ -2045,6 +2249,7 @@ else:
     tx = st.session_state["tx"]
     h_um = st.session_state["h_um"]
     d_um = st.session_state["d_um"]
+    integrated = st.session_state.get("integrated", pd.DataFrame())
     n_ok = st.session_state["n_ok"]
     n_m = st.session_state["n_m"]
     rate = n_m / n_ok * 100 if n_ok else 0
@@ -2066,8 +2271,8 @@ else:
     k6.metric("누락추정", f"{len(missing_only)}", delta_color="inverse")
 
     # ── 탭 ──
-    t0, t1, t2, t2b, t3, t4, t5, t6 = st.tabs([
-        "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험", "📝 메신저 요약", "🤖 AI 통합 다운로드",
+    t0, t1, t1b, t2, t2b, t3, t4, t5, t6 = st.tabs([
+        "📋 일자별 합계매칭", "🚨 의심건", "🔍 3-Way 통합분석", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험", "📝 메신저 요약", "🤖 AI 통합 다운로드",
     ])
 
     with t0:
@@ -2228,6 +2433,55 @@ else:
         if len(d_um):
             st.markdown("#### ❌ 일마 미매칭(카드)")
             st.dataframe(d_um[["내원순서", "성명", "차트번호", "카드"]], use_container_width=True, hide_index=True)
+
+    with t1b:
+        st.subheader("🔍 3-Way 통합 의심건 분석")
+        st.caption("한솔↔일마, 한솔↔차트, 일마↔차트 3가지 비교를 종합하여 의심되는 수납건을 우선순위로 정렬합니다.")
+        if not integrated.empty:
+            # 등급별 요약
+            grade_summary = integrated.groupby("의심등급").agg(
+                건수=("의심등급", "count"),
+                총차트카드금액=("차트카드금액", "sum"),
+            ).reset_index()
+            g1, g2, g3, g4 = st.columns(4)
+            n_urgent = len(integrated[integrated["의심등급"] == "🔴긴급확인"])
+            n_priority = len(integrated[integrated["의심등급"] == "🟠우선확인"])
+            n_review = len(integrated[integrated["의심등급"] == "🟡검토필요"])
+            n_info = len(integrated[integrated["의심등급"] == "ℹ️참고"])
+            g1.metric("🔴 긴급확인", f"{n_urgent}건")
+            g2.metric("🟠 우선확인", f"{n_priority}건")
+            g3.metric("🟡 검토필요", f"{n_review}건")
+            g4.metric("ℹ️ 참고", f"{n_info}건")
+
+            # 필터
+            grade_filter = st.multiselect(
+                "의심등급 필터", ["🔴긴급확인", "🟠우선확인", "🟡검토필요", "ℹ️참고"],
+                default=["🔴긴급확인", "🟠우선확인", "🟡검토필요"],
+                key="integrated_grade_filter")
+            disp_int = integrated[integrated["의심등급"].isin(grade_filter)]
+
+            disp_int_cols = [c for c in [
+                "의심등급", "차트번호", "환자명",
+                "차트카드금액", "한솔매칭금액", "일마카드금액",
+                "한솔미매칭", "일마미매칭",
+                "한솔↔차트", "일마↔차트",
+                "의심사유",
+            ] if c in disp_int.columns]
+            st.dataframe(disp_int[disp_int_cols], use_container_width=True, hide_index=True)
+
+            # 상세 해설
+            st.markdown("---")
+            st.markdown("#### 의심등급 기준")
+            st.markdown("""
+| 등급 | 점수 | 의미 |
+|------|------|------|
+| 🔴긴급확인 | 40점+ | 여러 소스에서 동시 불일치 → 즉시 확인 필요 |
+| 🟠우선확인 | 25~39점 | 한 소스에서 심각한 불일치 또는 두 소스에서 경미한 불일치 |
+| 🟡검토필요 | 15~24점 | 단일 소스 불일치 → 확인 권장 |
+| ℹ️참고 | 15점 미만 | 경미한 불일치 → 참고사항 |
+""")
+        else:
+            st.success("🎉 3-Way 통합 분석 결과 의심건 없음!")
 
     with t2:
         st.subheader("💳 한솔↔일마 매칭")
@@ -2456,6 +2710,7 @@ Step 5. 결론 도출
             missing_all=missing_all, missing_only=missing_only,
             pc=pc, tx=tx, tots=tots,
             h_um=h_um, d_um=d_um, matched_h=_matched_h_set, matched_dc=_matched_dc_set,
+            integrated=integrated,
         )
         today_str = datetime.now().strftime("%Y%m%d")
         st.download_button(
