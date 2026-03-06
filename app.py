@@ -521,9 +521,10 @@ def run_matching(hansol, daily, patient):
       P1: 승인번호 직접매칭
       P1b: 공동결제 합산 (1카드 N차트)
       P1c: 공유카드 매칭 (동일 카드번호, 다른 환자)
+      P1d: 승인번호 기반 분할결제 합산 (차트 N건 합 = 일마 1건)
       P2: 유일 금액 1:1
       P2b: 카드사+금액 (동일금액 다건 → 카드사 구분)
-      P3: 분할결제 2~3건 합 (시간근접)
+      P3: 분할결제 2~3건 합 (시간근접) + 승인번호 힌트 활용 강화
       P3b: 본부금 기반 분할결제 (차트 본부금 힌트)
       P4: 시간-순서 상관 (동일금액 다건, 카드사 우선)
       P5: 현금영수증 + 이체
@@ -680,6 +681,68 @@ def run_matching(hansol, daily, patient):
                             add("P1c_공유카드", "🟡MED", [hr["h_idx"]], dc_all.iloc[0],
                                 note=f"카드번호 {card_no[-4:]} / 유일금액 매칭")
 
+    # 차트번호 → {승인번호 set} 맵 구축 (P1d, P3 승인번호 힌트에서 공용)
+    chart_appr_set = {}
+    for _, pr in patient.iterrows():
+        if pr.get("플랫폼구분", ""):
+            continue
+        if pr.get("분류", "") != "카드":
+            continue
+        ch = clean_no(pr["차트번호"])
+        chart_appr_set.setdefault(ch, set())
+        for a in pr["승인번호목록"]:
+            aa = clean_no(a)
+            if aa:
+                chart_appr_set[ch].add(aa)
+
+    # P1d - 승인번호 기반 분할결제 합산매칭
+    # 차트에 여러 승인번호가 기재되어 있지만 일마에는 합산 1건으로 올라간 경우
+    # 예: 차트에 50k(#111)+30k(#222)+20k(#333) → 일마에 100k 1건
+    # 차트의 승인번호목록으로 한솔 개별 거래를 찾아 합이 일마 금액과 일치하면 매칭
+    if appr_map:
+
+        for _, dr in d_card.iterrows():
+            if dr["d_idx"] in matched_dc:
+                continue
+            ch = clean_no(dr["차트번호"])
+            apprs = chart_appr_set.get(ch, set())
+            if len(apprs) < 2:
+                continue
+            target = int(dr["카드"])
+
+            # 이 차트의 승인번호에 해당하는 미매칭 한솔 카드건 수집
+            cand_rows = []
+            for _, hr in h_card.iterrows():
+                if hr["h_idx"] in matched_h:
+                    continue
+                appr = clean_no(str(hr.get("승인번호", "")))
+                if appr in apprs:
+                    cand_rows.append(hr)
+            if len(cand_rows) < 2:
+                continue
+
+            # 조합 탐색: 2~min(6, len) 건의 합이 target과 일치하는 조합
+            best_combo = None
+            best_diff = float("inf")
+            max_r = min(6, len(cand_rows))
+            for r in range(2, max_r + 1):
+                for combo in combinations(range(len(cand_rows)), r):
+                    s = sum(int(cand_rows[k]["금액"]) for k in combo)
+                    diff = abs(target - s)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_combo = combo
+                    if best_diff == 0:
+                        break
+                if best_diff == 0:
+                    break
+
+            if best_combo is not None and best_diff == 0:
+                idxs = [int(cand_rows[k]["h_idx"]) for k in best_combo]
+                apprs_used = [clean_no(str(cand_rows[k].get("승인번호", ""))) for k in best_combo]
+                add(f"P1d_승인번호분할{len(best_combo)}건", "🟢HIGH", idxs, dr,
+                    note=f"차트 승인번호 {len(apprs)}개 중 {len(best_combo)}건 합산매칭 (승인#{', '.join(apprs_used)})")
+
     # P2
     for _, dr in d_card.iterrows():
         if dr["d_idx"] in matched_dc:
@@ -710,26 +773,61 @@ def run_matching(hansol, daily, patient):
                 add("P2b_카드사+금액", "🟢HIGH", [hc_match.iloc[0]["h_idx"]], dr)
                 break
 
-    # P3
+    # P3 - 분할결제 시간근접 매칭 (승인번호 힌트 활용 강화)
     for _, dr in d_card.iterrows():
         if dr["d_idx"] in matched_dc:
             continue
         target = dr["카드"]
-        avail = h_card[~h_card["h_idx"].isin(matched_h)][["h_idx", "금액", "시간_분"]].values.tolist()
+        ch = clean_no(dr["차트번호"])
+        ch_apprs = chart_appr_set.get(ch, set())
+
+        avail = h_card[~h_card["h_idx"].isin(matched_h)].copy()
+        avail_list = avail[["h_idx", "금액", "시간_분"]].values.tolist()
+
+        # 승인번호 힌트가 있으면: 해당 승인번호 한솔건 우선 탐색 + 시간제한 완화(30분)
+        # 승인번호 힌트가 없으면: 기존 로직 (시간제한 10분, 최대 3건)
         found = False
-        for r in [2, 3]:
-            if found or len(avail) < r:
-                break
-            for combo in combinations(range(len(avail)), r):
-                items = [avail[k] for k in combo]
-                if sum(it[1] for it in items) == target:
-                    times = [it[2] for it in items]
-                    spread = max(times) - min(times) if times else 999
-                    if spread <= 10:
-                        idxs = [int(it[0]) for it in items]
-                        add(f"P3_분할{r}건", "🟢HIGH" if spread <= 5 else "🟡MED", idxs, dr)
-                        found = True
+
+        if ch_apprs and len(ch_apprs) >= 2:
+            # 승인번호 힌트 기반 우선 탐색: 차트 승인번호에 해당하는 한솔건만으로 조합
+            hint_rows = []
+            for _, hr in avail.iterrows():
+                appr = clean_no(str(hr.get("승인번호", "")))
+                if appr in ch_apprs:
+                    hint_rows.append([hr["h_idx"], int(hr["금액"]), hr.get("시간_분", 0)])
+            if len(hint_rows) >= 2:
+                max_r = min(6, len(hint_rows))
+                for r in range(2, max_r + 1):
+                    if found:
                         break
+                    for combo in combinations(range(len(hint_rows)), r):
+                        items = [hint_rows[k] for k in combo]
+                        if sum(it[1] for it in items) == target:
+                            times = [it[2] for it in items]
+                            spread = max(times) - min(times) if times else 999
+                            if spread <= 30:
+                                idxs = [int(it[0]) for it in items]
+                                conf = "🟢HIGH" if spread <= 10 else "🟡MED"
+                                add(f"P3_승인번호분할{r}건", conf, idxs, dr,
+                                    note=f"차트 승인번호 힌트 활용 (시간차 {spread}분)")
+                                found = True
+                                break
+
+        if not found:
+            # 기존 P3 로직: 브루트포스 (시간제한 10분, 최대 3건)
+            for r in [2, 3]:
+                if found or len(avail_list) < r:
+                    break
+                for combo in combinations(range(len(avail_list)), r):
+                    items = [avail_list[k] for k in combo]
+                    if sum(it[1] for it in items) == target:
+                        times = [it[2] for it in items]
+                        spread = max(times) - min(times) if times else 999
+                        if spread <= 10:
+                            idxs = [int(it[0]) for it in items]
+                            add(f"P3_분할{r}건", "🟢HIGH" if spread <= 5 else "🟡MED", idxs, dr)
+                            found = True
+                            break
 
     # P3b - 본부금 기반 분할결제 (차트 본부금 정보로 정밀 분할 탐지)
     for _, dr in d_card.iterrows():
@@ -1255,14 +1353,14 @@ def build_missing_receipts(match_df, patient, daily, hansol):
             return idxs
 
         best, best_diff, best_len = [], float("inf"), 999
-        max_r = min(len(idxs), 5)
+        max_r = min(len(idxs), 7)
         for r in range(1, max_r + 1):
             for comb in combinations(idxs, r):
                 s = int(cands.loc[list(comb), "금액"].sum())
                 diff = abs(target - s)
                 if diff < best_diff or (diff == best_diff and r < best_len):
                     best, best_diff, best_len = list(comb), diff, r
-                    if best_diff == 0 and best_len == 1:
+                    if best_diff == 0:
                         return best
         return best
 
