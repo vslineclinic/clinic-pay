@@ -1187,7 +1187,7 @@ def build_hansol_chart_compare(match_df, patient):
     return out.sort_values(["카드사검증", "차트번호"]).reset_index(drop=True)
 
 
-def build_missing_receipts(match_df, patient, daily, hansol):
+def build_missing_receipts(match_df, patient, daily, hansol, unified_info=None):
     """한솔-차트 매칭 기반 누락 추정 수납건 분석"""
     p_card = patient[patient["분류"] == "카드"].copy()
 
@@ -1357,6 +1357,83 @@ def build_missing_receipts(match_df, patient, daily, hansol):
                         "한솔매칭건수_appr": int(hm2["h_idx"].nunique()),
                     }
 
+    # ── 3차: 통합정보 카드번호 기반 매칭 (승인번호 미기재/부분 미기재 차트) ──
+    # 승인번호가 전혀 없거나 부분만 있는 차트에 대해,
+    # 통합정보(unified_info)의 카드번호로 한솔 미매칭 건을 높은 신뢰도로 연결
+    if unified_info:
+        # 이미 appr_rows에 있는 차트번호 집합
+        appr_charts = {ar["차트번호"] for ar in appr_rows}
+
+        for ch, ui in unified_info.items():
+            cards = ui.get("card_numbers", set())
+            if not cards:
+                continue
+            target = int(chart_amount_map.get(ch, 0))
+            if target == 0:
+                continue
+
+            if ch in appr_charts:
+                # 이미 승인번호 매칭이 있는 차트 → 부분 미기재 보완
+                idx = next((i for i, ar in enumerate(appr_rows) if ar["차트번호"] == ch), None)
+                if idx is None:
+                    continue
+                current_amt = appr_rows[idx]["한솔매칭금액_appr"]
+                if current_amt >= target:
+                    continue  # 이미 완전 매칭
+
+                # 통합정보 카드번호로 추가 한솔건 검색
+                card_cand = h_ok_card[
+                    (h_ok_card["카드번호_norm"].isin(cards)) &
+                    (~h_ok_card["h_idx"].isin(used_hidx))
+                ][["h_idx", "금액", "카드번호_norm"]].drop_duplicates("h_idx")
+                if card_cand.empty:
+                    continue
+
+                prev_matched = h_ok_card[h_ok_card["h_idx"].isin(chart_matched_hidx.get(ch, set()))][["h_idx", "금액", "카드번호_norm"]]
+                combined = pd.concat([prev_matched, card_cand]).drop_duplicates("h_idx")
+                chosen3 = _best_subset(combined, target)
+                if chosen3:
+                    hm3 = combined.loc[chosen3]
+                    new_amt = int(hm3["금액"].sum())
+                    if abs(target - new_amt) < abs(target - current_amt):
+                        new_hidxs = set(hm3["h_idx"].tolist())
+                        old_hidxs = chart_matched_hidx.get(ch, set())
+                        used_hidx -= (old_hidxs - new_hidxs)
+                        used_hidx |= new_hidxs
+                        chart_matched_hidx[ch] = new_hidxs
+                        new_cards = set(hm3["카드번호_norm"].dropna().unique()) - {""}
+                        chart_matched_cards[ch] = new_cards
+                        appr_rows[idx] = {
+                            "차트번호": ch,
+                            "한솔매칭금액_appr": new_amt,
+                            "한솔매칭건수_appr": int(hm3["h_idx"].nunique()),
+                        }
+            else:
+                # 승인번호가 전혀 없는 차트 → 카드번호만으로 매칭 시도
+                card_cand = h_ok_card[
+                    (h_ok_card["카드번호_norm"].isin(cards)) &
+                    (~h_ok_card["h_idx"].isin(used_hidx))
+                ][["h_idx", "금액", "카드번호_norm"]].drop_duplicates("h_idx")
+                if card_cand.empty:
+                    continue
+
+                chosen3 = _best_subset(card_cand, target)
+                if chosen3:
+                    hm3 = card_cand.loc[chosen3]
+                    new_amt = int(hm3["금액"].sum())
+                    # 금액이 정확히 일치하거나 매우 근접한 경우만 높은 신뢰도로 매칭
+                    if new_amt == target or abs(target - new_amt) <= target * 0.01:
+                        new_hidxs = set(hm3["h_idx"].tolist())
+                        used_hidx |= new_hidxs
+                        chart_matched_hidx[ch] = new_hidxs
+                        new_cards = set(hm3["카드번호_norm"].dropna().unique()) - {""}
+                        chart_matched_cards[ch] = new_cards
+                        appr_rows.append({
+                            "차트번호": ch,
+                            "한솔매칭금액_appr": new_amt,
+                            "한솔매칭건수_appr": int(hm3["h_idx"].nunique()),
+                        })
+
     h_appr_agg = pd.DataFrame(appr_rows)
 
     # 기존 매칭 결과 기반 집계(승인번호가 없거나 누락된 케이스 fallback)
@@ -1521,6 +1598,129 @@ def build_missing_receipts(match_df, patient, daily, hansol):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 통합정보 빌더: 3개 소스의 정보를 차트번호 기준으로 통합
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _build_unified_info(hansol, daily, patient, match_df):
+    """3개 소스(한솔/일마/차트) + 매칭결과를 차트번호 기준으로 통합하여
+    빈 데이터를 상호 보완할 수 있는 마스터 조회 딕셔너리 생성.
+
+    Returns:
+        dict[str, dict]: chart_no → {
+            "names": set(str),        # 가능한 이름들
+            "best_name": str,         # 가장 신뢰도 높은 이름
+            "card_numbers": set(str), # 카드번호들 (12자리)
+            "approval_numbers": set(str),  # 승인번호들
+            "card_companies": set(str),    # 카드사들
+            "daily_card_amt": int,
+            "daily_cash_amt": int,
+            "daily_xfer_amt": int,
+            "chart_card_amt": int,
+            "chart_total_amt": int,
+        }
+    """
+    info = {}
+
+    def _ensure(ch):
+        if ch and ch not in info:
+            info[ch] = {
+                "names": set(),
+                "best_name": "",
+                "card_numbers": set(),
+                "approval_numbers": set(),
+                "card_companies": set(),
+                "daily_card_amt": 0,
+                "daily_cash_amt": 0,
+                "daily_xfer_amt": 0,
+                "chart_card_amt": 0,
+                "chart_total_amt": 0,
+            }
+
+    # 1) 일마에서 이름·금액 수집
+    for _, dr in daily.iterrows():
+        ch = clean_no(dr.get("차트번호", ""))
+        if not ch:
+            continue
+        _ensure(ch)
+        nm = clean_name(dr.get("성명", ""))
+        if nm:
+            info[ch]["names"].add(nm)
+        info[ch]["daily_card_amt"] += int(dr.get("카드", 0))
+        info[ch]["daily_cash_amt"] += int(dr.get("현금", 0))
+        info[ch]["daily_xfer_amt"] += int(dr.get("이체", 0))
+
+    # 2) 차트에서 이름·승인번호·카드사·금액 수집
+    for _, pr in patient.iterrows():
+        ch = clean_no(pr.get("차트번호", ""))
+        if not ch:
+            continue
+        _ensure(ch)
+        nm = clean_name(pr.get("이름", ""))
+        if nm:
+            info[ch]["names"].add(nm)
+        info[ch]["chart_total_amt"] += int(pr.get("금액", 0))
+        if pr.get("분류") == "카드":
+            info[ch]["chart_card_amt"] += int(pr.get("금액", 0))
+        # 승인번호
+        apprs = pr.get("승인번호목록", [])
+        if isinstance(apprs, list):
+            for a in apprs:
+                aa = clean_no(a)
+                if aa:
+                    info[ch]["approval_numbers"].add(aa)
+        # 카드사
+        co = str(pr.get("카드사", "")).strip()
+        if co and co != "nan":
+            info[ch]["card_companies"].add(co)
+
+    # 3) 매칭결과에서 카드번호·승인번호·이름 수집
+    if not match_df.empty:
+        for _, mr in match_df.iterrows():
+            ch = clean_no(mr.get("일마_차트", ""))
+            if not ch:
+                continue
+            _ensure(ch)
+            nm = clean_name(mr.get("일마_성명", ""))
+            if nm:
+                info[ch]["names"].add(nm)
+            card_no = clean_no(mr.get("한솔_카드번호", ""))[:12]
+            if card_no:
+                info[ch]["card_numbers"].add(card_no)
+            appr = str(mr.get("한솔_승인번호", "")).strip()
+            if appr and appr != "nan":
+                info[ch]["approval_numbers"].add(appr)
+            co = str(mr.get("한솔_카드사", "")).strip()
+            if co and co != "nan":
+                info[ch]["card_companies"].add(co)
+
+    # 4) 한솔에서 승인번호→차트 매핑으로 카드번호 추가 수집
+    h_ok = hansol[hansol["tx_status"] == "정상"]
+    if "카드번호" in h_ok.columns:
+        # 차트의 승인번호 → 한솔의 카드번호 역매핑
+        appr_to_card = {}
+        for _, hr in h_ok.iterrows():
+            appr = clean_no(hr.get("승인번호", ""))
+            card_no = clean_no(hr.get("카드번호", ""))[:12]
+            if appr and card_no:
+                appr_to_card[appr] = card_no
+
+        for ch, ci in info.items():
+            for appr in ci["approval_numbers"]:
+                card_no = appr_to_card.get(appr)
+                if card_no:
+                    ci["card_numbers"].add(card_no)
+
+    # 5) best_name 결정 (차트 이름 우선, 없으면 일마 이름)
+    for ch, ci in info.items():
+        names = ci["names"]
+        if names:
+            ci["best_name"] = sorted(names, key=len, reverse=True)[0]
+
+    return info
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 환자별 3-Way 비교
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1577,6 +1777,15 @@ def build_patient_compare(daily, patient):
     mg[num_cols] = mg[num_cols].fillna(0)
     str_cols = mg.select_dtypes(include=["object", "string"]).columns
     mg[str_cols] = mg[str_cols].fillna("")
+
+    # ── 이름 상호 보완: 일마누락 시 차트이름으로, 차트누락 시 일마이름으로 채움 ──
+    empty_name = mg["성명"].astype(str).str.strip() == ""
+    has_chart_name = mg["성명_차트"].astype(str).str.strip() != ""
+    mg.loc[empty_name & has_chart_name, "성명"] = mg.loc[empty_name & has_chart_name, "성명_차트"]
+
+    empty_chart_name = mg["성명_차트"].astype(str).str.strip() == ""
+    has_name = mg["성명"].astype(str).str.strip() != ""
+    mg.loc[empty_chart_name & has_name, "성명_차트"] = mg.loc[empty_chart_name & has_name, "성명"]
     for pay in ["카드", "현금", "이체", "플랫폼"]:
         ic, pc = f"[일마]{pay}", f"[차트]{pay}"
         if ic in mg.columns and pc in mg.columns:
@@ -1647,7 +1856,7 @@ def tax_risk(hansol, daily, patient, matched_h):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _build_cross_reference_sheet(match_df, patient, hansol):
+def _build_cross_reference_sheet(match_df, patient, hansol, unified_info=None):
     """크로스레퍼런스 시트: 차트번호별 모든 연결 정보를 한눈에 볼 수 있게 구성"""
     if match_df.empty:
         return pd.DataFrame()
@@ -1666,6 +1875,9 @@ def _build_cross_reference_sheet(match_df, patient, hansol):
         # 차트마감 정보
         p_rows = patient[patient["차트번호"] == ch]
         p_name = p_rows["이름"].iloc[0] if not p_rows.empty else ""
+        # 통합정보에서 이름 보완: 차트에 이름이 없으면 일마/매칭결과에서 가져옴
+        if not p_name and unified_info and ch in unified_info:
+            p_name = unified_info[ch].get("best_name", "")
         p_card_amt = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum())
         p_cash_amt = int(p_rows[p_rows["분류"] == "현금"]["금액"].sum())
         p_xfer_amt = int(p_rows[p_rows["분류"] == "이체"]["금액"].sum())
@@ -1686,6 +1898,16 @@ def _build_cross_reference_sheet(match_df, patient, hansol):
         m_apprs = list(set(str(x) for x in m_rows.get("한솔_승인번호", []) if str(x).strip()))
         m_rules = list(m_rows["매칭규칙"].unique()) if not m_rows.empty else []
         m_confs = list(m_rows["확신도"].unique()) if not m_rows.empty else []
+
+        # 통합정보에서 카드번호·승인번호 보완 (매칭결과에 없는 정보도 통합)
+        if unified_info and ch in unified_info:
+            ui = unified_info[ch]
+            # 매칭 카드번호에 통합정보 카드번호 추가
+            all_card_nos = set(m_card_nos) | ui.get("card_numbers", set())
+            m_card_nos = sorted(all_card_nos)
+            # 매칭 승인번호에 통합정보 승인번호 추가
+            all_apprs = set(m_apprs) | ui.get("approval_numbers", set())
+            m_apprs = sorted(all_apprs)
 
         rows.append({
             "차트번호": ch,
@@ -1751,7 +1973,8 @@ def _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_
 
 def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                           missing_all, missing_only, pc, tx, tots,
-                          h_um, d_um, matched_h, matched_dc=None):
+                          h_um, d_um, matched_h, matched_dc=None,
+                          unified_info=None):
     """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성 (v3.0)"""
     if matched_dc is None:
         matched_dc = set()
@@ -1915,7 +2138,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
 
         # ── Sheet 12: 크로스레퍼런스 (차트번호별 통합 뷰) ──
-        cross_ref = _build_cross_reference_sheet(match_df, patient, hansol)
+        cross_ref = _build_cross_reference_sheet(match_df, patient, hansol, unified_info=unified_info)
         if not cross_ref.empty:
             cross_ref.to_excel(writer, sheet_name="11_크로스레퍼런스", index=False)
 
@@ -1999,8 +2222,11 @@ if "done" not in st.session_state:
                 }
 
                 match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
+                # 통합정보 구축: 3개 소스 + 매칭결과를 차트번호 기준 마스터 조회로 통합
+                unified_info = _build_unified_info(hansol, daily, patient, match_df)
                 hc_compare = build_hansol_chart_compare(match_df, patient)
-                missing_all, missing_only = build_missing_receipts(match_df, patient, daily, hansol)
+                missing_all, missing_only = build_missing_receipts(
+                    match_df, patient, daily, hansol, unified_info=unified_info)
                 pc = build_patient_compare(daily, patient)
                 tx = tax_risk(hansol, daily, patient, matched_h)
 
@@ -2015,6 +2241,7 @@ if "done" not in st.session_state:
                 st.session_state["tots"] = tots
                 st.session_state["match_df"] = match_df
                 st.session_state["matched_dc"] = matched_dc
+                st.session_state["unified_info"] = unified_info
                 st.session_state["hc_compare"] = hc_compare
                 st.session_state["missing_all"] = missing_all
                 st.session_state["missing_only"] = missing_only
@@ -2038,6 +2265,7 @@ else:
     patient = st.session_state["patient"]
     tots = st.session_state["tots"]
     match_df = st.session_state["match_df"]
+    unified_info = st.session_state.get("unified_info")
     hc_compare = st.session_state["hc_compare"]
     missing_all = st.session_state["missing_all"]
     missing_only = st.session_state["missing_only"]
@@ -2456,6 +2684,7 @@ Step 5. 결론 도출
             missing_all=missing_all, missing_only=missing_only,
             pc=pc, tx=tx, tots=tots,
             h_um=h_um, d_um=d_um, matched_h=_matched_h_set, matched_dc=_matched_dc_set,
+            unified_info=unified_info,
         )
         today_str = datetime.now().strftime("%Y%m%d")
         st.download_button(
