@@ -2605,6 +2605,65 @@ else:
         # 취소+부도
         cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
 
+        # ── 취소건 분류: 카드교체(당일결제→당일취소→재결제) vs 실제환불 ──
+        h_cancel = hansol[hansol["tx_status"] == "취소"].copy()
+        h_normal = hansol[hansol["tx_status"] == "정상"].copy()
+        cancel_details = []  # 취소 건별 상세 정보
+        card_swap_amt = 0  # 카드교체 취소 합계
+        real_refund_amt = 0  # 실제 환불 합계
+
+        if not h_cancel.empty:
+            used_normal_idx = set()  # 이미 카드교체로 매칭된 정상건
+            for _, cr in h_cancel.iterrows():
+                c_amt = int(cr["금액"])
+                c_time = cr.get("시간_분", 0)
+                c_card = clean_no(str(cr.get("카드번호", "")))[:12]
+                c_appr = clean_no(str(cr.get("승인번호", "")))
+                c_time_str = cr.get("시간표시", "")
+                c_card_co = str(cr.get("카드사", ""))
+
+                # 동일 금액 + 시간근접(±30분) 정상건 탐색 → 카드교체 판정
+                is_swap = False
+                swap_pair_info = ""
+                for _, nr in h_normal.iterrows():
+                    if nr["h_idx"] in used_normal_idx:
+                        continue
+                    n_amt = int(nr["금액"])
+                    n_time = nr.get("시간_분", 0)
+                    if n_amt == c_amt and abs(n_time - c_time) <= 30:
+                        # 같은 카드번호면 단순취소→재승인, 다른 카드번호면 카드교체
+                        n_card = clean_no(str(nr.get("카드번호", "")))[:12]
+                        if n_card != c_card:
+                            is_swap = True
+                            used_normal_idx.add(nr["h_idx"])
+                            swap_pair_info = f"→ 재결제 {nr.get('시간표시', '')} {nr.get('카드사', '')} {n_card[-4:] if len(n_card) >= 4 else n_card}"
+                            break
+
+                if is_swap:
+                    card_swap_amt += c_amt
+                    cancel_details.append({
+                        "구분": "🔄카드교체",
+                        "시간": c_time_str,
+                        "금액": c_amt,
+                        "카드사": c_card_co,
+                        "카드번호(뒤4자리)": c_card[-4:] if len(c_card) >= 4 else c_card,
+                        "승인번호": c_appr,
+                        "비고": f"카드교체 취소(환불아님) {swap_pair_info}",
+                    })
+                else:
+                    real_refund_amt += c_amt
+                    cancel_details.append({
+                        "구분": "💸실제환불",
+                        "시간": c_time_str,
+                        "금액": c_amt,
+                        "카드사": c_card_co,
+                        "카드번호(뒤4자리)": c_card[-4:] if len(c_card) >= 4 else c_card,
+                        "승인번호": c_appr,
+                        "비고": "실제 환불 거래",
+                    })
+
+        cancel_detail_df = pd.DataFrame(cancel_details) if cancel_details else pd.DataFrame()
+
         # 결제수단별 합계 (최종매칭 시 차트정보 기준)
         card_total = int(patient[patient["분류"] == "카드"]["금액"].sum())
         cash_total = int(patient[patient["분류"] == "현금"]["금액"].sum())
@@ -2616,8 +2675,8 @@ else:
         zeropay = int(daily["제로페이"].sum())
         local_currency = int(daily["기타지역화폐"].sum())
 
-        # 환불+취소 금액
-        refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
+        # 환불 금액 (카드교체 취소 제외, 실제 환불만)
+        refund = real_refund_amt
 
         # Today (차트 기준)
         today_total = int(patient["금액"].sum())
@@ -2653,6 +2712,25 @@ else:
 
         if not type_col:
             st.warning("⚠️ 일일마감 데이터에서 신환/구환 구분 컬럼을 찾지 못했습니다. 신환/구환 수치는 수동으로 입력해주세요.")
+
+        # ── 취소/환불 상세 내역 ──
+        st.markdown("---")
+        st.markdown("#### 💳 취소/환불 거래 상세")
+        if not cancel_detail_df.empty:
+            swap_cnt = len(cancel_detail_df[cancel_detail_df["구분"] == "🔄카드교체"])
+            refund_cnt = len(cancel_detail_df[cancel_detail_df["구분"] == "💸실제환불"])
+
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("전체 취소건", f"{len(cancel_detail_df)}건")
+            rc2.metric("🔄 카드교체 (환불아님)", f"{swap_cnt}건 / {card_swap_amt:,}원")
+            rc3.metric("💸 실제환불", f"{refund_cnt}건 / {real_refund_amt:,}원")
+
+            if swap_cnt > 0:
+                st.info(f"ℹ️ 카드교체 취소 {swap_cnt}건({card_swap_amt:,}원)은 당일 재결제가 확인되어 메신저 요약의 '환불+취소'에서 제외했습니다.")
+
+            st.dataframe(cancel_detail_df, use_container_width=True, hide_index=True)
+        else:
+            st.success("✅ 취소/환불 거래가 없습니다.")
 
     with t6:
         st.subheader("🤖 AI 분석용 통합 파일 다운로드")
