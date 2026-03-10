@@ -2216,9 +2216,14 @@ if "done" not in st.session_state:
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
                 h_cancel = hansol[hansol["tx_status"] == "취소"]
+                h_cancel_card = int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()) if not h_cancel.empty else 0
+                h_cancel_cash = int(h_cancel[h_cancel["is_현금"]]["금액"].sum()) if not h_cancel.empty else 0
                 tots = {
-                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()),
-                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum()),
+                    # 한솔페이: 승인(정상) 금액만 표시 (취소 차감하지 않음 — 사이트 기준과 동일)
+                    "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()),
+                    "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()),
+                    "h_cancel_card": h_cancel_card,
+                    "h_cancel_cash": h_cancel_cash,
                     "d_card": int(daily["카드"].sum()),
                     "d_cash": int(daily["현금"].sum()),
                     "d_xfer": int(daily["이체"].sum()),
@@ -2323,11 +2328,14 @@ else:
         h_total_base = tots["h_card"] + tots["h_cash"]
         h_total_with_plat = h_total_base + (tots["d_plat"] if plat_confirmed else 0)
 
+        h_cancel_total = tots.get("h_cancel_card", 0) + tots.get("h_cancel_cash", 0)
         sm_rows = [
             {"구분": "카드", "한솔페이": tots["h_card"], "일일마감": tots["d_card"], "차트마감": tots["p_card"]},
             {"구분": "현금/영수증+이체", "한솔페이": tots["h_cash"], "일일마감": d_cash_xfer, "차트마감": p_cash_xfer},
             {"구분": "플랫폼", "한솔페이": h_plat_display, "일일마감": tots["d_plat"], "차트마감": tots["p_plat"]},
         ]
+        if h_cancel_total > 0:
+            sm_rows.append({"구분": "취소승인(참고)", "한솔페이": f"-{h_cancel_total:,}", "일일마감": "-", "차트마감": "-"})
         if p_etc > 0:
             sm_rows.append({"구분": "기타(미분류)", "한솔페이": "-", "일일마감": "-", "차트마감": p_etc})
         sm_rows.append({"구분": "합계", "한솔페이": h_total_with_plat, "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]})
@@ -2434,7 +2442,7 @@ else:
             cancel_amt = int(can["금액"].sum()) if len(can) > 0 else 0
             msg = f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건"
             if cancel_amt > 0:
-                msg += f" (취소금액 {cancel_amt:,}원 → 순매출에서 차감됨)"
+                msg += f" (취소금액 {cancel_amt:,}원 — 위 한솔페이 금액은 승인금액 기준이며 취소는 별도 표시)"
             st.info(msg)
 
     with t1:
@@ -2575,10 +2583,18 @@ else:
         # 취소+부도
         cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
 
+        # 환불+취소 금액 먼저 계산 (카드 순수납 계산에 필요)
+        refund = int(abs(patient[patient["is_취소"]]["금액"].sum())) if patient["is_취소"].any() else 0
+        # 한솔 기준 취소 건수와 비교하여 차이가 있으면 한솔 금액도 참고
+        h_refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
+        if refund == 0 and h_refund > 0:
+            refund = h_refund
+
         # 결제수단별 합계 (최종매칭 시 차트정보 기준)
-        # 카드: 취소/환불 금액(음수) 포함한 순매출 (카드사 정산 기준)
         p_card = patient[patient["분류"] == "카드"]
-        card_total = int(p_card["금액"].sum())
+        card_gross = int(p_card[~p_card["is_취소"]]["금액"].sum())
+        # 카드 순수납 = 카드 승인금액 - 환불/취소금액 (실제 카드사 정산 기준)
+        card_total = card_gross - refund
         cash_total = int(patient[patient["분류"] == "현금"]["금액"].sum())
         transfer_total = int(patient[patient["분류"] == "이체"]["금액"].sum())
         platform_group = patient[patient["분류"] == "플랫폼"]
@@ -2587,13 +2603,6 @@ else:
         naman = int(platform_group[platform_group["플랫폼구분"] == "나만의닥터"]["금액"].sum())
         zeropay = int(daily["제로페이"].sum())
         local_currency = int(daily["기타지역화폐"].sum())
-
-        # 환불+취소 금액 (차트 데이터 기준, 전체 결제수단 포함)
-        refund = int(abs(patient[patient["is_취소"]]["금액"].sum())) if patient["is_취소"].any() else 0
-        # 한솔 기준 취소 건수와 비교하여 차이가 있으면 한솔 금액도 참고
-        h_refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
-        if refund == 0 and h_refund > 0:
-            refund = h_refund
 
         # Today (차트 기준)
         today_total = int(patient["금액"].sum())
