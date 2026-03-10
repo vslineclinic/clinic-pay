@@ -359,12 +359,20 @@ def parse_daily(raw):
     df = df.reset_index(drop=True)
 
     # --- 환불/취소 섹션 탐지 및 분리 ---
+    # 섹션 구분 행: "환불/취소", "환불 내역", "취소 내역" 등의 제목 행 탐지
+    # 일반 데이터 행(차트번호가 숫자인 행)은 제외
     refund_hdr = None
     for i, row in df.iterrows():
         row_text = row.astype(str).str.replace(r"\s", "", regex=True).str.cat()
-        if "환불" in row_text and "취소" in row_text:
-            refund_hdr = i
-            break
+        if "환불" in row_text or "취소" in row_text:
+            # 차트번호 컬럼이 유효한 숫자이면 일반 데이터 행이므로 건너뜀
+            chart_val = str(row.iloc[0]).strip() if len(row) > 0 else ""
+            if "차트번호" in df.columns:
+                chart_val = str(row.get("차트번호", "")).strip()
+            is_data_row = chart_val.replace("-", "").replace(" ", "").isdigit() and len(chart_val) >= 3
+            if not is_data_row:
+                refund_hdr = i
+                break
 
     refund_df = pd.DataFrame()
     if refund_hdr is not None:
@@ -443,6 +451,20 @@ def parse_daily(raw):
 
     df["플랫폼합"] = df["여신티켓"] + df["강남언니"] + df["나만의닥터"] + df["제로페이"] + df["기타지역화폐"]
     df["총액"] = df["카드"] + df["현금"] + df["이체"] + df["플랫폼합"]
+
+    # --- 메인 데이터 내 환불/취소 행 추출 (구분 컬럼 기준) ---
+    # "구분" 컬럼에 "환불" 또는 "취소"가 포함된 행을 refund_df로 이동
+    gubun_col = next((c for c in df.columns if str(c).replace(" ", "") == "구분"), None)
+    if gubun_col and refund_df.empty:
+        refund_mask = df[gubun_col].astype(str).str.contains("환불|취소", na=False)
+        if refund_mask.any():
+            refund_rows = df[refund_mask].copy().reset_index(drop=True)
+            if "총액" not in refund_rows.columns or refund_rows["총액"].sum() == 0:
+                # 총액이 없으면 결제수단 합계로 재계산
+                refund_rows["총액"] = refund_rows["카드"] + refund_rows["현금"] + refund_rows["이체"] + refund_rows["플랫폼합"]
+            refund_df = refund_rows
+            df = df[~refund_mask].copy().reset_index(drop=True)
+
     df["d_idx"] = range(len(df))
     return df, refund_df
 
@@ -2312,6 +2334,7 @@ if "done" not in st.session_state:
                 st.session_state["done"] = True
                 st.session_state["hansol"] = hansol
                 st.session_state["daily"] = daily
+                st.session_state["daily_refund"] = daily_refund
                 st.session_state["patient"] = patient
                 st.session_state["tots"] = tots
                 st.session_state["match_df"] = match_df
@@ -2337,6 +2360,7 @@ else:
     # ════════════════════════════════════════════
     hansol = st.session_state["hansol"]
     daily = st.session_state["daily"]
+    daily_refund = st.session_state.get("daily_refund", pd.DataFrame())
     patient = st.session_state["patient"]
     tots = st.session_state["tots"]
     match_df = st.session_state["match_df"]
@@ -2653,7 +2677,7 @@ else:
         local_currency = int(daily["기타지역화폐"].sum())
 
         # 환불+취소 금액 (일일마감 환불/취소 내역 우선, 없으면 차트/한솔 기준)
-        d_refund = int(daily_refund["총액"].sum()) if not daily_refund.empty else 0
+        d_refund = int(daily_refund["총액"].sum()) if not daily_refund.empty and "총액" in daily_refund.columns else 0
         p_refund = int(abs(patient[patient["is_취소"]]["금액"].sum())) if patient["is_취소"].any() else 0
         h_refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
         # 일일마감 환불 내역이 있으면 우선 사용, 없으면 차트/한솔 기준
