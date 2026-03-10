@@ -343,7 +343,7 @@ def parse_hansol(raw):
 
 
 def parse_daily(raw):
-    """일일마감 파싱: 동적 헤더, 결제수단별 금액"""
+    """일일마감 파싱: 동적 헤더, 결제수단별 금액, 환불/취소 내역 포함"""
     hdr = None
     for i, row in raw.iterrows():
         rs = row.astype(str).str.replace(r"\s", "", regex=True)
@@ -352,14 +352,72 @@ def parse_daily(raw):
             break
     if hdr is None:
         st.error("일일마감 파일에서 헤더를 찾을 수 없습니다.")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     df = raw.iloc[hdr + 1:].copy()
     df.columns = [str(c).strip().replace("\n", "") for c in raw.iloc[hdr]]
     df = df.reset_index(drop=True)
 
+    # --- 환불/취소 섹션 탐지 및 분리 ---
+    refund_hdr = None
+    for i, row in df.iterrows():
+        row_text = row.astype(str).str.replace(r"\s", "", regex=True).str.cat()
+        if "환불" in row_text and "취소" in row_text:
+            refund_hdr = i
+            break
+
+    refund_df = pd.DataFrame()
+    if refund_hdr is not None:
+        # 환불 섹션 이전까지만 메인 데이터로 사용
+        refund_raw = df.iloc[refund_hdr:].copy().reset_index(drop=True)
+        df = df.iloc[:refund_hdr].copy().reset_index(drop=True)
+
+        # 환불 섹션 내에서 헤더 행 찾기 (구분, 차트번호, 성명 등)
+        r_hdr = None
+        for i, row in refund_raw.iterrows():
+            rs = row.astype(str).str.replace(r"\s", "", regex=True)
+            if rs.str.contains("차트번호|성명", na=False).sum() >= 2:
+                r_hdr = i
+                break
+        if r_hdr is not None:
+            r_data = refund_raw.iloc[r_hdr + 1:].copy()
+            r_data.columns = [str(c).strip().replace("\n", "") for c in refund_raw.iloc[r_hdr]]
+            r_data = r_data.reset_index(drop=True)
+            # 빈 행 제거
+            if "성명" in r_data.columns:
+                r_data = r_data[r_data["성명"].notna() & (r_data["성명"].astype(str).str.strip() != "")]
+            if "차트번호" in r_data.columns:
+                r_data = r_data[r_data["차트번호"].notna() & (r_data["차트번호"].astype(str).str.strip() != "")]
+            r_data = r_data.reset_index(drop=True)
+
+            if not r_data.empty:
+                if "차트번호" in r_data.columns:
+                    r_data["차트번호"] = r_data["차트번호"].apply(clean_no)
+                if "성명" in r_data.columns:
+                    r_data["성명"] = r_data["성명"].apply(clean_name)
+
+                pay_map_r = {
+                    "카드": ["카드"], "현금": ["현금"], "이체": ["이체"],
+                    "여신티켓": ["여신티켓", "여신"], "강남언니": ["강남언니"],
+                    "나만의닥터": ["나만의닥터"], "제로페이": ["제로페이"],
+                    "기타지역화폐": ["기타-지역화폐", "기타지역화폐"],
+                }
+                for tgt, cands in pay_map_r.items():
+                    mc = next((c for c in cands if c in r_data.columns), None)
+                    r_data[tgt] = r_data[mc].apply(clean_money) if mc else 0
+
+                r_data["플랫폼합"] = r_data["여신티켓"] + r_data["강남언니"] + r_data["나만의닥터"] + r_data["제로페이"] + r_data["기타지역화폐"]
+                r_data["총액"] = r_data["카드"] + r_data["현금"] + r_data["이체"] + r_data["플랫폼합"]
+                refund_df = r_data
+
+    # --- 메인 데이터 필터링 ---
     if "성명" in df.columns:
         df = df[df["성명"].notna() & ~df["성명"].astype(str).str.contains("합계|소계", na=False)]
+    # 차트번호가 비어있고 성명도 비어있는 총합계 행 제거
+    if "차트번호" in df.columns:
+        chart_valid = df["차트번호"].apply(lambda x: str(clean_no(x)).strip() != "")
+        name_valid = df["성명"].notna() & (df["성명"].astype(str).str.strip() != "") if "성명" in df.columns else True
+        df = df[chart_valid | name_valid]
     df = df.reset_index(drop=True)
 
     df["차트번호"] = df["차트번호"].apply(clean_no)
@@ -386,7 +444,7 @@ def parse_daily(raw):
     df["플랫폼합"] = df["여신티켓"] + df["강남언니"] + df["나만의닥터"] + df["제로페이"] + df["기타지역화폐"]
     df["총액"] = df["카드"] + df["현금"] + df["이체"] + df["플랫폼합"]
     df["d_idx"] = range(len(df))
-    return df
+    return df, refund_df
 
 
 # 결제메모 플랫폼 키워드 → 플랫폼명 매핑
@@ -2208,7 +2266,7 @@ if "done" not in st.session_state:
         if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
             with st.spinner("매칭 엔진 실행 중..."):
                 hansol = parse_hansol(load_file(f_h, password=h_pw))
-                daily = parse_daily(load_file(f_d, password=d_pw))
+                daily, daily_refund = parse_daily(load_file(f_d, password=d_pw))
                 patient = parse_patient(load_file(f_p, password=p_pw))
                 if daily.empty:
                     st.error("일일마감 파일 파싱 실패")
@@ -2216,14 +2274,20 @@ if "done" not in st.session_state:
 
                 h_ok = hansol[hansol["tx_status"] == "정상"]
                 h_cancel = hansol[hansol["tx_status"] == "취소"]
+                # 일일마감 환불/취소 내역 반영
+                d_refund_card = int(daily_refund["카드"].sum()) if not daily_refund.empty and "카드" in daily_refund.columns else 0
+                d_refund_cash = int(daily_refund["현금"].sum()) if not daily_refund.empty and "현금" in daily_refund.columns else 0
+                d_refund_xfer = int(daily_refund["이체"].sum()) if not daily_refund.empty and "이체" in daily_refund.columns else 0
+                d_refund_plat = int(daily_refund["플랫폼합"].sum()) if not daily_refund.empty and "플랫폼합" in daily_refund.columns else 0
+                d_refund_tot = int(daily_refund["총액"].sum()) if not daily_refund.empty and "총액" in daily_refund.columns else 0
                 tots = {
                     "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()),
                     "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum()),
-                    "d_card": int(daily["카드"].sum()),
-                    "d_cash": int(daily["현금"].sum()),
-                    "d_xfer": int(daily["이체"].sum()),
-                    "d_plat": int(daily["플랫폼합"].sum()),
-                    "d_tot": int(daily["총액"].sum()),
+                    "d_card": int(daily["카드"].sum()) - d_refund_card,
+                    "d_cash": int(daily["현금"].sum()) - d_refund_cash,
+                    "d_xfer": int(daily["이체"].sum()) - d_refund_xfer,
+                    "d_plat": int(daily["플랫폼합"].sum()) - d_refund_plat,
+                    "d_tot": int(daily["총액"].sum()) - d_refund_tot,
                     "p_card": int(patient[patient["분류"] == "카드"]["금액"].sum()),
                     "p_cash": int(patient[patient["분류"] == "현금"]["금액"].sum()),
                     "p_xfer": int(patient[patient["분류"] == "이체"]["금액"].sum()),
@@ -2588,12 +2652,19 @@ else:
         zeropay = int(daily["제로페이"].sum())
         local_currency = int(daily["기타지역화폐"].sum())
 
-        # 환불+취소 금액 (차트 데이터 기준, 전체 결제수단 포함)
-        refund = int(abs(patient[patient["is_취소"]]["금액"].sum())) if patient["is_취소"].any() else 0
-        # 한솔 기준 취소 건수와 비교하여 차이가 있으면 한솔 금액도 참고
+        # 환불+취소 금액 (일일마감 환불/취소 내역 우선, 없으면 차트/한솔 기준)
+        d_refund = int(daily_refund["총액"].sum()) if not daily_refund.empty else 0
+        p_refund = int(abs(patient[patient["is_취소"]]["금액"].sum())) if patient["is_취소"].any() else 0
         h_refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
-        if refund == 0 and h_refund > 0:
+        # 일일마감 환불 내역이 있으면 우선 사용, 없으면 차트/한솔 기준
+        if d_refund > 0:
+            refund = d_refund
+        elif p_refund > 0:
+            refund = p_refund
+        elif h_refund > 0:
             refund = h_refund
+        else:
+            refund = 0
 
         # Today (차트 기준)
         today_total = int(patient["금액"].sum())
@@ -2626,6 +2697,20 @@ else:
 
         template_text = "\n".join(lines)
         st.code(template_text, language=None)
+
+        # 일일마감 환불/취소 내역 표시
+        if not daily_refund.empty:
+            st.markdown("#### 📋 일일마감 환불/취소 내역")
+            refund_display_cols = ["차트번호", "성명"]
+            pay_cols = ["이체", "현금", "카드", "여신티켓", "강남언니", "나만의닥터", "제로페이", "기타지역화폐"]
+            for pc in pay_cols:
+                if pc in daily_refund.columns and daily_refund[pc].sum() > 0:
+                    refund_display_cols.append(pc)
+            if "총액" in daily_refund.columns:
+                refund_display_cols.append("총액")
+            available_cols = [c for c in refund_display_cols if c in daily_refund.columns]
+            st.dataframe(daily_refund[available_cols], use_container_width=True, hide_index=True)
+            st.caption(f"환불/취소 합계: {int(daily_refund['총액'].sum()):,}원")
 
         if not type_col:
             st.warning("⚠️ 일일마감 데이터에서 신환/구환 구분 컬럼을 찾지 못했습니다. 신환/구환 수치는 수동으로 입력해주세요.")
