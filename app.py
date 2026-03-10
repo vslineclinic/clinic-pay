@@ -1989,21 +1989,176 @@ def build_patient_compare(daily, patient, daily_refund=None):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 세무위험
+# 3-Way 종합 미매칭 분석
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def tax_risk(hansol, daily, patient, matched_h):
-    risks = []
+def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, matched_dc,
+                                  missing_all, missing_only, pc, unified_info,
+                                  daily_refund=None, h_cancel=None):
+    """한솔-일마-차트 3개 소스를 모두 종합하여 미매칭/의심건을 통합 분석.
+
+    모든 환자(차트번호)에 대해 3개 소스 정보를 유기적으로 연결하고,
+    명확하게 의심되는 누락·오기재 건을 우선순위와 함께 반환한다.
+    """
+    findings = []
+
     h_ok = hansol[hansol["tx_status"] == "정상"]
     h_um = h_ok[~h_ok["h_idx"].isin(matched_h)]
-    for _, r in h_um.iterrows():
-        risks.append(dict(
-            위험등급="🔴높음", 유형="과소신고 위험",
-            내용=f"한솔 {r.get('시간표시', '')} {r['금액']:,}원 → 차트 미반영",
-            금액=int(r["금액"]),
-        ))
+    d_um = daily[(daily["카드"] > 0) & (~daily["d_idx"].isin(matched_dc))]
 
+    # ── (A) 한솔 미매칭: PG에 승인되었으나 일마에 없는 건 → 수납 누락 의심 ──
+    for _, r in h_um.iterrows():
+        amt = int(r["금액"])
+        time_str = r.get("시간표시", "")
+        card_no = str(r.get("카드번호", ""))[:12] if pd.notna(r.get("카드번호")) else ""
+        appr = str(r.get("승인번호", "")).strip() if pd.notna(r.get("승인번호")) else ""
+        is_cash = r.get("is_현금", False)
+        pay_type = "현금영수증" if is_cash else "카드"
+
+        # 차트에서 이 승인번호로 찾을 수 있는지 확인
+        chart_match = ""
+        if appr:
+            for _, pr in patient.iterrows():
+                if isinstance(pr.get("승인번호목록"), list) and appr in pr["승인번호목록"]:
+                    chart_match = f"차트 {pr['차트번호']} {pr['이름']} 에서 승인번호 발견"
+                    break
+
+        findings.append({
+            "우선순위": "🔴높음",
+            "유형": "한솔 미매칭 (수납누락 의심)",
+            "차트번호": "",
+            "환자명": "",
+            "한솔정보": f"{pay_type} {time_str} {amt:,}원" + (f" 승인#{appr}" if appr else ""),
+            "일마정보": "❌ 매칭 없음",
+            "차트정보": chart_match if chart_match else "❌ 미확인",
+            "의심금액": amt,
+            "상세사유": f"PG사({pay_type})에 {amt:,}원 정상승인되었으나 일일마감에 미기재 → 수납 누락 가능성",
+        })
+
+    # ── (B) 일마 미매칭: 프론트에서 카드수납 했으나 한솔에 없는 건 ──
+    for _, r in d_um.iterrows():
+        ch = str(r.get("차트번호", ""))
+        nm = str(r.get("성명", ""))
+        card_amt = int(r.get("카드", 0))
+
+        # 차트에서 이 환자 정보 찾기
+        p_rows = patient[patient["차트번호"] == ch]
+        chart_info = ""
+        if not p_rows.empty:
+            p_card = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum())
+            chart_info = f"차트 카드 {p_card:,}원"
+        else:
+            chart_info = "❌ 차트 없음"
+
+        findings.append({
+            "우선순위": "🔴높음",
+            "유형": "일마 미매칭 (PG미경유 의심)",
+            "차트번호": ch,
+            "환자명": nm,
+            "한솔정보": "❌ 매칭 없음",
+            "일마정보": f"카드 {card_amt:,}원",
+            "차트정보": chart_info,
+            "의심금액": card_amt,
+            "상세사유": f"일마에 카드 {card_amt:,}원 기재되었으나 PG사(한솔)에 해당 거래 없음 → 수기수납 또는 결제수단 오기재 가능성",
+        })
+
+    # ── (C) 한솔↔차트 누락: 차트에 카드수납이 있으나 한솔에서 매칭 안 됨 ──
+    if not missing_only.empty:
+        for _, r in missing_only.iterrows():
+            ch = str(r.get("차트번호", ""))
+            nm = str(r.get("이름", ""))
+            chart_card = int(r.get("차트카드금액", 0))
+            hansol_amt = int(r.get("한솔매칭금액", 0))
+            diff = int(r.get("차이(차트-한솔)", 0))
+            status = str(r.get("매칭상태", ""))
+            reason = str(r.get("불일치원인", ""))
+
+            # 일마에서 이 환자 찾기
+            d_rows = daily[daily["차트번호"] == ch]
+            daily_info = ""
+            if not d_rows.empty:
+                d_card = int(d_rows["카드"].sum())
+                daily_info = f"일마 카드 {d_card:,}원"
+            else:
+                daily_info = "❌ 일마 없음"
+
+            prio = "🟠중간" if hansol_amt > 0 else "🔴높음"
+            findings.append({
+                "우선순위": prio,
+                "유형": f"한솔↔차트 불일치 ({status})",
+                "차트번호": ch,
+                "환자명": nm,
+                "한솔정보": f"매칭 {hansol_amt:,}원" if hansol_amt > 0 else "❌ 매칭 없음",
+                "일마정보": daily_info,
+                "차트정보": f"카드 {chart_card:,}원",
+                "의심금액": abs(diff),
+                "상세사유": f"차트 카드 {chart_card:,}원 vs 한솔 매칭 {hansol_amt:,}원 → 차이 {diff:,}원" + (f" ({reason})" if reason else ""),
+            })
+
+    # ── (D) 일마↔차트 결제수단 불일치: 수단별 금액이 다른 환자 ──
+    if not pc.empty:
+        mismatch_pc = pc[pc["불일치상세"] != "✅일치"].copy()
+        for _, r in mismatch_pc.iterrows():
+            ch = str(r.get("차트번호", ""))
+            nm = str(r.get("성명", ""))
+            detail = str(r.get("불일치상세", ""))
+            matching = str(r.get("매칭", ""))
+
+            # 이미 (B)나 (C)에서 다룬 환자인지 확인 (중복 방지)
+            already_found = any(
+                f.get("차트번호") == ch and f.get("유형") != "일마↔차트 수단별 불일치"
+                for f in findings if f.get("차트번호")
+            )
+
+            # 일마 금액
+            i_card = int(r.get("[일마]카드", 0))
+            i_cash_xfer = int(r.get("[일마]현금+이체", 0)) if "[일마]현금+이체" in r.index else 0
+            # 차트 금액
+            c_card = int(r.get("[차트]카드", 0))
+            c_cash_xfer = int(r.get("[차트]현금+이체", 0)) if "[차트]현금+이체" in r.index else 0
+
+            # 카드 불일치 금액
+            card_diff = i_card - c_card
+
+            # 환자 전체 합계 불일치 확인
+            i_total = int(r.get("[일마]합계", 0)) if "[일마]합계" in r.index else 0
+            c_total = int(r.get("[차트]합계", 0)) if "[차트]합계" in r.index else 0
+            total_diff = i_total - c_total
+
+            # 한솔 매칭 정보 찾기
+            h_info = ""
+            if not match_df.empty and "일마_차트" in match_df.columns:
+                h_matches = match_df[match_df["일마_차트"].apply(clean_no) == ch]
+                if not h_matches.empty:
+                    h_amt = int(h_matches["한솔_금액"].sum())
+                    h_info = f"한솔 매칭 {h_amt:,}원"
+                else:
+                    h_info = "한솔 매칭 없음"
+
+            if matching in ["❌차트누락", "❌일마누락"]:
+                prio = "🔴높음"
+                stype = f"소스 누락 ({matching})"
+            elif total_diff != 0:
+                prio = "🟠중간"
+                stype = "금액 불일치"
+            else:
+                prio = "🟡낮음"
+                stype = "수단 오분류 (합계일치)"
+
+            findings.append({
+                "우선순위": prio,
+                "유형": f"일마↔차트 수단별 불일치",
+                "차트번호": ch,
+                "환자명": nm,
+                "한솔정보": h_info,
+                "일마정보": f"카드 {i_card:,} / 현금+이체 {i_cash_xfer:,}",
+                "차트정보": f"카드 {c_card:,} / 현금+이체 {c_cash_xfer:,}",
+                "의심금액": abs(total_diff) if total_diff != 0 else abs(card_diff),
+                "상세사유": f"{detail}" + (f" (합계차이 {total_diff:+,}원)" if total_diff != 0 else " (합계는 일치, 수단분류만 다름)"),
+            })
+
+    # ── (E) 차트번호 불일치: 일마/차트 간 같은 환자인데 차트번호가 다른 경우 ──
     d_ch = set(daily["차트번호"].unique())
     p_ch = set(patient["차트번호"].unique())
     dn = dict(zip(daily["차트번호"], daily["성명"]))
@@ -2012,20 +2167,129 @@ def tax_risk(hansol, daily, patient, matched_h):
         nm = dn.get(dc, "")
         if not nm:
             continue
-        for pc in p_ch - d_ch:
-            if clean_name(nm) == clean_name(pn.get(pc, "")) and similar_chart_no(dc, pc):
-                risks.append(dict(
-                    위험등급="🟡중간", 유형="차트번호 불일치",
-                    내용=f"{nm}: 일마 {dc} ↔ 차트 {pc}", 금액=0,
-                ))
+        for pc_no in p_ch - d_ch:
+            if clean_name(nm) == clean_name(pn.get(pc_no, "")) and similar_chart_no(dc, pc_no):
+                findings.append({
+                    "우선순위": "🟠중간",
+                    "유형": "차트번호 불일치 (동일환자)",
+                    "차트번호": f"{dc} / {pc_no}",
+                    "환자명": nm,
+                    "한솔정보": "-",
+                    "일마정보": f"차트번호 {dc}",
+                    "차트정보": f"차트번호 {pc_no}",
+                    "의심금액": 0,
+                    "상세사유": f"동일 환자({nm})가 일마에서는 {dc}, 차트에서는 {pc_no}로 기재 → 차트번호 오기재 또는 이중차트",
+                })
 
-    for _, r in hansol[hansol["tx_status"] == "취소"].iterrows():
-        risks.append(dict(
-            위험등급="🟡중간", 유형="취소거래 확인",
-            내용=f"한솔 취소 {r.get('시간표시', '')} {r['금액']:,}원", 금액=int(r["금액"]),
-        ))
+    # ── (F) 취소/환불 교차검증 ──
+    if h_cancel is not None and not h_cancel.empty:
+        for _, r in h_cancel.iterrows():
+            amt = int(r["금액"])
+            time_str = r.get("시간표시", "")
+            # 일마 환불에서 대응 건 찾기
+            d_refund_match = ""
+            if daily_refund is not None and not daily_refund.empty:
+                d_refund_match = f"일마 환불 총 {int(daily_refund['총액'].sum()):,}원"
+            # 차트 환불에서 대응 건 찾기
+            p_cancel_rows = patient[patient["is_취소"]] if "is_취소" in patient.columns else pd.DataFrame()
+            p_cancel_info = f"차트 환불 {int(abs(p_cancel_rows['금액'].sum())):,}원" if not p_cancel_rows.empty else "차트 환불 없음"
 
-    return pd.DataFrame(risks) if risks else pd.DataFrame(columns=["위험등급", "유형", "내용", "금액"])
+            findings.append({
+                "우선순위": "🟡낮음",
+                "유형": "취소거래 검증",
+                "차트번호": "",
+                "환자명": "",
+                "한솔정보": f"취소 {time_str} {amt:,}원",
+                "일마정보": d_refund_match if d_refund_match else "-",
+                "차트정보": p_cancel_info,
+                "의심금액": amt,
+                "상세사유": f"한솔 취소 {amt:,}원 → 일마·차트 환불기록과 대조 필요",
+            })
+
+    if not findings:
+        return pd.DataFrame(columns=["우선순위", "유형", "차트번호", "환자명", "한솔정보",
+                                      "일마정보", "차트정보", "의심금액", "상세사유"])
+
+    result = pd.DataFrame(findings)
+    # 우선순위 정렬: 높음 > 중간 > 낮음, 같으면 금액 내림차순
+    prio_order = {"🔴높음": 0, "🟠중간": 1, "🟡낮음": 2}
+    result["_prio"] = result["우선순위"].map(prio_order).fillna(9)
+    result = result.sort_values(["_prio", "의심금액"], ascending=[True, False]).drop(columns=["_prio"]).reset_index(drop=True)
+
+    # 중복 제거: 같은 차트번호 + 같은 유형이면 금액이 큰 것만 유지
+    # (단, 차트번호가 빈 건은 중복 제거 안 함)
+    seen = set()
+    dedup_idx = []
+    for idx, row in result.iterrows():
+        key = (row["차트번호"], row["유형"])
+        if row["차트번호"] and key in seen:
+            continue
+        if row["차트번호"]:
+            seen.add(key)
+        dedup_idx.append(idx)
+    result = result.loc[dedup_idx].reset_index(drop=True)
+
+    return result
+
+
+def build_refund_detail(daily_refund, patient):
+    """일마 환불과 차트 환불의 상세 정보를 비교하여 반환"""
+    rows = []
+
+    # 일마 환불 내역
+    if daily_refund is not None and not daily_refund.empty:
+        for _, r in daily_refund.iterrows():
+            ch = str(r.get("차트번호", ""))
+            nm = str(r.get("성명", ""))
+            card = int(r.get("카드", 0))
+            cash = int(r.get("현금", 0))
+            xfer = int(r.get("이체", 0))
+            plat = int(r.get("플랫폼합", 0))
+            total = int(r.get("총액", 0))
+            # 환불수단 결정
+            methods = []
+            if card > 0:
+                methods.append(f"카드 {card:,}")
+            if cash > 0:
+                methods.append(f"현금 {cash:,}")
+            if xfer > 0:
+                methods.append(f"이체 {xfer:,}")
+            if plat > 0:
+                methods.append(f"플랫폼 {plat:,}")
+            method_str = " + ".join(methods) if methods else "-"
+
+            rows.append({
+                "출처": "📋일일마감",
+                "차트번호": ch,
+                "환자명": nm,
+                "환불수단": method_str,
+                "환불금액": total,
+            })
+
+    # 차트 환불 내역
+    if "is_취소" in patient.columns:
+        p_cancel = patient[patient["is_취소"]].copy()
+        for _, r in p_cancel.iterrows():
+            ch = str(r.get("차트번호", ""))
+            nm = str(r.get("이름", ""))
+            amt = abs(int(r.get("금액", 0)))
+            method = str(r.get("분류", "기타"))
+            card_co = str(r.get("카드사", "")).strip()
+            method_display = method
+            if method == "카드" and card_co:
+                method_display = f"카드({card_co})"
+
+            rows.append({
+                "출처": "📊차트마감",
+                "차트번호": ch,
+                "환자명": nm,
+                "환불수단": f"{method_display} {amt:,}",
+                "환불금액": amt,
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["출처", "차트번호", "환자명", "환불수단", "환불금액"])
+    return pd.DataFrame(rows)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2149,16 +2413,16 @@ def _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_
 
 
 def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
-                          missing_all, missing_only, pc, tx, tots,
+                          missing_all, missing_only, pc, tots,
                           h_um, d_um, matched_h, matched_dc=None,
-                          unified_info=None):
+                          unified_info=None, comprehensive=None):
     """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성 (v3.0)"""
     if matched_dc is None:
         matched_dc = set()
     if not isinstance(pc, pd.DataFrame):
         pc = pd.DataFrame()
-    if not isinstance(tx, pd.DataFrame):
-        tx = pd.DataFrame()
+    if comprehensive is None:
+        comprehensive = pd.DataFrame()
     if not isinstance(missing_all, pd.DataFrame):
         missing_all = pd.DataFrame()
     if not isinstance(h_um, pd.DataFrame):
@@ -2191,7 +2455,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             ["6_일마미매칭", "일마에 있으나 한솔에 없는 건 → 수기 수납 또는 PG 미경유 건"],
             ["7_한솔vs차트_누락추정", "차트마감 기준 한솔 매칭 금액 비교 → 미반영/부족/초과 상태"],
             ["8_일마vs차트_수단별비교", "일마↔차트 결제수단별 금액 교차비교 → 수단 간 불일치 상세"],
-            ["9_세무위험", "자동 탐지 세무위험. 위험등급(🔴높음/🟡중간) 포함."],
+            ["9_종합미매칭분석", "한솔-일마-차트 3개 소스 종합 미매칭/의심건 우선순위별 분석"],
             ["10_합계비교", "3개 소스 결제수단별 합계 교차비교 → 전체 균형 확인"],
             ["11_크로스레퍼런스", "★ 차트번호별 모든 연결정보 통합 뷰 (차트금액·매칭금액·카드번호·승인번호·매칭규칙·차이)"],
             ["12_무결성검증", "데이터 연결 정확도 자동 검증 결과 → 중복매칭·총액불일치 등 감지"],
@@ -2282,12 +2546,12 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                                     "[일마]플랫폼", "[차트]플랫폼"] if c in pc.columns]
             pc[pc_cols].to_excel(writer, sheet_name="8_일마vs차트_수단별비교", index=False)
 
-        # ── Sheet 10: 세무위험 ──
-        if not tx.empty:
-            tx.to_excel(writer, sheet_name="9_세무위험", index=False)
+        # ── Sheet 10: 종합 미매칭 분석 ──
+        if comprehensive is not None and not comprehensive.empty:
+            comprehensive.to_excel(writer, sheet_name="9_종합미매칭분석", index=False)
         else:
-            pd.DataFrame({"상태": ["세무위험 탐지 건 없음"]}).to_excel(
-                writer, sheet_name="9_세무위험", index=False)
+            pd.DataFrame({"상태": ["종합 미매칭 건 없음"]}).to_excel(
+                writer, sheet_name="9_종합미매칭분석", index=False)
 
         # ── Sheet 11: 합계비교 ──
         h_total_base = tots["h_card"] + tots["h_cash"]
@@ -2445,10 +2709,18 @@ if "done" not in st.session_state:
                 missing_all, missing_only = build_missing_receipts(
                     match_df, patient, daily, hansol, unified_info=unified_info, daily_refund=daily_refund)
                 pc = build_patient_compare(daily, patient, daily_refund=daily_refund)
-                tx = tax_risk(hansol, daily, patient, matched_h)
 
                 h_um = h_ok[~h_ok["h_idx"].isin(matched_h)]
                 d_um = daily[(daily["카드"] > 0) & (~daily["d_idx"].isin(matched_dc))]
+
+                # 종합 미매칭 분석
+                comprehensive = build_comprehensive_mismatch(
+                    hansol, daily, patient, match_df, matched_h, matched_dc,
+                    missing_all, missing_only, pc, unified_info,
+                    daily_refund=daily_refund, h_cancel=h_cancel,
+                )
+                # 환불 상세 비교
+                refund_detail = build_refund_detail(daily_refund, patient)
 
                 # session_state에 저장
                 st.session_state["done"] = True
@@ -2464,7 +2736,8 @@ if "done" not in st.session_state:
                 st.session_state["missing_all"] = missing_all
                 st.session_state["missing_only"] = missing_only
                 st.session_state["pc"] = pc
-                st.session_state["tx"] = tx
+                st.session_state["comprehensive"] = comprehensive
+                st.session_state["refund_detail"] = refund_detail
                 st.session_state["h_um"] = h_um
                 st.session_state["d_um"] = d_um
                 st.session_state["n_ok"] = len(h_ok)
@@ -2494,7 +2767,8 @@ else:
     missing_all = st.session_state["missing_all"]
     missing_only = st.session_state["missing_only"]
     pc = st.session_state["pc"]
-    tx = st.session_state["tx"]
+    comprehensive = st.session_state.get("comprehensive", pd.DataFrame())
+    refund_detail = st.session_state.get("refund_detail", pd.DataFrame())
     h_um = st.session_state["h_um"]
     d_um = st.session_state["d_um"]
     n_ok = st.session_state["n_ok"]
@@ -2519,12 +2793,14 @@ else:
     k2.metric("자동매칭", f"{n_m}", f"{rate:.0f}%")
     k3.metric("한솔 미매칭", f"{len(h_um)}", delta_color="inverse")
     k4.metric("일마 미매칭", f"{len(d_um)}", delta_color="inverse")
-    k5.metric("세무위험", f"{len(tx)}", delta_color="inverse")
+    n_comp_high = len(comprehensive[comprehensive["우선순위"] == "🔴높음"]) if not comprehensive.empty and "우선순위" in comprehensive.columns else 0
+    k5.metric("종합 의심건", f"{len(comprehensive)}" if not comprehensive.empty else "0", delta_color="inverse")
     k6.metric("누락추정", f"{len(missing_only)}", delta_color="inverse")
 
     # ── 탭 ──
-    t0, t1, t2, t2b, t3, t4, t5, t6 = st.tabs([
-        "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트", "🔒 세무위험", "📝 메신저 요약", "🤖 AI 통합 다운로드",
+    t0, t1, t2, t2b, t3, t3b, t4, t5, t6 = st.tabs([
+        "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트",
+        "🔄 환불 상세", "🔍 종합분석", "📝 메신저 요약", "🤖 AI 통합 다운로드",
     ])
 
     with t0:
@@ -2763,15 +3039,122 @@ else:
             styled_pc = disp[cols].style.apply(_highlight_chart_cols, axis=1)
             st.dataframe(styled_pc, width='stretch', hide_index=True)
 
-    with t4:
-        st.subheader("🔒 세무위험")
-        if not tx.empty:
-            st.dataframe(tx.sort_values("위험등급"), width='stretch', hide_index=True)
-            hi = tx[tx["위험등급"] == "🔴높음"]
-            if len(hi):
-                st.error(f"⚠️ 고위험 {len(hi)}건 (합계 {hi['금액'].sum():,}원)")
+    with t3b:
+        st.subheader("🔄 환불/취소 상세 비교")
+        st.caption("일일마감과 차트마감의 환불/취소 건을 환자별로 비교합니다.")
+
+        if not refund_detail.empty:
+            # 출처별 합계 요약
+            rc1, rc2 = st.columns(2)
+            d_ref_total = int(refund_detail[refund_detail["출처"] == "📋일일마감"]["환불금액"].sum())
+            p_ref_total = int(refund_detail[refund_detail["출처"] == "📊차트마감"]["환불금액"].sum())
+            with rc1:
+                st.metric("일일마감 환불 합계", f"{d_ref_total:,}원")
+            with rc2:
+                st.metric("차트마감 환불 합계", f"{p_ref_total:,}원")
+
+            diff_refund = d_ref_total - p_ref_total
+            if diff_refund != 0:
+                st.warning(f"⚠️ 일마-차트 환불 차이: {diff_refund:+,}원")
+            else:
+                st.success("✅ 일마·차트 환불 합계 일치")
+
+            # 일마 환불
+            st.markdown("#### 📋 일일마감 환불 내역")
+            d_ref = refund_detail[refund_detail["출처"] == "📋일일마감"]
+            if not d_ref.empty:
+                st.dataframe(d_ref[["차트번호", "환자명", "환불수단", "환불금액"]],
+                             width='stretch', hide_index=True)
+            else:
+                st.info("일일마감 환불 내역 없음")
+
+            # 차트 환불
+            st.markdown("#### 📊 차트마감 환불 내역")
+            p_ref = refund_detail[refund_detail["출처"] == "📊차트마감"]
+            if not p_ref.empty:
+                st.dataframe(p_ref[["차트번호", "환자명", "환불수단", "환불금액"]],
+                             width='stretch', hide_index=True)
+            else:
+                st.info("차트마감 환불 내역 없음")
+
+            # 한솔 취소 내역
+            if not h_cancel.empty:
+                st.markdown("#### 💳 한솔페이 취소 내역")
+                h_cancel_cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "is_현금"] if c in h_cancel.columns]
+                st.dataframe(h_cancel[h_cancel_cols], width='stretch', hide_index=True)
+                st.caption(f"한솔 취소 합계: {int(h_cancel['금액'].sum()):,}원")
         else:
-            st.success("✅ 세무위험 없음")
+            st.success("✅ 환불/취소 내역 없음")
+
+    with t4:
+        st.subheader("🔍 한솔-일마-차트 종합 미매칭 분석")
+        st.caption("3개 소스를 모두 교차 검증하여 의심되는 누락·오기재 건을 우선순위별로 정리합니다.")
+
+        if not comprehensive.empty:
+            # 요약 통계
+            sc1, sc2, sc3 = st.columns(3)
+            n_high = len(comprehensive[comprehensive["우선순위"] == "🔴높음"])
+            n_mid = len(comprehensive[comprehensive["우선순위"] == "🟠중간"])
+            n_low = len(comprehensive[comprehensive["우선순위"] == "🟡낮음"])
+            sc1.metric("🔴 높음", f"{n_high}건")
+            sc2.metric("🟠 중간", f"{n_mid}건")
+            sc3.metric("🟡 낮음", f"{n_low}건")
+
+            total_suspect_amt = int(comprehensive["의심금액"].sum())
+            if total_suspect_amt > 0:
+                st.warning(f"⚠️ 총 의심금액: {total_suspect_amt:,}원 ({len(comprehensive)}건)")
+
+            # 필터
+            prio_filter = st.multiselect(
+                "우선순위 필터",
+                ["🔴높음", "🟠중간", "🟡낮음"],
+                default=["🔴높음", "🟠중간"],
+                key="comp_prio_filter",
+            )
+            type_options = sorted(comprehensive["유형"].unique().tolist())
+            type_filter = st.multiselect(
+                "유형 필터",
+                type_options,
+                default=type_options,
+                key="comp_type_filter",
+            )
+
+            filtered = comprehensive[
+                comprehensive["우선순위"].isin(prio_filter) &
+                comprehensive["유형"].isin(type_filter)
+            ]
+
+            if not filtered.empty:
+                # 의심금액 포맷
+                display_df = filtered.copy()
+                display_df["의심금액"] = display_df["의심금액"].apply(lambda x: f"{int(x):,}" if x else "-")
+
+                def _highlight_priority(row):
+                    styles = [""] * len(row)
+                    prio = row.get("우선순위", "")
+                    if "높음" in str(prio):
+                        styles[0] = "background-color: #ef4444; color: white"
+                    elif "중간" in str(prio):
+                        styles[0] = "background-color: #f97316; color: white"
+                    elif "낮음" in str(prio):
+                        styles[0] = "background-color: #eab308; color: white"
+                    return styles
+
+                styled = display_df.style.apply(_highlight_priority, axis=1)
+                st.dataframe(styled, width='stretch', hide_index=True)
+            else:
+                st.info("선택한 필터에 해당하는 건이 없습니다.")
+
+            # 유형별 통계
+            st.markdown("#### 유형별 통계")
+            type_stats = comprehensive.groupby("유형").agg(
+                건수=("유형", "count"),
+                의심금액합=("의심금액", "sum"),
+            ).reset_index()
+            type_stats["의심금액합"] = type_stats["의심금액합"].apply(lambda x: f"{int(x):,}")
+            st.dataframe(type_stats, width='stretch', hide_index=True)
+        else:
+            st.success("🎉 종합 분석 결과 의심건이 없습니다!")
 
     with t5:
         st.subheader("📝 메신저 정산 요약")
@@ -2948,9 +3331,9 @@ Step 5. 결론 도출
             hansol=hansol, daily=daily, patient=patient,
             match_df=match_df, hc_compare=hc_compare,
             missing_all=missing_all, missing_only=missing_only,
-            pc=pc, tx=tx, tots=tots,
+            pc=pc, tots=tots,
             h_um=h_um, d_um=d_um, matched_h=_matched_h_set, matched_dc=_matched_dc_set,
-            unified_info=unified_info,
+            unified_info=unified_info, comprehensive=comprehensive,
         )
         today_str = datetime.now().strftime("%Y%m%d")
         st.download_button(
@@ -2969,7 +3352,7 @@ Step 5. 결론 도출
                 "0_AI안내_데이터사전", "1_한솔페이", "2_일일마감", "3_차트마감",
                 "4_매칭결과", "5_한솔미매칭", "6_일마미매칭",
                 "7_한솔vs차트_누락추정", "8_일마vs차트_수단별비교",
-                "9_세무위험", "10_합계비교",
+                "9_종합미매칭분석", "10_합계비교",
                 "11_크로스레퍼런스", "12_무결성검증",
             ],
             "설명": [
@@ -2982,7 +3365,7 @@ Step 5. 결론 도출
                 f"일마 미매칭 ({len(d_um)}건)",
                 f"한솔↔차트 누락추정 ({len(missing_all)}건)",
                 f"일마↔차트 수단별 비교 ({len(pc)}건)",
-                f"세무위험 ({len(tx)}건)",
+                f"★ 한솔-일마-차트 종합 미매칭 분석 ({len(comprehensive)}건)" if not comprehensive.empty else "종합 미매칭 분석 (0건)",
                 "3개 소스 합계 교차비교",
                 "★ 차트번호별 모든 연결정보 통합 뷰",
                 "데이터 연결 정확도 자동 검증",
