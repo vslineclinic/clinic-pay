@@ -2072,6 +2072,16 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
     """3개 파일 + 분석결과를 AI가 이해하기 쉬운 단일 엑셀로 생성 (v3.0)"""
     if matched_dc is None:
         matched_dc = set()
+    if not isinstance(pc, pd.DataFrame):
+        pc = pd.DataFrame()
+    if not isinstance(tx, pd.DataFrame):
+        tx = pd.DataFrame()
+    if not isinstance(missing_all, pd.DataFrame):
+        missing_all = pd.DataFrame()
+    if not isinstance(h_um, pd.DataFrame):
+        h_um = pd.DataFrame()
+    if not isinstance(d_um, pd.DataFrame):
+        d_um = pd.DataFrame()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
 
@@ -2288,7 +2298,7 @@ if "done" not in st.session_state:
         )
 
     if f_h and f_d and f_p:
-        if st.button("🚀 정산 분석 시작", type="primary", use_container_width=True):
+        if st.button("🚀 정산 분석 시작", type="primary", width='stretch'):
             with st.spinner("매칭 엔진 실행 중..."):
                 hansol = parse_hansol(load_file(f_h, password=h_pw))
                 daily, daily_refund = parse_daily(load_file(f_d, password=d_pw))
@@ -2454,7 +2464,7 @@ else:
             return styles
 
         styled_sm = sm.style.apply(_highlight_vs_chart, axis=1)
-        st.dataframe(styled_sm, use_container_width=True, hide_index=True)
+        st.dataframe(styled_sm, width='stretch', hide_index=True)
 
         # 구분별 차이 금액 정리
         st.markdown("#### 구분별 차이 금액")
@@ -2507,7 +2517,7 @@ else:
             return styles
 
         styled_diff = diff_df.style.apply(_highlight_diff_col, subset=["한솔 vs 차트", "일마 vs 차트", "한솔 vs 일마"])
-        st.dataframe(styled_diff, use_container_width=True, hide_index=True)
+        st.dataframe(styled_diff, width='stretch', hide_index=True)
 
         diffs = []
         if tots["h_card"] != tots["d_card"]:
@@ -2550,17 +2560,17 @@ else:
             missing_amt = int(missing_only["차이(차트-한솔)"].sum()) if "차이(차트-한솔)" in missing_only.columns else 0
             prio.append(dict(순위="🟠P3", 항목="한솔↔차트 누락추정", 건수=len(missing_only), 금액=f"{missing_amt:,}"))
         if prio:
-            st.dataframe(pd.DataFrame(prio), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(prio), width='stretch', hide_index=True)
         else:
             st.success("🎉 의심건 없음!")
 
         if len(h_um):
             st.markdown("#### ❌ 한솔 미매칭")
             cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "is_현금"] if c in h_um.columns]
-            st.dataframe(h_um[cols], use_container_width=True, hide_index=True)
+            st.dataframe(h_um[cols], width='stretch', hide_index=True)
         if len(d_um):
             st.markdown("#### ❌ 일마 미매칭(카드)")
-            st.dataframe(d_um[["내원순서", "성명", "차트번호", "카드"]], use_container_width=True, hide_index=True)
+            st.dataframe(d_um[["내원순서", "성명", "차트번호", "카드"]], width='stretch', hide_index=True)
 
     with t2:
         st.subheader("💳 한솔↔일마 매칭")
@@ -2568,10 +2578,10 @@ else:
         if not match_df.empty:
             cf = st.multiselect("확신도", ["🟢HIGH", "🟡MED", "🔴LOW"], default=["🟢HIGH", "🟡MED", "🔴LOW"])
             st.dataframe(match_df[match_df["확신도"].isin(cf)].sort_values("일마_순서"),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
             st.markdown("##### 규칙별 통계")
             st.dataframe(match_df.groupby("매칭규칙").agg(건수=("매칭규칙", "count"), 금액합=("한솔_금액", "sum")).reset_index(),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
     with t2b:
         st.subheader("🧩 한솔↔차트 누락 추정 수납건")
@@ -2580,7 +2590,7 @@ else:
             disp = missing_only if view == "누락/불일치만" else missing_all
             disp_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액", "차트카드건수",
                                      "한솔매칭금액", "한솔매칭건수", "일마카드금액", "차이(차트-한솔)", "불일치원인"] if c in disp.columns]
-            st.dataframe(disp[disp_cols].sort_values("매칭상태"), use_container_width=True, hide_index=True)
+            st.dataframe(disp[disp_cols].sort_values("매칭상태"), width='stretch', hide_index=True)
 
             # 누락 요약 통계
             st.markdown("#### 누락 분석 요약")
@@ -2627,12 +2637,12 @@ else:
                 return styles
 
             styled_pc = disp[cols].style.apply(_highlight_chart_cols, axis=1)
-            st.dataframe(styled_pc, use_container_width=True, hide_index=True)
+            st.dataframe(styled_pc, width='stretch', hide_index=True)
 
     with t4:
         st.subheader("🔒 세무위험")
         if not tx.empty:
-            st.dataframe(tx.sort_values("위험등급"), use_container_width=True, hide_index=True)
+            st.dataframe(tx.sort_values("위험등급"), width='stretch', hide_index=True)
             hi = tx[tx["위험등급"] == "🔴높음"]
             if len(hi):
                 st.error(f"⚠️ 고위험 {len(hi)}건 (합계 {hi['금액'].sum():,}원)")
@@ -2739,7 +2749,7 @@ else:
             if "총액" in daily_refund.columns:
                 refund_display_cols.append("총액")
             available_cols = [c for c in refund_display_cols if c in daily_refund.columns]
-            st.dataframe(daily_refund[available_cols], use_container_width=True, hide_index=True)
+            st.dataframe(daily_refund[available_cols], width='stretch', hide_index=True)
             st.caption(f"환불/취소 합계: {int(daily_refund['총액'].sum()):,}원")
 
         if not type_col:
@@ -2825,7 +2835,7 @@ Step 5. 결론 도출
             file_name=f"정산대사_AI통합_{today_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            use_container_width=True,
+            width='stretch',
         )
 
         # 파일 내용 미리보기
@@ -2854,4 +2864,4 @@ Step 5. 결론 도출
                 "데이터 연결 정확도 자동 검증",
             ],
         }
-        st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(preview_data), width='stretch', hide_index=True)
