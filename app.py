@@ -1482,7 +1482,7 @@ def build_missing_receipts(match_df, patient, daily, hansol, unified_info=None):
             return "⚠️초과매칭"
         return "✅일치"
 
-    result["매칭상태"] = result.apply(_status, axis=1)
+    result["매칭상태"] = [_status(row) for _, row in result.iterrows()]
 
     # --- 불일치 원인 분석 ---
     # 차트별 승인번호 보유 여부
@@ -1589,7 +1589,7 @@ def build_missing_receipts(match_df, patient, daily, hansol, unified_info=None):
 
         return " | ".join(reasons) if reasons else "원인 미상"
 
-    result["불일치원인"] = result.apply(_reason, axis=1)
+    result["불일치원인"] = [_reason(row) for _, row in result.iterrows()]
     result.loc[result["매칭상태"] == "✅일치", "불일치원인"] = ""
 
     missing = result[result["매칭상태"] != "✅일치"].copy()
