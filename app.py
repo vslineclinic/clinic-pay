@@ -447,11 +447,20 @@ def parse_patient(raw):
         df.loc[df["is_취소"], "금액"] = -df.loc[df["is_취소"], "금액"].abs()
         df.loc[df["is_취소"], "본부금"] = -df.loc[df["is_취소"], "본부금"].abs()
 
-    card_mask = pay_norm.str.startswith("카드", na=False)
+    # 취소/환불 행은 결제수단 컬럼에 "취소"/"환불"만 적혀 원래 결제수단이 누락되는
+    # 경우가 있으므로, cancel_text(수납구분/결제구분 등 여러 컬럼 합산)도 함께 참조
+    cancel_norm = cancel_text.str.lower().str.replace(r"[\s\-_/+·()\[\]]", "", regex=True)
+
+    card_mask = (
+        pay_norm.str.contains("카드", na=False)
+        | (df["is_취소"] & cancel_norm.str.contains("카드", na=False))
+    )
     cash_mask = (
         pay_norm.str.contains("현금", na=False)
         | pay_norm.str.contains("현금영수증", na=False)
         | pay_norm.str.contains("영수증", na=False)
+        | (df["is_취소"] & cancel_norm.str.contains("현금|영수증", na=False)
+           & ~cancel_norm.str.contains("카드", na=False))
     )
     transfer_mask = (
         pay_norm.isin(["통장", "통장입금"])
@@ -459,6 +468,8 @@ def parse_patient(raw):
         | pay_norm.str.contains("계좌", na=False)
         | pay_norm.str.contains("입금", na=False)
         | pay_norm.str.contains("무통장", na=False)
+        | (df["is_취소"] & cancel_norm.str.contains("이체|계좌|입금", na=False)
+           & ~cancel_norm.str.contains("카드|현금", na=False))
     )
     platform_mask = pay_norm.str.startswith("기타", na=False)
 
@@ -2565,7 +2576,9 @@ else:
         cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
 
         # 결제수단별 합계 (최종매칭 시 차트정보 기준)
-        card_total = int(patient[patient["분류"] == "카드"]["금액"].sum())
+        # 카드: 취소/환불 행 제외한 순수 수납 금액 (차트프로그램 표시 기준)
+        p_card = patient[patient["분류"] == "카드"]
+        card_total = int(p_card[~p_card["is_취소"]]["금액"].sum())
         cash_total = int(patient[patient["분류"] == "현금"]["금액"].sum())
         transfer_total = int(patient[patient["분류"] == "이체"]["금액"].sum())
         platform_group = patient[patient["분류"] == "플랫폼"]
@@ -2575,8 +2588,12 @@ else:
         zeropay = int(daily["제로페이"].sum())
         local_currency = int(daily["기타지역화폐"].sum())
 
-        # 환불+취소 금액
-        refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
+        # 환불+취소 금액 (차트 데이터 기준, 전체 결제수단 포함)
+        refund = int(patient[patient["is_취소"]]["금액"].sum().abs()) if patient["is_취소"].any() else 0
+        # 한솔 기준 취소 건수와 비교하여 차이가 있으면 한솔 금액도 참고
+        h_refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
+        if refund == 0 and h_refund > 0:
+            refund = h_refund
 
         # Today (차트 기준)
         today_total = int(patient["금액"].sum())
