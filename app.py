@@ -2576,9 +2576,9 @@ else:
         cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
 
         # 결제수단별 합계 (최종매칭 시 차트정보 기준)
-        # 카드: 취소/환불 행 제외한 순수 수납 금액 (차트프로그램 표시 기준)
+        # 카드: 취소/환불 금액(음수) 포함한 순매출 (카드사 정산 기준)
         p_card = patient[patient["분류"] == "카드"]
-        card_total = int(p_card[~p_card["is_취소"]]["금액"].sum())
+        card_total = int(p_card["금액"].sum())
         cash_total = int(patient[patient["분류"] == "현금"]["금액"].sum())
         transfer_total = int(patient[patient["분류"] == "이체"]["금액"].sum())
         platform_group = patient[patient["분류"] == "플랫폼"]
@@ -2589,7 +2589,7 @@ else:
         local_currency = int(daily["기타지역화폐"].sum())
 
         # 환불+취소 금액 (차트 데이터 기준, 전체 결제수단 포함)
-        refund = int(patient[patient["is_취소"]]["금액"].sum().abs()) if patient["is_취소"].any() else 0
+        refund = int(abs(patient[patient["is_취소"]]["금액"].sum())) if patient["is_취소"].any() else 0
         # 한솔 기준 취소 건수와 비교하여 차이가 있으면 한솔 금액도 참고
         h_refund = int(hansol[hansol["tx_status"] == "취소"]["금액"].sum())
         if refund == 0 and h_refund > 0:
