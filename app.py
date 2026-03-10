@@ -318,6 +318,9 @@ def parse_hansol(raw):
         df.loc[s.str.contains("포인트실패", na=False), "tx_status"] = "포인트실패"
         # 취소승인(=취소가 승인된 건)도 취소로 분류
         df.loc[s.str.contains("취소", na=False), "tx_status"] = "취소"
+        # 취소거절: 취소 시도가 거절된 건 → 매출도 환불도 아님, 총합계 제외
+        df.loc[s.str.contains("취소거절", na=False), "tx_status"] = "취소거절"
+        df.loc[s.str.contains("취소.?거절|거절.?취소", na=False, regex=True), "tx_status"] = "취소거절"
 
     typcol = next((c for c in ["구분"] if c in df.columns), None)
     df["is_현금"] = False
@@ -2518,9 +2521,12 @@ else:
 
         rej = hansol[hansol["tx_status"] == "승인거절"]
         can = hansol[hansol["tx_status"] == "취소"]
-        if len(rej) + len(can) > 0:
+        cancel_rej = hansol[hansol["tx_status"] == "취소거절"]
+        if len(rej) + len(can) + len(cancel_rej) > 0:
             cancel_amt = int(can["금액"].sum()) if len(can) > 0 else 0
             msg = f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건"
+            if len(cancel_rej) > 0:
+                msg += f" / 취소거절 {len(cancel_rej)}건 (합계 제외)"
             if cancel_amt > 0:
                 msg += f" (취소금액 {cancel_amt:,}원 → 순매출에서 차감됨)"
             st.info(msg)
@@ -2661,7 +2667,7 @@ else:
             old_amt = int(daily.loc[old_mask, "총액"].sum())
 
         # 취소+부도
-        cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절"])])
+        cancel_count = len(hansol[hansol["tx_status"].isin(["취소", "승인거절", "취소거절"])])
 
         # 결제수단별 합계 (최종매칭 시 차트정보 기준)
         # 카드: 취소/환불 금액(음수) 포함한 순매출 (카드사 정산 기준)
