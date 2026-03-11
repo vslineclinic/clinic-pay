@@ -499,12 +499,20 @@ def parse_patient(raw):
     df["이름"] = df["이름"].apply(clean_name)
 
     amt_cols = [c for c in ["비급여(과세총금액)", "비급여(비과세)"] if c in df.columns]
-    copay_cols = [c for c in df.columns if "본부금" in str(c) or "본인부담" in str(c)]
+    copay_cols = [c for c in df.columns if ("본부금" in str(c) or "본인부담" in str(c)) and "환불" not in str(c)]
     all_amt_cols = amt_cols + copay_cols
     for c in all_amt_cols:
         df[c] = df[c].apply(clean_money)
     df["본부금"] = df[copay_cols].sum(axis=1) if copay_cols else 0
     df["금액"] = df[all_amt_cols].sum(axis=1) if all_amt_cols else 0
+
+    # ── 환불 전용 컬럼 파싱: 환불(과세총금액), 환불(비과세), 환불(본부금) ──
+    refund_amt_cols = [c for c in ["환불(과세총금액)", "환불(비과세)"] if c in df.columns]
+    refund_copay_cols = [c for c in df.columns if "환불" in str(c) and ("본부금" in str(c) or "본인부담" in str(c))]
+    all_refund_cols = refund_amt_cols + refund_copay_cols
+    for c in all_refund_cols:
+        df[c] = df[c].apply(clean_money)
+    df["환불금액합"] = df[all_refund_cols].sum(axis=1) if all_refund_cols else 0
 
     def _pick_first_series(frame, col):
         """중복 컬럼명이 있는 경우 첫 번째 컬럼만 Series로 반환"""
@@ -525,8 +533,18 @@ def parse_patient(raw):
     cancel_text = pd.Series("", index=df.index, dtype=str)
     for c in cancel_text_cols:
         cancel_text = cancel_text + " " + _pick_first_series(df, c).astype(str)
-    df["is_취소"] = cancel_text.str.contains(r"취소|환불", na=False)
+    # 환불 전용 컬럼에 금액이 있는 행도 환불로 감지
+    has_refund_amt = df["환불금액합"] > 0
+    df["is_취소"] = cancel_text.str.contains(r"취소|환불", na=False) | has_refund_amt
     if df["is_취소"].any():
+        # 비급여 금액이 0이고 환불 컬럼에만 금액이 있는 행 → 환불 금액으로 채움
+        refund_only_mask = df["is_취소"] & (df["금액"].abs() == 0) & (df["환불금액합"] > 0)
+        df.loc[refund_only_mask, "금액"] = df.loc[refund_only_mask, "환불금액합"]
+        # 환불 전용 행의 본부금도 환불(본부금) 컬럼에서 가져옴
+        if refund_copay_cols:
+            refund_copay_only = df["is_취소"] & (df["본부금"].abs() == 0)
+            refund_copay_sum = df[refund_copay_cols].sum(axis=1)
+            df.loc[refund_copay_only & (refund_copay_sum > 0), "본부금"] = refund_copay_sum[refund_copay_only & (refund_copay_sum > 0)]
         df.loc[df["is_취소"], "금액"] = -df.loc[df["is_취소"], "금액"].abs()
         df.loc[df["is_취소"], "본부금"] = -df.loc[df["is_취소"], "본부금"].abs()
 
