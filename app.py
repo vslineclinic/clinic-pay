@@ -2681,10 +2681,24 @@ if "done" not in st.session_state:
                 d_refund_plat = int(daily_refund["플랫폼합"].sum()) if not daily_refund.empty and "플랫폼합" in daily_refund.columns else 0
                 d_refund_tot = int(daily_refund["총액"].sum()) if not daily_refund.empty and "총액" in daily_refund.columns else 0
 
-                # ── 차트 환불/취소 보정: 차트 is_취소 행의 금액이 0이거나
-                #    분류가 '기타'(환불-기타 등)인 경우, 일마 환불 기준으로 보정 ──
-                p_cancel = patient[patient["is_취소"]] if "is_취소" in patient.columns else patient.iloc[0:0]
-                # 차트에서 이미 반영된 환불 (is_취소 행의 음수 금액, 분류별)
+                # ── 차트 환불/취소 보정 ──
+                # 한솔·일마는 카테고리별 합계에서 환불을 이미 차감(net)하므로,
+                # 차트마감도 동일하게 카테고리별로 환불을 차감해야 정확히 비교됨.
+                p_cancel = patient[patient["is_취소"]].copy() if "is_취소" in patient.columns else patient.iloc[0:0].copy()
+                p_normal = patient[~patient["is_취소"]] if "is_취소" in patient.columns else patient
+
+                # "기타"로 분류된 환불 행을 원래 결제수단으로 재분류
+                # (예: 환불이 "기타"로 기재되었지만 원래 결제는 "카드"인 경우)
+                if not p_cancel.empty and not p_normal.empty:
+                    기타_mask = p_cancel["분류"] == "기타"
+                    for idx in p_cancel[기타_mask].index:
+                        ch = p_cancel.loc[idx, "차트번호"]
+                        orig = p_normal[p_normal["차트번호"] == ch]
+                        if not orig.empty:
+                            cat_sums = orig.groupby("분류")["금액"].sum()
+                            best_cat = cat_sums.idxmax()
+                            p_cancel.loc[idx, "분류"] = best_cat
+
                 def _p_cancel_by(cat):
                     if p_cancel.empty:
                         return 0
@@ -2694,16 +2708,11 @@ if "done" not in st.session_state:
                 p_cancel_cash = _p_cancel_by("현금")
                 p_cancel_xfer = _p_cancel_by("이체")
                 p_cancel_plat = _p_cancel_by("플랫폼")
+                p_cancel_etc = _p_cancel_by("기타")
                 p_cancel_tot = abs(int(p_cancel["금액"].sum())) if not p_cancel.empty else 0
                 # 차트에서 미반영된 환불 = 일마 환불 총액 - 차트 취소 총액
-                # NOTE: 카테고리별(카드/현금 등) 비교는 하지 않음.
-                #   동일 환불이 일마에서는 "카드", 차트에서는 "기타" 등
-                #   다른 분류로 기재될 수 있어 카테고리별 비교 시 이중 차감 발생.
-                #   is_취소로 이미 p_normal에서 제외된 건은 총액 기준으로만 보정.
                 p_extra_refund_tot = max(0, d_refund_tot - p_cancel_tot)
 
-                # 차트 비취소 건만 합산 (취소건 별도 처리)
-                p_normal = patient[~patient["is_취소"]] if "is_취소" in patient.columns else patient
                 tots = {
                     "h_card": int(h_ok[~h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()),
                     "h_cash": int(h_ok[h_ok["is_현금"]]["금액"].sum()) - int(h_cancel[h_cancel["is_현금"]]["금액"].sum()),
@@ -2712,12 +2721,13 @@ if "done" not in st.session_state:
                     "d_xfer": int(daily["이체"].sum()) - d_refund_xfer,
                     "d_plat": int(daily["플랫폼합"].sum()) - d_refund_plat,
                     "d_tot": int(daily["총액"].sum()) - d_refund_tot,
-                    "p_card": int(p_normal[p_normal["분류"] == "카드"]["금액"].sum()),
-                    "p_cash": int(p_normal[p_normal["분류"] == "현금"]["금액"].sum()),
-                    "p_xfer": int(p_normal[p_normal["분류"] == "이체"]["금액"].sum()),
-                    "p_plat": int(p_normal[p_normal["분류"] == "플랫폼"]["금액"].sum()),
-                    "p_etc": int(p_normal[p_normal["분류"] == "기타"]["금액"].sum()),
-                    "p_tot": int(p_normal["금액"].sum()) - p_extra_refund_tot,
+                    # 차트마감: 카테고리별로 환불 차감 (한솔·일마와 동일한 net 방식)
+                    "p_card": int(p_normal[p_normal["분류"] == "카드"]["금액"].sum()) - p_cancel_card,
+                    "p_cash": int(p_normal[p_normal["분류"] == "현금"]["금액"].sum()) - p_cancel_cash,
+                    "p_xfer": int(p_normal[p_normal["분류"] == "이체"]["금액"].sum()) - p_cancel_xfer,
+                    "p_plat": int(p_normal[p_normal["분류"] == "플랫폼"]["금액"].sum()) - p_cancel_plat,
+                    "p_etc": int(p_normal[p_normal["분류"] == "기타"]["금액"].sum()) - p_cancel_etc,
+                    "p_tot": int(p_normal["금액"].sum()) - p_cancel_tot - p_extra_refund_tot,
                 }
 
                 match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
@@ -2842,11 +2852,14 @@ else:
         ]
         if p_etc > 0:
             sm_rows.append({"구분": "기타(미분류)", "한솔페이": "-", "일일마감": "-", "차트마감": p_etc})
-        # 환불/취소 차감 행 표시 (일마 환불이 있는 경우)
-        if d_refund_tot > 0:
-            h_cancel_tot = int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()) + int(h_cancel[h_cancel["is_현금"]]["금액"].sum())
+        # 환불/취소 차감 행 표시 (어느 소스든 환불이 있는 경우)
+        # NOTE: 각 소스의 카테고리별 금액에 이미 환불이 차감되어 있으므로 이 행은 참고용
+        h_cancel_tot = int(h_cancel[~h_cancel["is_현금"]]["금액"].sum()) + int(h_cancel[h_cancel["is_현금"]]["금액"].sum())
+        p_refund_display = p_cancel_tot + p_extra_refund_tot
+        if d_refund_tot > 0 or p_cancel_tot > 0 or h_cancel_tot > 0:
             sm_rows.append({"구분": "환불/취소 차감", "한솔페이": f"-{h_cancel_tot:,}" if h_cancel_tot > 0 else "-",
-                            "일일마감": f"-{d_refund_tot:,}", "차트마감": f"-{p_extra_refund_tot:,}" if p_extra_refund_tot > 0 else f"-{p_cancel_tot:,}" if p_cancel_tot > 0 else "-"})
+                            "일일마감": f"-{d_refund_tot:,}" if d_refund_tot > 0 else "-",
+                            "차트마감": f"-{p_refund_display:,}" if p_refund_display > 0 else "-"})
         sm_rows.append({"구분": "합계", "한솔페이": h_total_with_plat, "일일마감": tots["d_tot"], "차트마감": tots["p_tot"]})
         sm = pd.DataFrame(sm_rows)
         if plat_confirmed:
