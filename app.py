@@ -2695,11 +2695,11 @@ if "done" not in st.session_state:
                 p_cancel_xfer = _p_cancel_by("이체")
                 p_cancel_plat = _p_cancel_by("플랫폼")
                 p_cancel_tot = abs(int(p_cancel["금액"].sum())) if not p_cancel.empty else 0
-                # 차트에서 미반영된 환불 = 일마 환불 - 차트 이미 반영분
-                p_extra_refund_card = max(0, d_refund_card - p_cancel_card)
-                p_extra_refund_cash = max(0, d_refund_cash - p_cancel_cash)
-                p_extra_refund_xfer = max(0, d_refund_xfer - p_cancel_xfer)
-                p_extra_refund_plat = max(0, d_refund_plat - p_cancel_plat)
+                # 차트에서 미반영된 환불 = 일마 환불 총액 - 차트 취소 총액
+                # NOTE: 카테고리별(카드/현금 등) 비교는 하지 않음.
+                #   동일 환불이 일마에서는 "카드", 차트에서는 "기타" 등
+                #   다른 분류로 기재될 수 있어 카테고리별 비교 시 이중 차감 발생.
+                #   is_취소로 이미 p_normal에서 제외된 건은 총액 기준으로만 보정.
                 p_extra_refund_tot = max(0, d_refund_tot - p_cancel_tot)
 
                 # 차트 비취소 건만 합산 (취소건 별도 처리)
@@ -2712,10 +2712,10 @@ if "done" not in st.session_state:
                     "d_xfer": int(daily["이체"].sum()) - d_refund_xfer,
                     "d_plat": int(daily["플랫폼합"].sum()) - d_refund_plat,
                     "d_tot": int(daily["총액"].sum()) - d_refund_tot,
-                    "p_card": int(p_normal[p_normal["분류"] == "카드"]["금액"].sum()) - p_extra_refund_card,
-                    "p_cash": int(p_normal[p_normal["분류"] == "현금"]["금액"].sum()) - p_extra_refund_cash,
-                    "p_xfer": int(p_normal[p_normal["분류"] == "이체"]["금액"].sum()) - p_extra_refund_xfer,
-                    "p_plat": int(p_normal[p_normal["분류"] == "플랫폼"]["금액"].sum()) - p_extra_refund_plat,
+                    "p_card": int(p_normal[p_normal["분류"] == "카드"]["금액"].sum()),
+                    "p_cash": int(p_normal[p_normal["분류"] == "현금"]["금액"].sum()),
+                    "p_xfer": int(p_normal[p_normal["분류"] == "이체"]["금액"].sum()),
+                    "p_plat": int(p_normal[p_normal["분류"] == "플랫폼"]["금액"].sum()),
                     "p_etc": int(p_normal[p_normal["분류"] == "기타"]["금액"].sum()),
                     "p_tot": int(p_normal["금액"].sum()) - p_extra_refund_tot,
                 }
