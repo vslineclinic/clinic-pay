@@ -191,6 +191,18 @@ def load_file(f, password=None, default_password="vsline99!!"):
     last_error = None
     user_pw = password.strip() if isinstance(password, str) and password.strip() else None
 
+    # 파일이 암호화되어 있는지 감지
+    def _is_encrypted():
+        """msoffcrypto로 파일 암호화 여부를 확인한다."""
+        if importlib.util.find_spec("msoffcrypto") is None:
+            return False
+        try:
+            ms = importlib.import_module("msoffcrypto")
+            office = ms.OfficeFile(io.BytesIO(raw))
+            return office.is_encrypted()
+        except Exception:
+            return False
+
     def _try_decrypt(pw):
         """msoffcrypto 복호화 시도 후 엑셀 읽기"""
         if importlib.util.find_spec("msoffcrypto") is None:
@@ -202,6 +214,8 @@ def load_file(f, password=None, default_password="vsline99!!"):
         office.decrypt(decrypted)
         decrypted.seek(0)
         return _read_excel_auto(decrypted, header=None)
+
+    encrypted = _is_encrypted()
 
     # 1단계: 사용자가 비밀번호를 입력한 경우 → 복호화 시도
     if user_pw is not None:
@@ -216,22 +230,23 @@ def load_file(f, password=None, default_password="vsline99!!"):
     except Exception as e:
         last_error = e
 
-    # 3단계: 기본 비밀번호로 복호화 시도
-    if user_pw != default_password:
-        try:
-            return _try_decrypt(default_password)
-        except Exception as e:
-            last_error = e
+    # 3단계: 암호화된 파일인 경우에만 기본 비밀번호로 복호화 시도
+    if encrypted:
+        if user_pw != default_password:
+            try:
+                return _try_decrypt(default_password)
+            except Exception as e:
+                last_error = e
 
-    # 4단계: 추가 기본 비밀번호들 시도
-    extra_passwords = ["1234", "0000", "1111", "password"]
-    for pw in extra_passwords:
-        if pw == user_pw or pw == default_password:
-            continue
-        try:
-            return _try_decrypt(pw)
-        except Exception:
-            continue
+        # 4단계: 추가 기본 비밀번호들 시도
+        extra_passwords = ["1234", "0000", "1111", "password"]
+        for pw in extra_passwords:
+            if pw == user_pw or pw == default_password:
+                continue
+            try:
+                return _try_decrypt(pw)
+            except Exception:
+                continue
 
     # 5단계: 확장자는 xls/xlsx이지만 실제로 HTML 테이블인 경우
     result = _try_read_as_html(raw)
@@ -257,7 +272,10 @@ def load_file(f, password=None, default_password="vsline99!!"):
         except Exception:
             continue
 
-    raise ValueError(f"지원하지 않는 형식이거나 비밀번호가 필요합니다. ({last_error})")
+    if encrypted:
+        raise ValueError(f"암호화된 파일입니다. 올바른 비밀번호를 입력해 주세요. ({last_error})")
+    else:
+        raise ValueError(f"지원하지 않는 파일 형식입니다. 엑셀(.xlsx, .xls, .xlsb) 또는 CSV 파일을 업로드해 주세요. ({last_error})")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
