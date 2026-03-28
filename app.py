@@ -1969,21 +1969,86 @@ def build_patient_compare(daily, patient, daily_refund=None):
     mg.loc[mg["_merge"] == "left_only", "매칭"] = "❌차트누락"
     mg.loc[mg["_merge"] == "right_only", "매칭"] = "❌일마누락"
 
-    # fuzzy
+    # fuzzy matching — 3단계 매칭
     lo = mg[mg["_merge"] == "left_only"].copy()
     ro = mg[mg["_merge"] == "right_only"].copy()
-    used = set()
+    used_lo = set()  # 매칭 완료된 left_only 인덱스
+    used_ro = set()  # 매칭 완료된 right_only 인덱스
+
+    def _merge_chart_into_ilma(i, dr, j, pr, label):
+        """right_only(차트) 행의 데이터를 left_only(일마) 행에 병합."""
+        mg.at[i, "매칭"] = label
+        for c in [c for c in pr.index if str(c).startswith("[차트]")]:
+            mg.at[i, c] = pr[c]
+        mg.at[j, "매칭"] = "__merged__"  # 병합 완료 표시 (나중에 제거)
+        used_lo.add(i)
+        used_ro.add(j)
+
+    # Pass 1: 유사 차트번호 + 동일 성명 (기존 로직)
     for i, dr in lo.iterrows():
         for j, pr in ro.iterrows():
-            if j in used:
+            if j in used_ro:
                 continue
             if clean_name(dr.get("성명", "")) == clean_name(pr.get("성명_차트", "")) \
                     and similar_chart_no(dr["차트번호"], pr["차트번호"]):
-                mg.at[i, "매칭"] = f"⚠️유사({dr['차트번호']}↔{pr['차트번호']})"
-                for c in [c for c in pr.index if str(c).startswith("[차트]")]:
-                    mg.at[i, c] = pr[c]
-                used.add(j)
+                _merge_chart_into_ilma(i, dr, j, pr,
+                                       f"⚠️유사({dr['차트번호']}↔{pr['차트번호']})")
                 break
+
+    # Pass 2: 동일 성명 + 수단별 금액 일치 (차트번호 달라도 매칭)
+    #   — 카드/현금/이체/플랫폼 중 하나 이상의 금액이 0이 아니면서 일치하면 매칭
+    pay_pairs = [("[일마]카드", "[차트]카드"), ("[일마]현금", "[차트]현금"),
+                 ("[일마]이체", "[차트]이체"), ("[일마]플랫폼", "[차트]플랫폼")]
+    for i, dr in lo.iterrows():
+        if i in used_lo:
+            continue
+        dn = clean_name(dr.get("성명", ""))
+        if not dn:
+            continue
+        best_j, best_score = None, 0
+        for j, pr in ro.iterrows():
+            if j in used_ro:
+                continue
+            if dn != clean_name(pr.get("성명_차트", "")):
+                continue
+            # 수단별 금액 비교: 일치하는 비-0 수단 수 계산
+            score = 0
+            for ic, pc in pay_pairs:
+                iv = dr.get(ic, 0) or 0
+                pv = pr.get(pc, 0) or 0
+                if iv != 0 and iv == pv:
+                    score += 1
+            # 합계 일치도 보너스
+            i_total = sum(dr.get(c, 0) or 0 for c, _ in pay_pairs)
+            p_total = sum(pr.get(c, 0) or 0 for _, c in pay_pairs)
+            if i_total != 0 and i_total == p_total:
+                score += 2
+            if score > best_score:
+                best_j, best_score = j, score
+        if best_j is not None and best_score >= 1:
+            pr = ro.loc[best_j]
+            _merge_chart_into_ilma(i, dr, best_j, pr,
+                                   f"⚠️유사({dr['차트번호']}↔{pr['차트번호']})")
+
+    # Pass 3: 동일 성명 1:1 매칭 (해당 이름의 미매칭이 양쪽 각 1건뿐일 때)
+    remaining_lo = lo[~lo.index.isin(used_lo)]
+    remaining_ro = ro[~ro.index.isin(used_ro)]
+    lo_names = remaining_lo.apply(lambda r: clean_name(r.get("성명", "")), axis=1)
+    ro_names = remaining_ro.apply(lambda r: clean_name(r.get("성명_차트", "")), axis=1)
+    for name in set(lo_names) & set(ro_names):
+        if not name:
+            continue
+        li = remaining_lo[lo_names == name].index.tolist()
+        ri = remaining_ro[ro_names == name].index.tolist()
+        if len(li) == 1 and len(ri) == 1:
+            i, j = li[0], ri[0]
+            if i not in used_lo and j not in used_ro:
+                dr, pr = lo.loc[i], ro.loc[j]
+                _merge_chart_into_ilma(i, dr, j, pr,
+                                       f"⚠️유사({dr['차트번호']}↔{pr['차트번호']})")
+
+    # 병합 완료된 right_only 행 제거
+    mg = mg[mg["매칭"] != "__merged__"].copy()
 
     # 숫자 컬럼만 fillna(0), 문자열 컬럼은 빈문자열
     num_cols = mg.select_dtypes(include="number").columns
