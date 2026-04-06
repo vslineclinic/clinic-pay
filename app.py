@@ -2707,6 +2707,180 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AI 자동 분석 (Claude / Gemini API)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
+                            tots, pc, missing_all, comprehensive,
+                            unified_info=None):
+    """핵심 분석 데이터를 AI에 전송할 텍스트로 변환 (토큰 절약을 위해 핵심만 추출)"""
+    lines = []
+
+    # 1. 합계비교 (필수)
+    lines.append("=== [합계비교] ===")
+    h_total_base = tots["h_card"] + tots["h_cash"]
+    d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
+    p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
+    p_etc = tots.get("p_etc", 0)
+    plat_confirmed = tots["d_plat"] == tots["p_plat"] and tots["d_plat"] > 0
+    h_plat = tots["d_plat"] if plat_confirmed else 0
+    h_total = h_total_base + h_plat
+
+    lines.append(f"구분,한솔페이,일일마감,차트마감,한솔vs차트_차이,일마vs차트_차이")
+    rows = [
+        ("카드", tots["h_card"], tots["d_card"], tots["p_card"]),
+        ("현금+이체", tots["h_cash"], d_cash_xfer, p_cash_xfer),
+        ("플랫폼", h_plat, tots["d_plat"], tots["p_plat"]),
+    ]
+    if p_etc > 0:
+        rows.append(("기타", 0, 0, p_etc))
+    rows.append(("합계", h_total, tots["d_tot"], tots["p_tot"]))
+    for label, h, d, p in rows:
+        lines.append(f"{label},{h},{d},{p},{h - p},{d - p}")
+
+    # 2. 한솔 미매칭 (최우선 점검)
+    lines.append(f"\n=== [한솔 미매칭] ({len(h_um)}건) ===")
+    if not h_um.empty:
+        cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "is_현금", "카드사"] if c in h_um.columns]
+        lines.append(",".join(cols))
+        for _, row in h_um.head(50).iterrows():
+            lines.append(",".join(str(row.get(c, "")) for c in cols))
+        if len(h_um) > 50:
+            lines.append(f"... 외 {len(h_um) - 50}건 생략")
+
+    # 3. 일마 미매칭
+    lines.append(f"\n=== [일마 미매칭] ({len(d_um)}건) ===")
+    if not d_um.empty:
+        cols = ["내원순서", "성명", "차트번호", "카드"]
+        available = [c for c in cols if c in d_um.columns]
+        lines.append(",".join(available))
+        for _, row in d_um.head(50).iterrows():
+            lines.append(",".join(str(row.get(c, "")) for c in available))
+
+    # 4. 종합 미매칭 분석 (핵심)
+    lines.append(f"\n=== [종합 미매칭 분석] ({len(comprehensive) if comprehensive is not None and not comprehensive.empty else 0}건) ===")
+    if comprehensive is not None and not comprehensive.empty:
+        lines.append(",".join(comprehensive.columns.tolist()))
+        for _, row in comprehensive.head(80).iterrows():
+            lines.append(",".join(str(v) for v in row.values))
+        if len(comprehensive) > 80:
+            lines.append(f"... 외 {len(comprehensive) - 80}건 생략")
+
+    # 5. 일마↔차트 수단별 불일치 (불일치만)
+    if pc is not None and not pc.empty:
+        mm = pc[pc["불일치상세"] != "✅일치"] if "불일치상세" in pc.columns else pc
+        lines.append(f"\n=== [일마↔차트 수단별 불일치] ({len(mm)}건) ===")
+        if not mm.empty:
+            cols = [c for c in ["차트번호", "성명", "불일치상세",
+                                "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
+                                "[일마]현금+이체", "[차트]현금+이체",
+                                "[일마]플랫폼", "[차트]플랫폼"] if c in mm.columns]
+            lines.append(",".join(cols))
+            for _, row in mm.head(50).iterrows():
+                lines.append(",".join(str(row.get(c, "")) for c in cols))
+
+    # 6. 한솔↔차트 누락추정
+    if missing_all is not None and not missing_all.empty:
+        miss_only = missing_all[missing_all.get("매칭상태", pd.Series(dtype=str)).isin(["❌미반영", "⚠️부족"])] if "매칭상태" in missing_all.columns else missing_all
+        lines.append(f"\n=== [한솔↔차트 누락추정] ({len(miss_only)}건) ===")
+        if not miss_only.empty:
+            cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
+                                "한솔매칭금액", "차이(차트-한솔)"] if c in miss_only.columns]
+            lines.append(",".join(cols))
+            for _, row in miss_only.head(50).iterrows():
+                lines.append(",".join(str(row.get(c, "")) for c in cols))
+
+    # 7. 크로스레퍼런스 - 문제건만
+    if unified_info is not None and not unified_info.empty:
+        problem = unified_info[unified_info.get("상태", pd.Series(dtype=str)).str.contains("❌|⚠️", na=False)] if "상태" in unified_info.columns else pd.DataFrame()
+        if not problem.empty:
+            lines.append(f"\n=== [크로스레퍼런스 - 문제건] ({len(problem)}건) ===")
+            cols = [c for c in problem.columns if c not in ["p_idx"]][:12]
+            lines.append(",".join(cols))
+            for _, row in problem.head(50).iterrows():
+                lines.append(",".join(str(row.get(c, "")) for c in cols))
+
+    # 8. 기본 통계
+    lines.append(f"\n=== [기본 통계] ===")
+    lines.append(f"한솔페이 총 거래: {len(hansol)}건")
+    lines.append(f"일일마감 환자: {len(daily)}건")
+    lines.append(f"차트마감 환자: {len(patient)}건")
+    lines.append(f"자동매칭 성공: {len(match_df)}건")
+    lines.append(f"한솔 미매칭: {len(h_um)}건")
+    lines.append(f"일마 미매칭: {len(d_um)}건")
+
+    return "\n".join(lines)
+
+
+AI_SYSTEM_PROMPT = """당신은 병원 정산 전문 AI 분석관입니다. 한솔페이(PG사)·일일마감(프론트)·차트마감(EMR) 3개 자료의 대사(reconciliation) 결과를 분석합니다.
+
+당신의 목적: 3개 자료의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾아, 정산 담당자가 가장 먼저 확인해야 할 환자/거래를 우선순위별로 알려주는 것입니다.
+
+분석 원칙:
+- 차트마감(EMR)이 최종 기준 원장
+- 금액이 큰 불일치부터 우선순위 부여
+- 단순 매칭 실패와 실제 의심건을 구분
+- 같은 차트번호가 여러 곳에서 불일치하면 위험도 상승
+- 취소/환불 교차검증 필수"""
+
+AI_USER_PROMPT = """아래는 병원 정산 3-Way 대사 분석 결과입니다. 이 데이터를 분석하여 다음을 한국어로 답변해주세요:
+
+{data}
+
+---
+
+위 데이터를 분석하여 아래 형식으로 답변해주세요:
+
+### 📊 총합 차이 요약
+- 카드/현금/플랫폼별 차이 금액과 원인 추정
+
+### 🚨 최우선 확인 대상 (금액순)
+| 우선순위 | 차트번호 | 환자명 | 불일치금액 | 의심사유 | 조치방안 |
+|---------|---------|-------|----------|---------|---------|
+
+### ⚠️ 추가 확인 필요
+- 중간 위험도 건 요약
+
+### 💡 패턴 분석
+- 반복 미매칭, 시간대 집중, 카드 공유 등 패턴이 있으면 기술
+
+### ✅ 결론
+- 전체 요약 (1~2문장)
+- 총 불일치 금액과 확인 대상 건수"""
+
+
+def run_ai_analysis_claude(api_key, analysis_text):
+    """Claude API를 사용한 자동 분석"""
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=AI_SYSTEM_PROMPT,
+        messages=[
+            {"role": "user", "content": AI_USER_PROMPT.format(data=analysis_text)}
+        ],
+    )
+    return message.content[0].text
+
+
+def run_ai_analysis_gemini(api_key, analysis_text):
+    """Google Gemini API를 사용한 자동 분석"""
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=AI_SYSTEM_PROMPT,
+    )
+    response = model.generate_content(
+        AI_USER_PROMPT.format(data=analysis_text),
+        generation_config=genai.types.GenerationConfig(max_output_tokens=4096),
+    )
+    return response.text
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2929,7 +3103,7 @@ else:
     # ── 탭 ──
     t0, t1, t2, t2b, t3, t3b, t4, t5, t6 = st.tabs([
         "📋 일자별 합계매칭", "🚨 의심건", "💳 한솔↔일마", "🧩 한솔↔차트", "📊 일마↔차트",
-        "🔄 환불 상세", "🔍 종합분석", "📝 메신저 요약", "🤖 AI 통합 다운로드",
+        "🔄 환불 상세", "🔍 종합분석", "📝 메신저 요약", "🤖 AI 자동 분석",
     ])
 
     with t0:
@@ -3399,18 +3573,97 @@ else:
             st.warning("⚠️ 일일마감 데이터에서 신환/구환 구분 컬럼을 찾지 못했습니다. 신환/구환 수치는 수동으로 입력해주세요.")
 
     with t6:
-        st.subheader("🤖 AI 분석용 통합 파일 다운로드")
-        st.caption("한솔페이 + 일일마감 + 차트마감 + 분석결과를 하나의 엑셀 파일로 통합합니다.")
+        st.subheader("🤖 AI 자동 분석")
+        st.caption("AI가 의심거래를 자동으로 분석하여 가장 먼저 확인해야 할 환자/거래를 알려줍니다.")
 
-        st.markdown("""
+        # ── AI 자동 분석 섹션 ──
+        ai_tab1, ai_tab2 = st.tabs(["🧠 AI 자동 분석", "📥 수동 다운로드"])
+
+        with ai_tab1:
+            st.markdown("#### AI에게 자동으로 분석 요청하기")
+            st.info("API 키는 서버에 저장되지 않으며, 현재 세션에서만 사용됩니다.")
+
+            ai_col1, ai_col2 = st.columns([1, 2])
+            with ai_col1:
+                ai_provider = st.selectbox(
+                    "AI 서비스 선택",
+                    ["Claude (Anthropic)", "Gemini (Google)"],
+                    key="ai_provider",
+                )
+            with ai_col2:
+                if ai_provider == "Claude (Anthropic)":
+                    ai_api_key = st.text_input(
+                        "Anthropic API Key",
+                        type="password",
+                        key="claude_api_key",
+                        placeholder="sk-ant-...",
+                        help="https://console.anthropic.com 에서 발급받으세요.",
+                    )
+                else:
+                    ai_api_key = st.text_input(
+                        "Google AI API Key",
+                        type="password",
+                        key="gemini_api_key",
+                        placeholder="AIza...",
+                        help="https://aistudio.google.com/apikey 에서 발급받으세요.",
+                    )
+
+            if ai_api_key:
+                if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn"):
+                    with st.spinner("AI가 분석 중입니다... (약 15~30초 소요)"):
+                        try:
+                            analysis_text = _build_ai_analysis_text(
+                                hansol=hansol, daily=daily, patient=patient,
+                                match_df=match_df, h_um=h_um, d_um=d_um,
+                                tots=tots, pc=pc, missing_all=missing_all,
+                                comprehensive=comprehensive,
+                                unified_info=unified_info,
+                            )
+                            if ai_provider == "Claude (Anthropic)":
+                                result = run_ai_analysis_claude(ai_api_key, analysis_text)
+                            else:
+                                result = run_ai_analysis_gemini(ai_api_key, analysis_text)
+                            st.session_state["ai_result"] = result
+                            st.session_state["ai_provider_used"] = ai_provider
+                        except Exception as e:
+                            error_msg = str(e)
+                            if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
+                                st.error("API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
+                            elif "429" in error_msg or "rate" in error_msg.lower():
+                                st.error("API 요청 한도를 초과했습니다. 잠시 후 다시 시도해주세요.")
+                            else:
+                                st.error(f"AI 분석 중 오류가 발생했습니다: {error_msg}")
+            else:
+                st.warning("API 키를 입력하면 AI 분석을 시작할 수 있습니다.")
+
+            # 결과 표시
+            if "ai_result" in st.session_state:
+                st.markdown("---")
+                provider_name = st.session_state.get("ai_provider_used", "AI")
+                st.markdown(f"### 📋 {provider_name} 분석 결과")
+                st.markdown(st.session_state["ai_result"])
+
+                # 결과 복사용 텍스트
+                st.markdown("---")
+                st.download_button(
+                    label="📋 분석 결과 텍스트 다운로드",
+                    data=st.session_state["ai_result"].encode("utf-8"),
+                    file_name=f"AI분석결과_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+                    mime="text/markdown",
+                    key="ai_result_download",
+                )
+
+        with ai_tab2:
+            st.markdown("#### 수동 분석: 엑셀 파일 다운로드 후 AI에 직접 업로드")
+            st.markdown("""
 **사용법:** 다운로드한 엑셀 파일을 ChatGPT / Gemini / Claude 등에 업로드하고 아래 프롬프트를 사용하세요.
 
 ---
 
 **권장 프롬프트 (복사해서 사용):**
-        """)
+            """)
 
-        ai_prompt = """첨부된 엑셀은 병원 정산 3-Way 대사 결과입니다. 당신의 목적은 단 하나: 한솔페이(PG사)·일일마감(프론트)·차트마감(EMR) 3개 자료의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾는 것입니다.
+            ai_prompt = """첨부된 엑셀은 병원 정산 3-Way 대사 결과입니다. 당신의 목적은 단 하나: 한솔페이(PG사)·일일마감(프론트)·차트마감(EMR) 3개 자료의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾는 것입니다.
 
 [필수 사전 작업]
 1. '0_AI안내_데이터사전' 시트를 반드시 먼저 읽고 데이터 구조·연결키·분석 가이드를 숙지하세요.
@@ -3452,59 +3705,59 @@ Step 5. 결론 도출
 - 특정 시간대에 취소가 집중되는 패턴 확인
 - 동일 카드번호가 다른 환자에게 반복 사용되는 패턴 확인"""
 
-        st.code(ai_prompt, language=None)
+            st.code(ai_prompt, language=None)
 
-        st.markdown("""
+            st.markdown("""
 ---
 
 **누적 분석 팁:** 여러 날짜의 파일을 한꺼번에 AI에 올리면 반복 패턴(동일 차트번호 반복 미매칭, 특정 시간대 취소 집중 등)을 탐지할 수 있습니다.
-        """)
+            """)
 
-        h_ok = hansol[hansol["tx_status"] == "정상"]
-        _matched_h_set = set(match_df["한솔_hidx"].tolist()) if not match_df.empty and "한솔_hidx" in match_df.columns else set()
-        _matched_dc_set = st.session_state.get("matched_dc", set())
-        excel_data = build_ai_merged_excel(
-            hansol=hansol, daily=daily, patient=patient,
-            match_df=match_df, hc_compare=hc_compare,
-            missing_all=missing_all, missing_only=missing_only,
-            pc=pc, tots=tots,
-            h_um=h_um, d_um=d_um, matched_h=_matched_h_set, matched_dc=_matched_dc_set,
-            unified_info=unified_info, comprehensive=comprehensive,
-        )
-        today_str = datetime.now().strftime("%Y%m%d")
-        st.download_button(
-            label="📥 AI 통합 엑셀 다운로드",
-            data=excel_data,
-            file_name=f"정산대사_AI통합_{today_str}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            width='stretch',
-        )
+            h_ok = hansol[hansol["tx_status"] == "정상"]
+            _matched_h_set = set(match_df["한솔_hidx"].tolist()) if not match_df.empty and "한솔_hidx" in match_df.columns else set()
+            _matched_dc_set = st.session_state.get("matched_dc", set())
+            excel_data = build_ai_merged_excel(
+                hansol=hansol, daily=daily, patient=patient,
+                match_df=match_df, hc_compare=hc_compare,
+                missing_all=missing_all, missing_only=missing_only,
+                pc=pc, tots=tots,
+                h_um=h_um, d_um=d_um, matched_h=_matched_h_set, matched_dc=_matched_dc_set,
+                unified_info=unified_info, comprehensive=comprehensive,
+            )
+            today_str = datetime.now().strftime("%Y%m%d")
+            st.download_button(
+                label="📥 AI 통합 엑셀 다운로드",
+                data=excel_data,
+                file_name=f"정산대사_AI통합_{today_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="ai_excel_download",
+            )
 
-        # 파일 내용 미리보기
-        st.markdown("#### 📑 포함 시트 목록")
-        preview_data = {
-            "시트명": [
-                "0_AI안내_데이터사전", "1_한솔페이", "2_일일마감", "3_차트마감",
-                "4_매칭결과", "5_한솔미매칭", "6_일마미매칭",
-                "7_한솔vs차트_누락추정", "8_일마vs차트_수단별비교",
-                "9_종합미매칭분석", "10_합계비교",
-                "11_크로스레퍼런스", "12_무결성검증",
-            ],
-            "설명": [
-                "AI가 데이터를 이해하기 위한 안내·용어·분석 가이드",
-                f"PG사 거래 원본 ({len(hansol)}건)",
-                f"프론트 일일마감 ({len(daily)}건)",
-                f"EMR 차트마감 ({len(patient)}건)",
-                f"한솔↔일마 자동매칭 ({len(match_df)}건) – P1~P9 포함",
-                f"한솔 미매칭 ({len(h_um)}건)",
-                f"일마 미매칭 ({len(d_um)}건)",
-                f"한솔↔차트 누락추정 ({len(missing_all)}건)",
-                f"일마↔차트 수단별 비교 ({len(pc)}건)",
-                f"★ 한솔-일마-차트 종합 미매칭 분석 ({len(comprehensive)}건)" if not comprehensive.empty else "종합 미매칭 분석 (0건)",
-                "3개 소스 합계 교차비교",
-                "★ 차트번호별 모든 연결정보 통합 뷰",
-                "데이터 연결 정확도 자동 검증",
-            ],
-        }
-        st.dataframe(pd.DataFrame(preview_data), width='stretch', hide_index=True)
+            # 파일 내용 미리보기
+            st.markdown("#### 📑 포함 시트 목록")
+            preview_data = {
+                "시트명": [
+                    "0_AI안내_데이터사전", "1_한솔페이", "2_일일마감", "3_차트마감",
+                    "4_매칭결과", "5_한솔미매칭", "6_일마미매칭",
+                    "7_한솔vs차트_누락추정", "8_일마vs차트_수단별비교",
+                    "9_종합미매칭분석", "10_합계비교",
+                    "11_크로스레퍼런스", "12_무결성검증",
+                ],
+                "설명": [
+                    "AI가 데이터를 이해하기 위한 안내·용어·분석 가이드",
+                    f"PG사 거래 원본 ({len(hansol)}건)",
+                    f"프론트 일일마감 ({len(daily)}건)",
+                    f"EMR 차트마감 ({len(patient)}건)",
+                    f"한솔↔일마 자동매칭 ({len(match_df)}건) – P1~P9 포함",
+                    f"한솔 미매칭 ({len(h_um)}건)",
+                    f"일마 미매칭 ({len(d_um)}건)",
+                    f"한솔↔차트 누락추정 ({len(missing_all)}건)",
+                    f"일마↔차트 수단별 비교 ({len(pc)}건)",
+                    f"★ 한솔-일마-차트 종합 미매칭 분석 ({len(comprehensive)}건)" if not comprehensive.empty else "종합 미매칭 분석 (0건)",
+                    "3개 소스 합계 교차비교",
+                    "★ 차트번호별 모든 연결정보 통합 뷰",
+                    "데이터 연결 정확도 자동 검증",
+                ],
+            }
+            st.dataframe(pd.DataFrame(preview_data), width='stretch', hide_index=True)
