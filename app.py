@@ -2748,9 +2748,24 @@ if "done" not in st.session_state:
     if f_h and f_d and f_p:
         if st.button("🚀 정산 분석 시작", type="primary", width='stretch'):
             with st.spinner("매칭 엔진 실행 중..."):
-                hansol = parse_hansol(load_file(f_h, password=h_pw))
-                daily, daily_refund = parse_daily(load_file(f_d, password=d_pw))
-                patient = parse_patient(load_file(f_p, password=p_pw))
+                try:
+                    hansol_raw = load_file(f_h, password=h_pw)
+                except Exception as e:
+                    st.error(f"한솔페이 파일 로딩 실패: {e}")
+                    st.stop()
+                try:
+                    daily_raw = load_file(f_d, password=d_pw)
+                except Exception as e:
+                    st.error(f"일일마감 파일 로딩 실패: {e}")
+                    st.stop()
+                try:
+                    patient_raw = load_file(f_p, password=p_pw)
+                except Exception as e:
+                    st.error(f"차트마감 파일 로딩 실패: {e}")
+                    st.stop()
+                hansol = parse_hansol(hansol_raw)
+                daily, daily_refund = parse_daily(daily_raw)
+                patient = parse_patient(patient_raw)
                 if daily.empty:
                     st.error("일일마감 파일 파싱 실패")
                     st.stop()
