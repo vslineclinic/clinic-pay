@@ -339,6 +339,9 @@ def parse_hansol(raw):
         # 취소거절: 취소 시도가 거절된 건 → 매출도 환불도 아님, 총합계 제외
         df.loc[s.str.contains("취소거절", na=False), "tx_status"] = "취소거절"
         df.loc[s.str.contains("취소.?거절|거절.?취소", na=False, regex=True), "tx_status"] = "취소거절"
+        # 조회 건은 실제 결제/취소가 아닌 단순 조회이므로 제외
+        # (포인트조회, 잔액조회, 원거래조회, 취소조회 등)
+        df.loc[s.str.contains("조회", na=False), "tx_status"] = "조회"
 
     typcol = next((c for c in ["구분"] if c in df.columns), None)
     df["is_현금"] = False
@@ -3061,11 +3064,15 @@ else:
         rej = hansol[hansol["tx_status"] == "승인거절"]
         can = hansol[hansol["tx_status"] == "취소"]
         cancel_rej = hansol[hansol["tx_status"] == "취소거절"]
-        if len(rej) + len(can) + len(cancel_rej) > 0:
+        inq = hansol[hansol["tx_status"] == "조회"]
+        if len(rej) + len(can) + len(cancel_rej) + len(inq) > 0:
             cancel_amt = int(can["금액"].sum()) if len(can) > 0 else 0
             msg = f"📌 승인거절 {len(rej)}건 / 취소 {len(can)}건"
             if len(cancel_rej) > 0:
                 msg += f" / 취소거절 {len(cancel_rej)}건 (합계 제외)"
+            if len(inq) > 0:
+                inq_amt = int(inq["금액"].sum())
+                msg += f" / 조회 {len(inq)}건 {inq_amt:,}원 (합계 제외)"
             if cancel_amt > 0:
                 msg += f" (취소금액 {cancel_amt:,}원 → 순매출에서 차감됨)"
             st.info(msg)
