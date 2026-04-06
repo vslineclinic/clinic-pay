@@ -835,7 +835,7 @@ def run_matching(hansol, daily, patient):
         for card_co in card_cos:
             if not card_co:
                 continue
-            hc_match = hc[hc["카드사"].str.contains(card_co, na=False, case=False)]
+            hc_match = hc[hc["카드사"].str.contains(card_co, na=False, case=False, regex=False)]
             if len(hc_match) == 1:
                 add("P2b_카드사+금액", "🟢HIGH", [hc_match.iloc[0]["h_idx"]], dr)
                 break
@@ -926,7 +926,7 @@ def run_matching(hansol, daily, patient):
                 for card_co in card_cos:
                     if not card_co:
                         continue
-                    hc_co = hc[hc["카드사"].str.contains(card_co, na=False, case=False)]
+                    hc_co = hc[hc["카드사"].str.contains(card_co, na=False, case=False, regex=False)]
                     if not hc_co.empty:
                         hc_filtered = hc_co
                         break
