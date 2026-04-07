@@ -2586,8 +2586,13 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             "거래상태": f"매칭완료 {h_matched_count}건 (이 시트에서 생략)",
             "카드사": "", "승인번호": "", "카드번호": "", "현금여부": ""
         }])
-        summary_row = summary_row[[c for c in h_unmatched.columns if c in summary_row.columns]]
-        h_final = pd.concat([summary_row, h_unmatched], ignore_index=True)
+        _common_cols = [c for c in h_unmatched.columns if c in summary_row.columns]
+        if _common_cols and not h_unmatched.empty:
+            h_final = pd.concat([summary_row[_common_cols], h_unmatched], ignore_index=True)
+        elif not h_unmatched.empty:
+            h_final = h_unmatched
+        else:
+            h_final = h_export  # 미매칭 없으면 원본 그대로
         h_final.to_excel(writer, sheet_name="1_한솔페이", index=False)
 
         # ── Sheet 3: 일일마감 (불일치 건만) ──
@@ -2610,8 +2615,13 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                 "순번": "요약", "차트번호": "", "성명": f"매칭완료 {d_matched_count}건 (생략)",
                 "카드": int(d_export[~d_export["차트번호"].isin(_d_problem_charts)]["카드"].sum()) if "카드" in d_export.columns else 0
             }])
-            summary_row_d = summary_row_d[[c for c in d_filtered.columns if c in summary_row_d.columns]]
-            d_final = pd.concat([summary_row_d, d_filtered], ignore_index=True)
+            _common_cols_d = [c for c in d_filtered.columns if c in summary_row_d.columns]
+            if _common_cols_d and not d_filtered.empty:
+                d_final = pd.concat([summary_row_d[_common_cols_d], d_filtered], ignore_index=True)
+            elif not d_filtered.empty:
+                d_final = d_filtered
+            else:
+                d_final = d_export
         else:
             d_final = d_export
         d_final.to_excel(writer, sheet_name="2_일일마감", index=False)
@@ -2627,7 +2637,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         # 불일치 차트번호만 포함 (크로스레퍼런스의 불일치 + 미매칭)
         _all_problem_charts = _d_problem_charts.copy()
         if not missing_all.empty and "차트번호" in missing_all.columns:
-            _miss_charts = missing_all[missing_all.get("매칭상태", pd.Series(dtype=str)).isin(["미반영", "부족", "초과"])] if "매칭상태" in missing_all.columns else missing_all
+            _miss_charts = missing_all[missing_all["매칭상태"].isin(["미반영", "부족", "초과"])] if "매칭상태" in missing_all.columns else missing_all
             _all_problem_charts |= set(_miss_charts["차트번호"].tolist())
         if _all_problem_charts and "차트번호" in p_export.columns:
             p_filtered = p_export[p_export["차트번호"].isin(_all_problem_charts)]
@@ -2636,8 +2646,13 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
                 "순번": "요약", "차트번호": "", "이름": f"일치 {p_matched_count}건 (생략)",
                 "금액": int(p_export[~p_export["차트번호"].isin(_all_problem_charts)]["금액"].sum()) if "금액" in p_export.columns else 0
             }])
-            summary_row_p = summary_row_p[[c for c in p_filtered.columns if c in summary_row_p.columns]]
-            p_final = pd.concat([summary_row_p, p_filtered], ignore_index=True)
+            _common_cols_p = [c for c in p_filtered.columns if c in summary_row_p.columns]
+            if _common_cols_p and not p_filtered.empty:
+                p_final = pd.concat([summary_row_p[_common_cols_p], p_filtered], ignore_index=True)
+            elif not p_filtered.empty:
+                p_final = p_filtered
+            else:
+                p_final = p_export
         else:
             p_final = p_export
         p_final.to_excel(writer, sheet_name="3_차트마감", index=False)
@@ -3652,11 +3667,19 @@ else:
             if not _t3_mismatch.empty:
                 st.markdown("##### 👇 결제수단이 다른 환자 (프론트 입력 vs 차트 기록)")
                 _t3_items = []
+                def _safe_int(v, default=0):
+                    if pd.isna(v) or v is None or v == "":
+                        return default
+                    try:
+                        return int(float(v))
+                    except (ValueError, TypeError):
+                        return default
+
                 for _, _r in _t3_mismatch.iterrows():
-                    _ilma_card = int(_r.get("[일마]카드", 0) or 0)
-                    _chart_card = int(_r.get("[차트]카드", 0) or 0)
-                    _ilma_cash = int(_r.get("[일마]현금+이체", 0) or 0)
-                    _chart_cash = int(_r.get("[차트]현금+이체", 0) or 0)
+                    _ilma_card = _safe_int(_r.get("[일마]카드"))
+                    _chart_card = _safe_int(_r.get("[차트]카드"))
+                    _ilma_cash = _safe_int(_r.get("[일마]현금+이체"))
+                    _chart_cash = _safe_int(_r.get("[차트]현금+이체"))
                     _t3_items.append({
                         "차트번호": _r.get("차트번호", ""),
                         "환자명": _r.get("성명", ""),
