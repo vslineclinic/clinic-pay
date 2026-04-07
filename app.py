@@ -2713,7 +2713,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 
 def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
-                            unified_info=None):
+                            unified_info=None, cross_ref=None):
     """핵심 분석 데이터를 AI에 전송할 텍스트로 변환 (토큰 절약을 위해 핵심만 추출)"""
     lines = []
 
@@ -2792,8 +2792,10 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                 lines.append(",".join(str(row.get(c, "")) for c in cols))
 
     # 7. 크로스레퍼런스 - 문제건만
-    if unified_info is not None and not unified_info.empty:
-        problem = unified_info[unified_info.get("상태", pd.Series(dtype=str)).str.contains("❌|⚠️", na=False)] if "상태" in unified_info.columns else pd.DataFrame()
+    if cross_ref is None and unified_info is not None:
+        cross_ref = _build_cross_reference_sheet(match_df, patient, hansol, unified_info=unified_info)
+    if cross_ref is not None and not cross_ref.empty:
+        problem = cross_ref[cross_ref.get("상태", pd.Series(dtype=str)).str.contains("❌|⚠️", na=False)] if "상태" in cross_ref.columns else pd.DataFrame()
         if not problem.empty:
             lines.append(f"\n=== [크로스레퍼런스 - 문제건] ({len(problem)}건) ===")
             cols = [c for c in problem.columns if c not in ["p_idx"]][:12]
