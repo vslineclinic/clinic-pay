@@ -2714,11 +2714,13 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
                             unified_info=None, cross_ref=None):
-    """핵심 분석 데이터를 AI에 전송할 텍스트로 변환 (토큰 최소화: 핵심 불일치만 압축 전송)"""
+    """핵심 분석 데이터를 AI에 전송할 텍스트로 변환.
+    핵심 목표: 한솔페이(PG)↔차트마감(EMR) 차이가 '어디서' 발생하는지 추적.
+    토큰 최소화: 불일치 건만 전송, 일치 건은 통계만."""
     lines = []
 
-    # ── 1. 합계비교 (필수, 소형) ──
-    lines.append("[합계]")
+    # ── 1. 합계비교 (3개 소스 총합 + 차이) ──
+    lines.append("[합계비교]")
     h_total_base = tots["h_card"] + tots["h_cash"]
     d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
     p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
@@ -2727,63 +2729,79 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
     h_plat = tots["d_plat"] if plat_confirmed else 0
     h_total = h_total_base + h_plat
 
-    lines.append("구분,한솔,일마,차트,한솔vs차트,일마vs차트")
-    rows = [
+    lines.append("구분,한솔,일마,차트,한솔-차트,일마-차트")
+    rows_data = [
         ("카드", tots["h_card"], tots["d_card"], tots["p_card"]),
         ("현금+이체", tots["h_cash"], d_cash_xfer, p_cash_xfer),
         ("플랫폼", h_plat, tots["d_plat"], tots["p_plat"]),
     ]
     if p_etc > 0:
-        rows.append(("기타", 0, 0, p_etc))
-    rows.append(("합계", h_total, tots["d_tot"], tots["p_tot"]))
-    for label, h, d, p in rows:
-        hc_diff = h - p
-        dc_diff = d - p
-        # 차이가 없는 행은 차이 컬럼에 0 표시
-        lines.append(f"{label},{h},{d},{p},{hc_diff},{dc_diff}")
+        rows_data.append(("기타", 0, 0, p_etc))
+    rows_data.append(("합계", h_total, tots["d_tot"], tots["p_tot"]))
+    for label, h, d, p in rows_data:
+        lines.append(f"{label},{h},{d},{p},{h - p},{d - p}")
 
-    # ── 2. 한솔↔차트 누락추정 (★최우선: 차이의 직접 원인) ──
-    if missing_all is not None and not missing_all.empty:
-        miss_only = missing_all[missing_all.get("매칭상태", pd.Series(dtype=str)).isin(["❌미반영", "⚠️부족"])] if "매칭상태" in missing_all.columns else missing_all
-        if not miss_only.empty:
-            lines.append(f"\n[한솔vs차트 누락★] {len(miss_only)}건")
-            cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
-                                "한솔매칭금액", "차이(차트-한솔)"] if c in miss_only.columns]
-            miss_sorted = miss_only.copy()
-            if "차이(차트-한솔)" in miss_sorted.columns:
-                miss_sorted["_abs_diff"] = pd.to_numeric(miss_sorted["차이(차트-한솔)"], errors="coerce").fillna(0).abs()
-                miss_sorted = miss_sorted.sort_values("_abs_diff", ascending=False)
-            lines.append(",".join(cols))
-            _limit = 15
-            for _, row in miss_sorted.head(_limit).iterrows():
-                lines.append(",".join(str(row.get(c, "")) for c in cols))
-            if len(miss_only) > _limit:
-                lines.append(f"...외 {len(miss_only) - _limit}건")
+    # ── 2. 차트번호별 크로스레퍼런스 (★핵심: 차이 나는 환자만) ──
+    # 한솔↔일마↔차트를 차트번호 기준으로 통합 → 불일치 건만 추출
+    if unified_info:
+        cross_rows = []
+        for ch, ui in unified_info.items():
+            if not ch:
+                continue
+            # 차트 금액
+            p_rows = patient[patient["차트번호"] == ch]
+            p_card = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum()) if not p_rows.empty else 0
+            p_cash_xfer_ch = int(p_rows[p_rows["분류"].isin(["현금", "이체"])]["금액"].sum()) if not p_rows.empty else 0
+            p_plat_ch = int(p_rows[p_rows["분류"] == "플랫폼"]["금액"].sum()) if not p_rows.empty else 0
+            p_total_ch = int(p_rows["금액"].sum()) if not p_rows.empty else 0
 
-    # ── 3. 일마↔차트 수단별 불일치 (불일치만) ──
-    if pc is not None and not pc.empty:
-        mm = pc[pc["불일치상세"] != "✅일치"] if "불일치상세" in pc.columns else pc
-        if not mm.empty:
-            lines.append(f"\n[일마vs차트 불일치] {len(mm)}건")
-            cols = [c for c in ["차트번호", "성명", "불일치상세",
-                                "[일마]카드", "[차트]카드",
-                                "[일마]현금+이체", "[차트]현금+이체",
-                                "[일마]플랫폼", "[차트]플랫폼"] if c in mm.columns]
-            lines.append(",".join(cols))
-            _limit = 15
-            for _, row in mm.head(_limit).iterrows():
-                lines.append(",".join(str(row.get(c, "")) for c in cols))
-            if len(mm) > _limit:
-                lines.append(f"...외 {len(mm) - _limit}건")
+            # 일마 금액
+            d_card_ch = ui.get("daily_card_amt", 0)
+            d_cash_xfer_ch = ui.get("daily_cash_amt", 0) + ui.get("daily_xfer_amt", 0)
 
-    # ── 4. 한솔 미매칭 (금액순, 핵심 컬럼만) ──
+            # 한솔 매칭 금액 (이 차트번호에 매칭된 한솔 건)
+            m_rows = match_df[match_df["일마_차트"].apply(clean_no) == ch] if not match_df.empty and "일마_차트" in match_df.columns else pd.DataFrame()
+            h_matched_card = int(m_rows[m_rows["한솔_유형"] != "현금영수증"]["한솔_금액"].sum()) if not m_rows.empty and "한솔_유형" in m_rows.columns else (int(m_rows["한솔_금액"].sum()) if not m_rows.empty else 0)
+
+            # 차이 계산
+            diff_h_chart = h_matched_card - p_card  # 한솔매칭 vs 차트카드
+            diff_d_chart_card = d_card_ch - p_card  # 일마카드 vs 차트카드
+            diff_d_chart_cash = d_cash_xfer_ch - p_cash_xfer_ch  # 일마현금이체 vs 차트현금이체
+
+            # 불일치 건만 수집 (차이가 있는 건)
+            if diff_h_chart != 0 or diff_d_chart_card != 0 or diff_d_chart_cash != 0:
+                name = ui.get("best_name", "")
+                if not name and not p_rows.empty:
+                    name = str(p_rows["이름"].iloc[0])
+                cross_rows.append({
+                    "ch": ch, "name": name,
+                    "h_card": h_matched_card, "d_card": d_card_ch, "p_card": p_card,
+                    "d_cx": d_cash_xfer_ch, "p_cx": p_cash_xfer_ch,
+                    "h_p": diff_h_chart, "d_p_card": diff_d_chart_card, "d_p_cx": diff_d_chart_cash,
+                })
+
+        if cross_rows:
+            # 금액 차이 큰 순 정렬
+            cross_rows.sort(key=lambda x: abs(x["h_p"]) + abs(x["d_p_card"]), reverse=True)
+            lines.append(f"\n[차트번호별 불일치★] {len(cross_rows)}건 (차이 있는 환자만)")
+            lines.append("차트번호,이름,한솔매칭카드,일마카드,차트카드,일마현금이체,차트현금이체,한솔-차트,일마카드-차트,일마현금-차트")
+            _limit = 20
+            for r in cross_rows[:_limit]:
+                lines.append(f"{r['ch']},{r['name']},{r['h_card']},{r['d_card']},{r['p_card']},{r['d_cx']},{r['p_cx']},{r['h_p']},{r['d_p_card']},{r['d_p_cx']}")
+            if len(cross_rows) > _limit:
+                lines.append(f"...외 {len(cross_rows) - _limit}건")
+            # 불일치 합계
+            sum_hp = sum(r["h_p"] for r in cross_rows)
+            sum_dp = sum(r["d_p_card"] for r in cross_rows)
+            lines.append(f"불일치합계: 한솔-차트={sum_hp}, 일마카드-차트={sum_dp}")
+
+    # ── 3. 한솔 미매칭 (일마에 매칭 안 된 한솔 거래 → 차이의 직접 원인) ──
     if not h_um.empty:
-        lines.append(f"\n[한솔 미매칭] {len(h_um)}건")
-        cols = [c for c in ["금액", "카드번호", "승인번호", "is_현금"] if c in h_um.columns]
+        lines.append(f"\n[한솔 미매칭] {len(h_um)}건 (합계:{int(h_um['금액'].sum()):,}원)")
+        cols = [c for c in ["금액", "승인번호", "카드번호", "is_현금"] if c in h_um.columns]
         h_um_sorted = h_um.copy()
         if "금액" in h_um_sorted.columns:
-            h_um_sorted["_abs_amt"] = h_um_sorted["금액"].abs()
-            h_um_sorted = h_um_sorted.sort_values("_abs_amt", ascending=False)
+            h_um_sorted = h_um_sorted.sort_values("금액", key=abs, ascending=False)
         lines.append(",".join(cols))
         _limit = 10
         for _, row in h_um_sorted.head(_limit).iterrows():
@@ -2791,9 +2809,10 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
         if len(h_um) > _limit:
             lines.append(f"...외 {len(h_um) - _limit}건")
 
-    # ── 5. 일마 미매칭 (금액순, 핵심만) ──
+    # ── 4. 일마 미매칭 (한솔에 없는 일마 카드건) ──
     if not d_um.empty:
-        lines.append(f"\n[일마 미매칭] {len(d_um)}건")
+        d_um_total = int(pd.to_numeric(d_um["카드"], errors="coerce").fillna(0).sum()) if "카드" in d_um.columns else 0
+        lines.append(f"\n[일마 미매칭] {len(d_um)}건 (카드합계:{d_um_total:,}원)")
         cols = [c for c in ["성명", "차트번호", "카드"] if c in d_um.columns]
         d_um_sorted = d_um.copy()
         if "카드" in d_um_sorted.columns:
@@ -2806,31 +2825,52 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
         if len(d_um) > _limit:
             lines.append(f"...외 {len(d_um) - _limit}건")
 
-    # ── 6. 기본 통계 (소형) ──
+    # ── 5. 일마↔차트 수단별 불일치 (결제수단 오분류 추적) ──
+    if pc is not None and not pc.empty:
+        mm = pc[pc["불일치상세"] != "✅일치"] if "불일치상세" in pc.columns else pc
+        if not mm.empty:
+            lines.append(f"\n[일마vs차트 수단불일치] {len(mm)}건")
+            cols = [c for c in ["차트번호", "성명", "불일치상세",
+                                "[일마]카드", "[차트]카드",
+                                "[일마]현금+이체", "[차트]현금+이체"] if c in mm.columns]
+            lines.append(",".join(cols))
+            _limit = 12
+            for _, row in mm.head(_limit).iterrows():
+                lines.append(",".join(str(row.get(c, "")) for c in cols))
+            if len(mm) > _limit:
+                lines.append(f"...외 {len(mm) - _limit}건")
+
+    # ── 6. 통계 요약 ──
     lines.append(f"\n[통계] 한솔{len(hansol)}건,일마{len(daily)}건,차트{len(patient)}건,매칭{len(match_df)}건,한솔미매칭{len(h_um)}건,일마미매칭{len(d_um)}건")
 
     return "\n".join(lines)
 
 
-AI_SYSTEM_PROMPT = """병원 정산 AI 분석관. 한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 대사 결과 분석.
-원칙: 차트마감=기준원장, 금액 큰 순 우선, 매칭실패vs실제불일치 구분, 간결·실무조치 중심 답변."""
+AI_SYSTEM_PROMPT = """병원 정산 전문 분석관. 한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 대사 결과에서 금액 차이의 원인을 추적.
+원칙: 차트마감=기준원장. 차이가 나는 환자를 특정하고, 왜 차이가 나는지(미매칭/수단오분류/금액불일치) 구분. 간결·실무 중심."""
 
-AI_USER_PROMPT = """병원 정산 3-Way 대사 결과. 핵심: 한솔vs차트 차이 원인과 확인 우선순위를 알려줘.
-플랫폼(강남언니 등)은 한솔에 없으므로 일마vs차트 기준.
+AI_USER_PROMPT = """아래는 병원 3-Way 대사 결과입니다.
+
+★핵심 질문: 한솔페이(PG)와 차트마감(EMR) 사이에 차이가 어디서, 왜 발생하는가?
+- [합계비교]에서 카드/현금별 차이 금액을 먼저 확인
+- [차트번호별 불일치]에서 어떤 환자에서 차이가 나는지 특정
+- [미매칭]에서 매칭 안 된 거래가 차이의 원인인지 확인
+- 플랫폼(강남언니 등)은 한솔에 없으므로 일마↔차트 기준으로 비교
 
 {data}
 
 ---
-간결하게 답변:
+아래 형식으로 간결하게 답변해주세요:
 
-### 1. 총합 차이 요약
-카드/현금+이체/플랫폼별 차이 금액과 원인
+### 1. 총합 차이 원인
+카드/현금+이체/플랫폼별 차이 금액과 그 차이를 만드는 구체적 원인
 
-### 2. 확인 순서 (금액 큰 순)
-| 순위 | 차트번호 | 환자명 | 불일치금액 | 원인추정 | 조치방안 |
-|-----|---------|-------|----------|---------|---------|
+### 2. 차이 발생 환자 (금액 큰 순)
+| 순위 | 차트번호 | 환자명 | 차이금액 | 차이원인 | 조치방안 |
+|-----|---------|-------|---------|---------|---------|
 
-### 3. 추가 확인 (있으면만)
+### 3. 차이금액 검증
+위 환자들의 차이금액 합 = 총합 차이와 일치하는지 확인. 불일치 시 누락 건 지적.
 
 ### 4. 결론 (1~2문장)"""
 
@@ -2859,12 +2899,15 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     import google.generativeai as genai
     genai.configure(api_key=api_key)
 
-    # 토큰 절약: system_instruction을 prompt에 통합하여 1회 호출로 완료
-    prompt = AI_SYSTEM_PROMPT.strip() + "\n\n" + AI_USER_PROMPT.format(data=analysis_text)
+    prompt = AI_USER_PROMPT.format(data=analysis_text)
     if user_question:
         prompt += f"\n\n추가 질문: {user_question}"
 
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+    # system_instruction을 별도 파라미터로 전달 → 토큰 효율 향상
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=AI_SYSTEM_PROMPT,
+    )
 
     # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 3회 재시도 + 지수 백오프
     max_retries = 3
@@ -2873,7 +2916,7 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=3000,  # 출력 토큰 절약
+                    max_output_tokens=3000,
                 ),
             )
             return response.text
@@ -3696,12 +3739,11 @@ else:
         with ai_tab1:
             st.markdown("#### AI에게 자동으로 분석 요청하기")
             st.markdown("""
-> **팝업으로 분석**: 아래 버튼을 클릭하면 AI 분석 팝업이 열립니다.
-> 팝업에서 분석을 시작한 후, 팝업을 닫고 다른 탭의 분석 정보를 확인할 수 있습니다.
-> 분석 결과는 자동으로 저장되며 아래에 표시됩니다.
+> 버튼을 클릭하면 AI 분석 팝업이 열립니다. API 키 입력 후 바로 분석을 시작할 수 있습니다.
+> 분석 결과는 자동으로 저장되며, 팝업을 닫고 다른 탭을 자유롭게 탐색할 수 있습니다.
             """)
 
-            if st.button("🚀 AI 분석 팝업 열기", type="primary", key="ai_open_dialog_btn"):
+            if st.button("🚀 AI 분석 시작", type="primary", key="ai_open_dialog_btn"):
                 _ai_analysis_dialog()
 
             # 이전 분석 결과 표시 (팝업을 닫은 후에도 유지)
