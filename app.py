@@ -2714,7 +2714,7 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
                             unified_info=None, cross_ref=None):
-    """핵심 분석 데이터를 AI에 전송할 텍스트로 변환 (토큰 절약을 위해 핵심만 추출)"""
+    """핵심 분석 데이터를 AI에 전송할 텍스트로 변환 (무료 API 토큰 한도 대응: 핵심만 압축)"""
     lines = []
 
     # 1. 합계비교 (필수)
@@ -2739,15 +2739,19 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
     for label, h, d, p in rows:
         lines.append(f"{label},{h},{d},{p},{h - p},{d - p}")
 
-    # 2. 한솔 미매칭 (최우선 점검)
+    # 2. 한솔 미매칭 (최우선 점검 - 금액순 정렬)
     lines.append(f"\n=== [한솔 미매칭] ({len(h_um)}건) ===")
     if not h_um.empty:
         cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "is_현금", "카드사"] if c in h_um.columns]
+        h_um_sorted = h_um.copy()
+        if "금액" in h_um_sorted.columns:
+            h_um_sorted["_abs_amt"] = h_um_sorted["금액"].abs()
+            h_um_sorted = h_um_sorted.sort_values("_abs_amt", ascending=False)
         lines.append(",".join(cols))
-        for _, row in h_um.head(50).iterrows():
+        for _, row in h_um_sorted.head(30).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
-        if len(h_um) > 50:
-            lines.append(f"... 외 {len(h_um) - 50}건 생략")
+        if len(h_um) > 30:
+            lines.append(f"... 외 {len(h_um) - 30}건 생략 (금액 큰 순 30건만 표시)")
 
     # 3. 일마 미매칭
     lines.append(f"\n=== [일마 미매칭] ({len(d_um)}건) ===")
@@ -2755,41 +2759,58 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
         cols = ["내원순서", "성명", "차트번호", "카드"]
         available = [c for c in cols if c in d_um.columns]
         lines.append(",".join(available))
-        for _, row in d_um.head(50).iterrows():
+        d_um_sorted = d_um.copy()
+        if "카드" in d_um_sorted.columns:
+            d_um_sorted["_abs_amt"] = pd.to_numeric(d_um_sorted["카드"], errors="coerce").fillna(0).abs()
+            d_um_sorted = d_um_sorted.sort_values("_abs_amt", ascending=False)
+        for _, row in d_um_sorted.head(30).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in available))
+        if len(d_um) > 30:
+            lines.append(f"... 외 {len(d_um) - 30}건 생략")
 
-    # 4. 종합 미매칭 분석 (핵심)
+    # 4. 종합 미매칭 분석 (핵심 - 금액순 압축)
     lines.append(f"\n=== [종합 미매칭 분석] ({len(comprehensive) if comprehensive is not None and not comprehensive.empty else 0}건) ===")
     if comprehensive is not None and not comprehensive.empty:
         lines.append(",".join(comprehensive.columns.tolist()))
-        for _, row in comprehensive.head(80).iterrows():
+        for _, row in comprehensive.head(40).iterrows():
             lines.append(",".join(str(v) for v in row.values))
-        if len(comprehensive) > 80:
-            lines.append(f"... 외 {len(comprehensive) - 80}건 생략")
+        if len(comprehensive) > 40:
+            lines.append(f"... 외 {len(comprehensive) - 40}건 생략")
 
-    # 5. 일마↔차트 수단별 불일치 (불일치만)
+    # 5. 일마↔차트 수단별 불일치 (불일치만 - 플랫폼 포함, 금액순)
     if pc is not None and not pc.empty:
         mm = pc[pc["불일치상세"] != "✅일치"] if "불일치상세" in pc.columns else pc
         lines.append(f"\n=== [일마↔차트 수단별 불일치] ({len(mm)}건) ===")
+        lines.append("※ 플랫폼 결제는 한솔페이에 없으므로 일마vs차트 기준으로 확인")
         if not mm.empty:
             cols = [c for c in ["차트번호", "성명", "불일치상세",
                                 "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
                                 "[일마]현금+이체", "[차트]현금+이체",
                                 "[일마]플랫폼", "[차트]플랫폼"] if c in mm.columns]
             lines.append(",".join(cols))
-            for _, row in mm.head(50).iterrows():
+            for _, row in mm.head(30).iterrows():
                 lines.append(",".join(str(row.get(c, "")) for c in cols))
+            if len(mm) > 30:
+                lines.append(f"... 외 {len(mm) - 30}건 생략")
 
-    # 6. 한솔↔차트 누락추정
+    # 6. 한솔↔차트 누락추정 (★핵심: 한솔페이 vs 차트 차이의 원인)
     if missing_all is not None and not missing_all.empty:
         miss_only = missing_all[missing_all.get("매칭상태", pd.Series(dtype=str)).isin(["❌미반영", "⚠️부족"])] if "매칭상태" in missing_all.columns else missing_all
-        lines.append(f"\n=== [한솔↔차트 누락추정] ({len(miss_only)}건) ===")
+        lines.append(f"\n=== [한솔↔차트 누락추정 ★핵심] ({len(miss_only)}건) ===")
+        lines.append("※ 이 데이터가 '한솔페이 vs 차트' 차이의 직접 원인. 금액 큰 순으로 확인하면 정산 빠르게 마무리 가능")
         if not miss_only.empty:
             cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
                                 "한솔매칭금액", "차이(차트-한솔)"] if c in miss_only.columns]
+            # 차이 금액 큰 순으로 정렬
+            miss_sorted = miss_only.copy()
+            if "차이(차트-한솔)" in miss_sorted.columns:
+                miss_sorted["_abs_diff"] = pd.to_numeric(miss_sorted["차이(차트-한솔)"], errors="coerce").fillna(0).abs()
+                miss_sorted = miss_sorted.sort_values("_abs_diff", ascending=False)
             lines.append(",".join(cols))
-            for _, row in miss_only.head(50).iterrows():
+            for _, row in miss_sorted.head(30).iterrows():
                 lines.append(",".join(str(row.get(c, "")) for c in cols))
+            if len(miss_only) > 30:
+                lines.append(f"... 외 {len(miss_only) - 30}건 생략")
 
     # 7. 크로스레퍼런스 - 문제건만
     if cross_ref is None and unified_info is not None:
@@ -2798,10 +2819,12 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
         problem = cross_ref[cross_ref.get("상태", pd.Series(dtype=str)).str.contains("❌|⚠️", na=False)] if "상태" in cross_ref.columns else pd.DataFrame()
         if not problem.empty:
             lines.append(f"\n=== [크로스레퍼런스 - 문제건] ({len(problem)}건) ===")
-            cols = [c for c in problem.columns if c not in ["p_idx"]][:12]
+            cols = [c for c in problem.columns if c not in ["p_idx"]][:10]
             lines.append(",".join(cols))
-            for _, row in problem.head(50).iterrows():
+            for _, row in problem.head(25).iterrows():
                 lines.append(",".join(str(row.get(c, "")) for c in cols))
+            if len(problem) > 25:
+                lines.append(f"... 외 {len(problem) - 25}건 생략")
 
     # 8. 기본 통계
     lines.append(f"\n=== [기본 통계] ===")
@@ -2817,39 +2840,40 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
 
 AI_SYSTEM_PROMPT = """당신은 병원 정산 전문 AI 분석관입니다. 한솔페이(PG사)·일일마감(프론트)·차트마감(EMR) 3개 자료의 대사(reconciliation) 결과를 분석합니다.
 
-당신의 목적: 3개 자료의 총합이 맞지 않게 하는 거래건을 빠르고 정확하게 찾아, 정산 담당자가 가장 먼저 확인해야 할 환자/거래를 우선순위별로 알려주는 것입니다.
+핵심 목적: "한솔페이 vs 차트마감" 사이에 차이가 나는 거래건을 찾고, 어떤 환자부터 검토하면 정산을 빠르게 마무리할 수 있는지 우선순위를 알려주는 것입니다.
+플랫폼 결제(강남언니, 여신티켓 등)는 한솔페이에 없으므로 "일일마감 vs 차트마감" 기준으로 확인합니다.
 
 분석 원칙:
 - 차트마감(EMR)이 최종 기준 원장
-- 금액이 큰 불일치부터 우선순위 부여
-- 단순 매칭 실패와 실제 의심건을 구분
+- 금액이 큰 불일치부터 우선순위 부여 (큰 금액 1~2건 해결로 총합이 맞을 수 있음)
+- 단순 매칭 실패(승인번호 누락 등)와 실제 금액 불일치를 반드시 구분
 - 같은 차트번호가 여러 곳에서 불일치하면 위험도 상승
-- 취소/환불 교차검증 필수"""
+- 취소/환불 교차검증 필수
+- 답변은 반드시 간결하고 실무 조치 중심으로"""
 
-AI_USER_PROMPT = """아래는 병원 정산 3-Way 대사 분석 결과입니다. 이 데이터를 분석하여 다음을 한국어로 답변해주세요:
+AI_USER_PROMPT = """아래는 병원 정산 3-Way 대사 분석 결과입니다. 핵심 질문: "한솔페이 vs 차트" 차이를 만드는 거래가 무엇이고, 어떤 환자부터 확인하면 정산을 빠르게 끝낼 수 있는가?
 
 {data}
 
 ---
 
-위 데이터를 분석하여 아래 형식으로 답변해주세요:
+위 데이터를 분석하여 아래 형식으로 **간결하게** 답변해주세요:
 
-### 📊 총합 차이 요약
-- 카드/현금/플랫폼별 차이 금액과 원인 추정
+### 1. 총합 차이 요약
+- 카드: 한솔페이 vs 차트 차이 금액 및 원인
+- 현금+이체: 일일마감 vs 차트 차이 금액 및 원인
+- 플랫폼: 일일마감 vs 차트 차이 금액 및 원인 (한솔페이에 없으므로 일마 기준)
 
-### 🚨 최우선 확인 대상 (금액순)
-| 우선순위 | 차트번호 | 환자명 | 불일치금액 | 의심사유 | 조치방안 |
-|---------|---------|-------|----------|---------|---------|
+### 2. 정산 마무리를 위한 확인 순서 (금액 큰 순)
+| 순위 | 차트번호 | 환자명 | 불일치금액 | 원인추정 | 조치방안 |
+|-----|---------|-------|----------|---------|---------|
+(이 표의 금액 합계 = 총합 차이여야 함. 안 맞으면 누락건 재확인)
 
-### ⚠️ 추가 확인 필요
-- 중간 위험도 건 요약
+### 3. 추가 확인 필요
+- 중간 위험도 건 요약 (있는 경우만)
 
-### 💡 패턴 분석
-- 반복 미매칭, 시간대 집중, 카드 공유 등 패턴이 있으면 기술
-
-### ✅ 결론
-- 전체 요약 (1~2문장)
-- 총 불일치 금액과 확인 대상 건수"""
+### 4. 결론
+- 핵심 1~2문장: 총 불일치 금액, 확인 대상 건수, 예상 원인"""
 
 
 def run_ai_analysis_claude(api_key, analysis_text, user_question=""):
@@ -2871,7 +2895,8 @@ def run_ai_analysis_claude(api_key, analysis_text, user_question=""):
 
 
 def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
-    """Google Gemini API를 사용한 자동 분석"""
+    """Google Gemini API를 사용한 자동 분석 (무료 API 한도 대응: RPM 15, TPM 100만)"""
+    import time as _time
     import google.generativeai as genai
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
@@ -2881,11 +2906,24 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     prompt = AI_USER_PROMPT.format(data=analysis_text)
     if user_question:
         prompt += f"\n\n추가 질문: {user_question}"
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(max_output_tokens=4096),
-    )
-    return response.text
+
+    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 3회 재시도 + 지수 백오프
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(max_output_tokens=4096),
+            )
+            return response.text
+        except Exception as e:
+            err = str(e)
+            is_rate_limit = "429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower()
+            if is_rate_limit and attempt < max_retries:
+                wait = 2 ** (attempt + 2)  # 4초, 8초, 16초
+                _time.sleep(wait)
+                continue
+            raise
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3626,30 +3664,42 @@ else:
             )
 
             if ai_api_key:
-                if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn"):
-                    with st.spinner("AI가 분석 중입니다... (약 15~30초 소요)"):
-                        try:
-                            analysis_text = _build_ai_analysis_text(
-                                hansol=hansol, daily=daily, patient=patient,
-                                match_df=match_df, h_um=h_um, d_um=d_um,
-                                tots=tots, pc=pc, missing_all=missing_all,
-                                comprehensive=comprehensive,
-                                unified_info=unified_info,
-                            )
-                            if ai_provider == "Claude (Anthropic)":
-                                result = run_ai_analysis_claude(ai_api_key, analysis_text, user_question)
-                            else:
-                                result = run_ai_analysis_gemini(ai_api_key, analysis_text, user_question)
-                            st.session_state["ai_result"] = result
-                            st.session_state["ai_provider_used"] = ai_provider
-                        except Exception as e:
-                            error_msg = str(e)
-                            if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
-                                st.error("API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
-                            elif "429" in error_msg or "rate" in error_msg.lower():
-                                st.error("API 요청 한도를 초과했습니다. 잠시 후 다시 시도해주세요.")
-                            else:
-                                st.error(f"AI 분석 중 오류가 발생했습니다: {error_msg}")
+                # 중복 호출 방지: 마지막 호출 시간 확인
+                import time as _time_mod
+                _last_call = st.session_state.get("_ai_last_call_time", 0)
+                _cooldown = 5  # 최소 5초 간격
+                _can_call = (_time_mod.time() - _last_call) >= _cooldown
+
+                if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn", disabled=not _can_call):
+                    if not _can_call:
+                        st.warning(f"잠시 후 다시 시도해주세요. (최소 {_cooldown}초 간격)")
+                    else:
+                        with st.spinner("AI가 분석 중입니다... (약 15~30초 소요, 한도 초과 시 자동 재시도)"):
+                            try:
+                                st.session_state["_ai_last_call_time"] = _time_mod.time()
+                                analysis_text = _build_ai_analysis_text(
+                                    hansol=hansol, daily=daily, patient=patient,
+                                    match_df=match_df, h_um=h_um, d_um=d_um,
+                                    tots=tots, pc=pc, missing_all=missing_all,
+                                    comprehensive=comprehensive,
+                                    unified_info=unified_info,
+                                )
+                                if ai_provider == "Claude (Anthropic)":
+                                    result = run_ai_analysis_claude(ai_api_key, analysis_text, user_question)
+                                else:
+                                    result = run_ai_analysis_gemini(ai_api_key, analysis_text, user_question)
+                                st.session_state["ai_result"] = result
+                                st.session_state["ai_provider_used"] = ai_provider
+                            except Exception as e:
+                                error_msg = str(e)
+                                if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
+                                    st.error("API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
+                                elif "429" in error_msg or "rate" in error_msg.lower() or "quota" in error_msg.lower():
+                                    st.error("⚠️ API 요청 한도를 초과했습니다 (무료: 분당 15회). 자동 재시도 후에도 실패했습니다. 1~2분 후 다시 시도해주세요.")
+                                elif "resource" in error_msg.lower():
+                                    st.error("⚠️ API 리소스 한도를 초과했습니다. 1~2분 후 다시 시도해주세요.")
+                                else:
+                                    st.error(f"AI 분석 중 오류가 발생했습니다: {error_msg}")
             else:
                 st.warning("API 키를 입력하면 AI 분석을 시작할 수 있습니다.")
 
