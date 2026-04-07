@@ -2893,6 +2893,42 @@ def run_ai_analysis_claude(api_key, analysis_text, user_question=""):
     return message.content[0].text
 
 
+def _gemini_rate_limit_wait():
+    """슬라이딩 윈도우 기반 rate limit 사전 대기.
+    무료 Gemini API: 분당 15회 제한 → 안전하게 분당 10회로 제한 (6초 간격).
+    최근 호출 기록을 추적하여 한도 초과 전에 자동 대기."""
+    import time as _time
+    if "_gemini_call_times" not in st.session_state:
+        st.session_state["_gemini_call_times"] = []
+
+    now = _time.time()
+    window = 60  # 1분 윈도우
+    safe_rpm = 10  # 안전 마진: 15 RPM 중 10회만 사용
+    min_interval = 6  # 최소 호출 간격 (초)
+
+    # 윈도우 밖의 기록 제거
+    st.session_state["_gemini_call_times"] = [
+        t for t in st.session_state["_gemini_call_times"] if now - t < window
+    ]
+    recent = st.session_state["_gemini_call_times"]
+
+    # 최소 간격 체크
+    if recent:
+        since_last = now - recent[-1]
+        if since_last < min_interval:
+            _time.sleep(min_interval - since_last)
+
+    # 윈도우 내 호출 수 체크
+    if len(recent) >= safe_rpm:
+        oldest = recent[0]
+        wait = window - (now - oldest) + 2  # 2초 여유
+        if wait > 0:
+            _time.sleep(wait)
+
+    # 호출 시각 기록
+    st.session_state["_gemini_call_times"].append(_time.time())
+
+
 def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     """Google Gemini API를 사용한 자동 분석 (무료 API 한도 대응: RPM 15, TPM 100만)"""
     import time as _time
@@ -2909,8 +2945,11 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
         system_instruction=AI_SYSTEM_PROMPT,
     )
 
-    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 3회 재시도 + 지수 백오프
-    max_retries = 3
+    # 호출 전 rate limit 사전 대기 (한도 초과 예방)
+    _gemini_rate_limit_wait()
+
+    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 4회 재시도 + 지수 백오프
+    max_retries = 4
     for attempt in range(max_retries + 1):
         try:
             response = model.generate_content(
@@ -2924,8 +2963,11 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
             err = str(e)
             is_rate_limit = "429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower()
             if is_rate_limit and attempt < max_retries:
-                wait = 20 * (attempt + 1)  # 20초, 40초, 60초
+                wait = 30 * (attempt + 1)  # 30초, 60초, 90초, 120초
                 _time.sleep(wait)
+                # 재시도 시각도 기록
+                if "_gemini_call_times" in st.session_state:
+                    st.session_state["_gemini_call_times"].append(_time.time())
                 continue
             raise
 
@@ -2975,7 +3017,7 @@ def _render_ai_analysis_inline():
 
     if ai_api_key:
         _last_call = st.session_state.get("_ai_last_call_time", 0)
-        _cooldown = 45  # 무료 API 한도 보호: 45초 간격
+        _cooldown = 90  # 무료 API 한도 보호: 90초 간격 (재시도 포함 시간 확보)
         _elapsed = _time_mod.time() - _last_call
         _can_call = _elapsed >= _cooldown
 
@@ -3003,9 +3045,9 @@ def _render_ai_analysis_inline():
                     if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
                         st.error("❌ API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
                     elif "429" in error_msg or "rate" in error_msg.lower() or "quota" in error_msg.lower():
-                        st.error("⚠️ API 요청 한도를 초과했습니다 (무료: 분당 15회). 2~3분 후 다시 시도해주세요.")
+                        st.error("⚠️ API 요청 한도를 초과했습니다 (무료: 분당 15회). 자동 재시도도 실패했습니다. 3~5분 후 다시 시도해주세요.")
                     elif "resource" in error_msg.lower():
-                        st.error("⚠️ API 리소스 한도 초과. 1~2분 후 다시 시도해주세요.")
+                        st.error("⚠️ API 리소스 한도 초과. 3~5분 후 다시 시도해주세요.")
                     else:
                         st.error(f"AI 분석 중 오류: {error_msg}")
     else:
