@@ -2760,11 +2760,11 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
                             unified_info=None, cross_ref=None,
-                            max_chars=12000):
+                            max_chars=8000):
     """핵심 분석 데이터를 AI에 전송할 텍스트로 변환.
     핵심 목표: 한솔페이(PG)↔차트마감(EMR) 차이가 '어디서' 발생하는지 추적.
     토큰 최소화: 불일치 건만 전송, 일치 건은 통계만.
-    max_chars: 최대 문자 수 (Gemini 무료 TPM 한도 대응)."""
+    max_chars: 최대 문자 수 (Gemini 무료 TPM 한도 대응, 8000자≈2000토큰)."""
     lines = []
 
     # ── 1. 합계비교 (3개 소스 총합 + 차이) ──
@@ -2833,7 +2833,7 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
             cross_rows.sort(key=lambda x: abs(x["h_p"]) + abs(x["d_p_card"]), reverse=True)
             lines.append(f"\n[차트번호별 불일치★] {len(cross_rows)}건 (차이 있는 환자만)")
             lines.append("차트번호,이름,한솔매칭카드,일마카드,차트카드,일마현금이체,차트현금이체,한솔-차트,일마카드-차트,일마현금-차트")
-            _limit = min(20, max(8, 20 - len(cross_rows) // 10))  # 데이터 많으면 축소
+            _limit = min(12, max(5, 12 - len(cross_rows) // 10))  # 데이터 많으면 축소
             for r in cross_rows[:_limit]:
                 lines.append(f"{r['ch']},{r['name']},{r['h_card']},{r['d_card']},{r['p_card']},{r['d_cx']},{r['p_cx']},{r['h_p']},{r['d_p_card']},{r['d_p_cx']}")
             if len(cross_rows) > _limit:
@@ -2851,7 +2851,7 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
         if "금액" in h_um_sorted.columns:
             h_um_sorted = h_um_sorted.sort_values("금액", key=abs, ascending=False)
         lines.append(",".join(cols))
-        _limit = 10
+        _limit = 7
         for _, row in h_um_sorted.head(_limit).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
         if len(h_um) > _limit:
@@ -2867,7 +2867,7 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
             d_um_sorted["_abs_amt"] = pd.to_numeric(d_um_sorted["카드"], errors="coerce").fillna(0).abs()
             d_um_sorted = d_um_sorted.sort_values("_abs_amt", ascending=False)
         lines.append(",".join(cols))
-        _limit = 10
+        _limit = 7
         for _, row in d_um_sorted.head(_limit).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
         if len(d_um) > _limit:
@@ -2882,7 +2882,7 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                                 "[일마]카드", "[차트]카드",
                                 "[일마]현금+이체", "[차트]현금+이체"] if c in mm.columns]
             lines.append(",".join(cols))
-            _limit = 12
+            _limit = 8
             for _, row in mm.head(_limit).iterrows():
                 lines.append(",".join(str(row.get(c, "")) for c in cols))
             if len(mm) > _limit:
@@ -2957,8 +2957,8 @@ def _gemini_rate_limit_wait():
 
     now = _time.time()
     window = 60  # 1분 윈도우
-    safe_rpm = 10  # 안전 마진: 15 RPM 중 10회만 사용
-    min_interval = 6  # 최소 호출 간격 (초)
+    safe_rpm = 8  # 안전 마진: 15 RPM 중 8회만 사용 (여유 확보)
+    min_interval = 8  # 최소 호출 간격 (초)
 
     # 윈도우 밖의 기록 제거
     st.session_state["_gemini_call_times"] = [
@@ -2986,11 +2986,12 @@ def _gemini_rate_limit_wait():
 def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     """Google Gemini API를 사용한 자동 분석 (무료 API 한도 대응: RPM 15, TPM 100만)"""
     import time as _time
+    import hashlib
     import google.generativeai as genai
     genai.configure(api_key=api_key)
 
     # 데이터가 너무 크면 Gemini 무료 TPM(분당 토큰) 한도에 걸리므로 축소
-    _MAX_ANALYSIS_CHARS = 12000  # ~3000 토큰 (한국어 ≈ 4자/토큰)
+    _MAX_ANALYSIS_CHARS = 8000  # ~2000 토큰 (한국어 ≈ 4자/토큰) — 무료 한도 여유 확보
     if len(analysis_text) > _MAX_ANALYSIS_CHARS:
         analysis_text = analysis_text[:_MAX_ANALYSIS_CHARS] + \
             f"\n...(데이터 축소: 원본 {len(analysis_text)}자 → {_MAX_ANALYSIS_CHARS}자. 핵심 불일치 건만 포함됨)"
@@ -2998,6 +2999,11 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     prompt = AI_USER_PROMPT.format(data=analysis_text)
     if user_question:
         prompt += f"\n\n추가 질문: {user_question}"
+
+    # ── 캐시 확인: 동일 데이터+질문이면 API 호출 없이 즉시 반환 ──
+    _cache_key = hashlib.md5((analysis_text + user_question).encode()).hexdigest()
+    if st.session_state.get("_gemini_cache_key") == _cache_key and st.session_state.get("_gemini_cache_result"):
+        return st.session_state["_gemini_cache_result"]
 
     # system_instruction을 별도 파라미터로 전달 → 토큰 효율 향상
     model = genai.GenerativeModel(
@@ -3008,25 +3014,32 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     # 호출 전 rate limit 사전 대기 (한도 초과 예방)
     _gemini_rate_limit_wait()
 
-    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 4회 재시도 + 지수 백오프
-    max_retries = 4
+    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 3회 재시도
+    # 첫 재시도에서 65초 대기 → 분당 윈도우가 완전히 리셋되도록 보장
+    max_retries = 3
     for attempt in range(max_retries + 1):
         try:
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=3000,
+                    max_output_tokens=2500,
                 ),
             )
-            return response.text
+            result = response.text
+            # 성공 시 캐시 저장
+            st.session_state["_gemini_cache_key"] = _cache_key
+            st.session_state["_gemini_cache_result"] = result
+            return result
         except Exception as e:
             err = str(e)
             is_rate_limit = "429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower()
             if is_rate_limit and attempt < max_retries:
-                wait = 30 * (attempt + 1)  # 30초, 60초, 90초, 120초
+                # 65초 대기: 분당 윈도우 완전 리셋 후 재시도
+                wait = 65 if attempt == 0 else 65 * (attempt + 1)
                 _time.sleep(wait)
-                # 재시도 시각도 기록
+                # 재시도 후 호출 기록 초기화 (윈도우 리셋됨)
                 if "_gemini_call_times" in st.session_state:
+                    st.session_state["_gemini_call_times"] = []
                     st.session_state["_gemini_call_times"].append(_time.time())
                 continue
             raise
@@ -3077,7 +3090,7 @@ def _render_ai_analysis_inline():
 
     if ai_api_key:
         _last_call = st.session_state.get("_ai_last_call_time", 0)
-        _cooldown = 90  # 무료 API 한도 보호: 90초 간격 (재시도 포함 시간 확보)
+        _cooldown = 30  # 캐싱 적용으로 쿨다운 단축 (동일 데이터는 캐시 반환)
         _elapsed = _time_mod.time() - _last_call
         _can_call = _elapsed >= _cooldown
 
@@ -3085,12 +3098,24 @@ def _render_ai_analysis_inline():
             _remaining = int(_cooldown - _elapsed)
             st.warning(f"⏳ {_remaining}초 후 다시 시도 가능합니다 (API 한도 보호)")
 
+        # 토큰 추정치 표시
+        _analysis_text = st.session_state.get("_ai_analysis_text", "")
+        if _analysis_text and ai_provider == "Gemini (Google)":
+            _est_tokens = len(_analysis_text) // 4 + 800  # 시스템프롬프트+출력 포함 추정
+            _color = "🟢" if _est_tokens < 3000 else "🟡" if _est_tokens < 5000 else "🔴"
+            # 캐시 여부 확인
+            import hashlib as _hl
+            _ck = _hl.md5((_analysis_text + (user_question or "")).encode()).hexdigest()
+            _cached = st.session_state.get("_gemini_cache_key") == _ck and st.session_state.get("_gemini_cache_result")
+            _cache_note = " | 📦 캐시됨 (API 호출 없이 즉시 반환)" if _cached else ""
+            st.caption(f"{_color} 예상 토큰: ~{_est_tokens:,} (데이터 {len(_analysis_text):,}자){_cache_note}")
+
         if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn_inline", disabled=not _can_call):
             analysis_text = st.session_state.get("_ai_analysis_text", "")
             if not analysis_text:
                 st.error("분석 데이터가 준비되지 않았습니다. 먼저 파일을 업로드하고 분석을 실행해주세요.")
                 return
-            with st.spinner("AI가 분석 중입니다... (약 15~30초 소요)"):
+            with st.spinner("AI가 분석 중입니다... (한도 초과 시 자동 대기 후 재시도)"):
                 try:
                     st.session_state["_ai_last_call_time"] = _time_mod.time()
                     if ai_provider == "Claude (Anthropic)":
@@ -3105,11 +3130,13 @@ def _render_ai_analysis_inline():
                     if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
                         st.error("❌ API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
                     elif "429" in error_msg or "rate" in error_msg.lower() or "quota" in error_msg.lower():
-                        st.error("⚠️ API 요청 한도를 초과했습니다 (무료: RPM 15회 / TPM 100만 토큰). "
-                                 "데이터가 크면 토큰 한도에 걸릴 수 있습니다. "
-                                 "자동 재시도도 실패했습니다. 3~5분 후 다시 시도해주세요.")
+                        st.error("⚠️ API 요청 한도를 초과했습니다. 자동 재시도(최대 3분)도 실패했습니다.\n\n"
+                                 "**💡 해결 방법:**\n"
+                                 "1. 5분 후 다시 시도\n"
+                                 "2. 다른 Google 계정으로 API 키 발급 (각 키별 별도 한도)\n"
+                                 "3. Google AI Studio에서 유료 전환 시 한도 대폭 상향")
                     elif "resource" in error_msg.lower():
-                        st.error("⚠️ API 리소스 한도 초과. 데이터 크기가 클 수 있습니다. 3~5분 후 다시 시도해주세요.")
+                        st.error("⚠️ API 리소스 한도 초과. 5분 후 다시 시도해주세요.")
                     else:
                         st.error(f"AI 분석 중 오류: {error_msg}")
     else:
