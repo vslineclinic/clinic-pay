@@ -2934,9 +2934,8 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
 # AI 분석 팝업 다이얼로그
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@st.dialog("🤖 AI 자동 분석", width="large")
-def _ai_analysis_dialog():
-    """AI 분석을 팝업 다이얼로그에서 실행 (메인 화면 탐색 가능)"""
+def _render_ai_analysis_inline():
+    """AI 분석을 인라인 폼으로 렌더링 (팝업 대신 탭 내부에 직접 표시)"""
     import time as _time_mod
 
     st.info("API 키는 서버에 저장되지 않으며, 현재 세션에서만 사용됩니다.")
@@ -2946,14 +2945,14 @@ def _ai_analysis_dialog():
         ai_provider = st.selectbox(
             "AI 서비스 선택",
             ["Gemini (Google)", "Claude (Anthropic)"],
-            key="ai_provider_dlg",
+            key="ai_provider_inline",
         )
     with ai_col2:
         if ai_provider == "Claude (Anthropic)":
             ai_api_key = st.text_input(
                 "Anthropic API Key",
                 type="password",
-                key="claude_api_key_dlg",
+                key="claude_api_key_inline",
                 placeholder="sk-ant-...",
                 help="https://console.anthropic.com 에서 발급받으세요.",
             )
@@ -2961,8 +2960,8 @@ def _ai_analysis_dialog():
             ai_api_key = st.text_input(
                 "Google AI API Key",
                 type="password",
-                key="gemini_api_key_dlg",
-                value=st.session_state.get("gemini_api_key_dlg", "AIzaSyA7qOuf9itKxxQ4pGsoXtNSboQXZbQKcGE"),
+                key="gemini_api_key_inline",
+                value=st.session_state.get("gemini_api_key_inline", "AIzaSyA7qOuf9itKxxQ4pGsoXtNSboQXZbQKcGE"),
                 placeholder="AIza...",
                 help="https://aistudio.google.com/apikey 에서 발급받으세요.",
             )
@@ -2970,7 +2969,7 @@ def _ai_analysis_dialog():
     user_question = st.text_area(
         "💬 AI에게 추가로 질문하기 (선택사항)",
         placeholder="예: 가장의심되는 거래건들 먼저 알려줘",
-        key="ai_user_question_dlg",
+        key="ai_user_question_inline",
         height=80,
     )
 
@@ -2984,7 +2983,7 @@ def _ai_analysis_dialog():
             _remaining = int(_cooldown - _elapsed)
             st.warning(f"⏳ {_remaining}초 후 다시 시도 가능합니다 (API 한도 보호)")
 
-        if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn_dlg", disabled=not _can_call):
+        if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn_inline", disabled=not _can_call):
             analysis_text = st.session_state.get("_ai_analysis_text", "")
             if not analysis_text:
                 st.error("분석 데이터가 준비되지 않았습니다. 먼저 파일을 업로드하고 분석을 실행해주세요.")
@@ -3011,21 +3010,6 @@ def _ai_analysis_dialog():
                         st.error(f"AI 분석 중 오류: {error_msg}")
     else:
         st.warning("API 키를 입력하면 AI 분석을 시작할 수 있습니다.")
-
-    # 이전 결과 표시
-    if "ai_result" in st.session_state:
-        st.markdown("---")
-        provider_name = st.session_state.get("ai_provider_used", "AI")
-        st.markdown(f"### 📋 {provider_name} 분석 결과")
-        st.markdown(st.session_state["ai_result"])
-
-        st.download_button(
-            label="📋 분석 결과 텍스트 다운로드",
-            data=st.session_state["ai_result"].encode("utf-8"),
-            file_name=f"AI분석결과_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
-            mime="text/markdown",
-            key="ai_result_download_dlg",
-        )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3739,14 +3723,13 @@ else:
         with ai_tab1:
             st.markdown("#### AI에게 자동으로 분석 요청하기")
             st.markdown("""
-> 버튼을 클릭하면 AI 분석 팝업이 열립니다. API 키 입력 후 바로 분석을 시작할 수 있습니다.
-> 분석 결과는 자동으로 저장되며, 팝업을 닫고 다른 탭을 자유롭게 탐색할 수 있습니다.
+> API 키 입력 후 바로 분석을 시작할 수 있습니다.
+> 분석 중에도 다른 탭을 자유롭게 탐색할 수 있으며, 결과는 아래에 표시됩니다.
             """)
 
-            if st.button("🚀 AI 분석 시작", type="primary", key="ai_open_dialog_btn"):
-                _ai_analysis_dialog()
+            _render_ai_analysis_inline()
 
-            # 이전 분석 결과 표시 (팝업을 닫은 후에도 유지)
+            # 분석 결과 표시
             if "ai_result" in st.session_state:
                 st.markdown("---")
                 provider_name = st.session_state.get("ai_provider_used", "AI")
