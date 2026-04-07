@@ -2907,8 +2907,8 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     if user_question:
         prompt += f"\n\n추가 질문: {user_question}"
 
-    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 3회 재시도 + 지수 백오프
-    max_retries = 3
+    # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 4회 재시도 + 긴 지수 백오프
+    max_retries = 4
     for attempt in range(max_retries + 1):
         try:
             response = model.generate_content(
@@ -2920,7 +2920,7 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
             err = str(e)
             is_rate_limit = "429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower()
             if is_rate_limit and attempt < max_retries:
-                wait = 2 ** (attempt + 2)  # 4초, 8초, 16초
+                wait = 15 * (attempt + 1)  # 15초, 30초, 45초, 60초
                 _time.sleep(wait)
                 continue
             raise
@@ -3667,14 +3667,14 @@ else:
                 # 중복 호출 방지: 마지막 호출 시간 확인
                 import time as _time_mod
                 _last_call = st.session_state.get("_ai_last_call_time", 0)
-                _cooldown = 5  # 최소 5초 간격
+                _cooldown = 30  # 최소 30초 간격 (무료 RPM 15 한도 보호)
                 _can_call = (_time_mod.time() - _last_call) >= _cooldown
 
                 if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn", disabled=not _can_call):
                     if not _can_call:
                         st.warning(f"잠시 후 다시 시도해주세요. (최소 {_cooldown}초 간격)")
                     else:
-                        with st.spinner("AI가 분석 중입니다... (약 15~30초 소요, 한도 초과 시 자동 재시도)"):
+                        with st.spinner("AI가 분석 중입니다... (약 15~60초 소요, 한도 초과 시 최대 60초 대기 후 자동 재시도)"):
                             try:
                                 st.session_state["_ai_last_call_time"] = _time_mod.time()
                                 analysis_text = _build_ai_analysis_text(
@@ -3695,7 +3695,7 @@ else:
                                 if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
                                     st.error("API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
                                 elif "429" in error_msg or "rate" in error_msg.lower() or "quota" in error_msg.lower():
-                                    st.error("⚠️ API 요청 한도를 초과했습니다 (무료: 분당 15회). 자동 재시도 후에도 실패했습니다. 1~2분 후 다시 시도해주세요.")
+                                    st.error("⚠️ API 요청 한도를 초과했습니다 (무료: 분당 15회). 자동 재시도(최대 60초 대기)에도 실패했습니다. 2~3분 후 다시 시도해주세요.")
                                 elif "resource" in error_msg.lower():
                                     st.error("⚠️ API 리소스 한도를 초과했습니다. 1~2분 후 다시 시도해주세요.")
                                 else:
