@@ -2713,10 +2713,12 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 
 def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
-                            unified_info=None, cross_ref=None):
+                            unified_info=None, cross_ref=None,
+                            max_chars=12000):
     """핵심 분석 데이터를 AI에 전송할 텍스트로 변환.
     핵심 목표: 한솔페이(PG)↔차트마감(EMR) 차이가 '어디서' 발생하는지 추적.
-    토큰 최소화: 불일치 건만 전송, 일치 건은 통계만."""
+    토큰 최소화: 불일치 건만 전송, 일치 건은 통계만.
+    max_chars: 최대 문자 수 (Gemini 무료 TPM 한도 대응)."""
     lines = []
 
     # ── 1. 합계비교 (3개 소스 총합 + 차이) ──
@@ -2785,7 +2787,7 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
             cross_rows.sort(key=lambda x: abs(x["h_p"]) + abs(x["d_p_card"]), reverse=True)
             lines.append(f"\n[차트번호별 불일치★] {len(cross_rows)}건 (차이 있는 환자만)")
             lines.append("차트번호,이름,한솔매칭카드,일마카드,차트카드,일마현금이체,차트현금이체,한솔-차트,일마카드-차트,일마현금-차트")
-            _limit = 20
+            _limit = min(20, max(8, 20 - len(cross_rows) // 10))  # 데이터 많으면 축소
             for r in cross_rows[:_limit]:
                 lines.append(f"{r['ch']},{r['name']},{r['h_card']},{r['d_card']},{r['p_card']},{r['d_cx']},{r['p_cx']},{r['h_p']},{r['d_p_card']},{r['d_p_cx']}")
             if len(cross_rows) > _limit:
@@ -2843,7 +2845,13 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
     # ── 6. 통계 요약 ──
     lines.append(f"\n[통계] 한솔{len(hansol)}건,일마{len(daily)}건,차트{len(patient)}건,매칭{len(match_df)}건,한솔미매칭{len(h_um)}건,일마미매칭{len(d_um)}건")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+
+    # 최대 문자 수 초과 시 트렁케이트 (Gemini 무료 TPM 한도 대응)
+    if len(result) > max_chars:
+        result = result[:max_chars] + f"\n...(데이터 축소됨: {len(result)}자 → {max_chars}자)"
+
+    return result
 
 
 AI_SYSTEM_PROMPT = """병원 정산 전문 분석관. 한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 대사 결과에서 금액 차이의 원인을 추적.
@@ -2934,6 +2942,12 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     import time as _time
     import google.generativeai as genai
     genai.configure(api_key=api_key)
+
+    # 데이터가 너무 크면 Gemini 무료 TPM(분당 토큰) 한도에 걸리므로 축소
+    _MAX_ANALYSIS_CHARS = 12000  # ~3000 토큰 (한국어 ≈ 4자/토큰)
+    if len(analysis_text) > _MAX_ANALYSIS_CHARS:
+        analysis_text = analysis_text[:_MAX_ANALYSIS_CHARS] + \
+            f"\n...(데이터 축소: 원본 {len(analysis_text)}자 → {_MAX_ANALYSIS_CHARS}자. 핵심 불일치 건만 포함됨)"
 
     prompt = AI_USER_PROMPT.format(data=analysis_text)
     if user_question:
@@ -3045,9 +3059,11 @@ def _render_ai_analysis_inline():
                     if "401" in error_msg or "invalid" in error_msg.lower() or "api_key" in error_msg.lower():
                         st.error("❌ API 키가 올바르지 않습니다. 키를 다시 확인해주세요.")
                     elif "429" in error_msg or "rate" in error_msg.lower() or "quota" in error_msg.lower():
-                        st.error("⚠️ API 요청 한도를 초과했습니다 (무료: 분당 15회). 자동 재시도도 실패했습니다. 3~5분 후 다시 시도해주세요.")
+                        st.error("⚠️ API 요청 한도를 초과했습니다 (무료: RPM 15회 / TPM 100만 토큰). "
+                                 "데이터가 크면 토큰 한도에 걸릴 수 있습니다. "
+                                 "자동 재시도도 실패했습니다. 3~5분 후 다시 시도해주세요.")
                     elif "resource" in error_msg.lower():
-                        st.error("⚠️ API 리소스 한도 초과. 3~5분 후 다시 시도해주세요.")
+                        st.error("⚠️ API 리소스 한도 초과. 데이터 크기가 클 수 있습니다. 3~5분 후 다시 시도해주세요.")
                     else:
                         st.error(f"AI 분석 중 오류: {error_msg}")
     else:
