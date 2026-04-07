@@ -2850,22 +2850,25 @@ AI_USER_PROMPT = """아래는 병원 정산 3-Way 대사 분석 결과입니다.
 - 총 불일치 금액과 확인 대상 건수"""
 
 
-def run_ai_analysis_claude(api_key, analysis_text):
+def run_ai_analysis_claude(api_key, analysis_text, user_question=""):
     """Claude API를 사용한 자동 분석"""
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
+    prompt = AI_USER_PROMPT.format(data=analysis_text)
+    if user_question:
+        prompt += f"\n\n추가 질문: {user_question}"
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=4096,
         system=AI_SYSTEM_PROMPT,
         messages=[
-            {"role": "user", "content": AI_USER_PROMPT.format(data=analysis_text)}
+            {"role": "user", "content": prompt}
         ],
     )
     return message.content[0].text
 
 
-def run_ai_analysis_gemini(api_key, analysis_text):
+def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     """Google Gemini API를 사용한 자동 분석"""
     import google.generativeai as genai
     genai.configure(api_key=api_key)
@@ -2873,8 +2876,11 @@ def run_ai_analysis_gemini(api_key, analysis_text):
         model_name="gemini-2.0-flash",
         system_instruction=AI_SYSTEM_PROMPT,
     )
+    prompt = AI_USER_PROMPT.format(data=analysis_text)
+    if user_question:
+        prompt += f"\n\n추가 질문: {user_question}"
     response = model.generate_content(
-        AI_USER_PROMPT.format(data=analysis_text),
+        prompt,
         generation_config=genai.types.GenerationConfig(max_output_tokens=4096),
     )
     return response.text
@@ -3587,7 +3593,7 @@ else:
             with ai_col1:
                 ai_provider = st.selectbox(
                     "AI 서비스 선택",
-                    ["Claude (Anthropic)", "Gemini (Google)"],
+                    ["Gemini (Google)", "Claude (Anthropic)"],
                     key="ai_provider",
                 )
             with ai_col2:
@@ -3604,9 +3610,18 @@ else:
                         "Google AI API Key",
                         type="password",
                         key="gemini_api_key",
+                        value="AIzaSyA7qOuf9itKxxQ4pGsoXtNSboQXZbQKcGE",
                         placeholder="AIza...",
                         help="https://aistudio.google.com/apikey 에서 발급받으세요.",
                     )
+
+            # 추가 질문 입력란
+            user_question = st.text_area(
+                "💬 AI에게 추가로 질문하기 (선택사항)",
+                placeholder="예: 카드 매출 누락 건 중 금액이 큰 순서대로 알려줘 / 세무 리스크가 높은 항목을 정리해줘",
+                key="ai_user_question",
+                height=100,
+            )
 
             if ai_api_key:
                 if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn"):
@@ -3620,9 +3635,9 @@ else:
                                 unified_info=unified_info,
                             )
                             if ai_provider == "Claude (Anthropic)":
-                                result = run_ai_analysis_claude(ai_api_key, analysis_text)
+                                result = run_ai_analysis_claude(ai_api_key, analysis_text, user_question)
                             else:
-                                result = run_ai_analysis_gemini(ai_api_key, analysis_text)
+                                result = run_ai_analysis_gemini(ai_api_key, analysis_text, user_question)
                             st.session_state["ai_result"] = result
                             st.session_state["ai_provider_used"] = ai_provider
                         except Exception as e:
