@@ -3474,6 +3474,57 @@ else:
 
     with t1:
         st.subheader("🚨 즉시 확인 필요")
+
+        # ── 핵심 요약: 지금 확인해야 할 사람 목록 ──
+        _t1_action_items = []
+
+        # 한솔 미매칭 → 누가 결제했는데 장부에 없는지
+        if len(h_um):
+            for _, _r in h_um.sort_values("금액", key=abs, ascending=False).head(10).iterrows():
+                _card_hint = str(_r.get("카드번호", ""))[-4:] if _r.get("카드번호") else ""
+                _t1_action_items.append({
+                    "구분": "🔴 PG결제-장부없음",
+                    "환자/카드": f"카드끝자리 {_card_hint}" if _card_hint else "정보없음",
+                    "금액": f"{int(_r['금액']):,}원",
+                    "왜 확인?": "PG사에 결제기록이 있으나 병원 장부에 없음 → 수납 누락 가능",
+                    "승인번호": str(_r.get("승인번호", "")),
+                })
+
+        # 일마 미매칭 → 장부에 카드수납인데 PG에 없는 사람
+        if len(d_um):
+            for _, _r in d_um.sort_values("카드", key=lambda x: x.abs(), ascending=False).head(10).iterrows():
+                _t1_action_items.append({
+                    "구분": "🔴 장부카드-PG없음",
+                    "환자/카드": f"{_r.get('성명', '')} ({_r.get('차트번호', '')})",
+                    "금액": f"{int(_r['카드']):,}원",
+                    "왜 확인?": "프론트에서 카드로 수납했는데 PG사에 기록 없음 → 결제수단 오입력 가능",
+                    "승인번호": "",
+                })
+
+        # 수단 불일치 → 카드/현금 금액이 다른 사람
+        if not pc.empty:
+            _mm = pc[pc["불일치상세"] != "✅일치"]
+            if len(_mm):
+                for _, _r in _mm.head(8).iterrows():
+                    _diff_desc = str(_r.get("불일치상세", ""))
+                    _t1_action_items.append({
+                        "구분": "🟡 결제수단 차이",
+                        "환자/카드": f"{_r.get('성명', '')} ({_r.get('차트번호', '')})",
+                        "금액": _diff_desc,
+                        "왜 확인?": "일마와 차트에서 결제수단별 금액이 다름 → 입력 오류 가능",
+                        "승인번호": "",
+                    })
+
+        if _t1_action_items:
+            st.markdown("##### 👇 지금 확인해야 할 사람/거래 (금액 큰 순)")
+            st.dataframe(pd.DataFrame(_t1_action_items), width='stretch', hide_index=True)
+        else:
+            st.success("🎉 의심건 없음! 모든 거래가 정상 매칭되었습니다.")
+
+        st.divider()
+
+        # ── 기존 상세 정보 ──
+        st.markdown("##### 상세 내역")
         prio = []
         if len(h_um):
             prio.append(dict(순위="🔴P1", 항목="한솔 미매칭", 건수=len(h_um), 금액=f"{h_um['금액'].sum():,}"))
@@ -3492,8 +3543,6 @@ else:
             prio.append(dict(순위="🟠P3", 항목="한솔↔차트 누락추정", 건수=len(missing_only), 금액=f"{missing_amt:,}"))
         if prio:
             st.dataframe(pd.DataFrame(prio), width='stretch', hide_index=True)
-        else:
-            st.success("🎉 의심건 없음!")
 
         if len(h_um):
             st.markdown("#### ❌ 한솔 미매칭")
@@ -3505,8 +3554,27 @@ else:
 
     with t2:
         st.subheader("💳 한솔↔일마 매칭")
-        st.caption("🟢HIGH 자동확정 | 🟡MED 검토권장 | 🔴LOW 수동확인")
         if not match_df.empty:
+            # ── 핵심 요약: 수동 확인 필요한 매칭 ──
+            _t2_review = match_df[match_df["확신도"].isin(["🟡MED", "🔴LOW"])].copy()
+            if not _t2_review.empty:
+                st.markdown("##### ⚠️ 수동 확인 필요한 매칭 (자동매칭 확신도 낮음)")
+                _t2_summary_cols = [c for c in ["확신도", "일마_이름", "일마_차트", "한솔_금액",
+                                                 "매칭규칙", "한솔_승인", "한솔_카드"] if c in _t2_review.columns]
+                _t2_review_display = _t2_review[_t2_summary_cols].sort_values("한솔_금액", key=abs, ascending=False)
+                _t2_review_display = _t2_review_display.rename(columns={
+                    "일마_이름": "환자명", "일마_차트": "차트번호",
+                    "한솔_금액": "결제금액", "한솔_승인": "승인번호", "한솔_카드": "카드번호",
+                })
+                st.dataframe(_t2_review_display, width='stretch', hide_index=True)
+                st.caption(f"🟡MED: 금액·시간은 맞지만 100% 확신 못함 | 🔴LOW: 추정 매칭, 반드시 직접 확인")
+            else:
+                st.success("✅ 모든 매칭이 높은 확신도(HIGH)입니다. 수동 확인 필요 없음.")
+
+            st.divider()
+
+            # ── 기존 상세 ──
+            st.markdown("##### 전체 매칭 상세")
             cf = st.multiselect("확신도", ["🟢HIGH", "🟡MED", "🔴LOW"], default=["🟢HIGH", "🟡MED", "🔴LOW"])
             st.dataframe(match_df[match_df["확신도"].isin(cf)].sort_values("일마_순서"),
                          width='stretch', hide_index=True)
@@ -3517,34 +3585,97 @@ else:
     with t2b:
         st.subheader("🧩 한솔↔차트 누락 추정 수납건")
         if not missing_all.empty:
+            # ── 핵심 요약: 확인해야 할 환자 (금액 차이 있는 사람만) ──
+            no_match = missing_all[missing_all["매칭상태"] == "❌한솔매칭없음"]
+            under_match = missing_all[missing_all["매칭상태"] == "⚠️금액부족"]
+            over_match = missing_all[missing_all["매칭상태"] == "⚠️초과매칭"]
+            ok_match = missing_all[missing_all["매칭상태"] == "✅일치"]
+
+            _t2b_alerts = []
+            for _, _r in no_match.iterrows():
+                _t2b_alerts.append({
+                    "상태": "🔴 PG매칭 없음",
+                    "차트번호": _r.get("차트번호", ""),
+                    "환자명": _r.get("이름", ""),
+                    "차트 카드금액": f"{int(_r.get('차트카드금액', 0)):,}원",
+                    "PG 매칭금액": "0원",
+                    "차이": f"{int(_r.get('차트카드금액', 0)):,}원",
+                    "의미": "차트에 카드수납이 있으나 PG사에 기록없음",
+                })
+            for _, _r in under_match.iterrows():
+                _t2b_alerts.append({
+                    "상태": "🟡 금액 부족",
+                    "차트번호": _r.get("차트번호", ""),
+                    "환자명": _r.get("이름", ""),
+                    "차트 카드금액": f"{int(_r.get('차트카드금액', 0)):,}원",
+                    "PG 매칭금액": f"{int(_r.get('한솔매칭금액', 0)):,}원",
+                    "차이": f"{int(_r.get('차이(차트-한솔)', 0)):,}원",
+                    "의미": "차트보다 PG금액이 적음 → 일부 결제 누락 가능",
+                })
+            for _, _r in over_match.iterrows():
+                _t2b_alerts.append({
+                    "상태": "🟡 금액 초과",
+                    "차트번호": _r.get("차트번호", ""),
+                    "환자명": _r.get("이름", ""),
+                    "차트 카드금액": f"{int(_r.get('차트카드금액', 0)):,}원",
+                    "PG 매칭금액": f"{int(_r.get('한솔매칭금액', 0)):,}원",
+                    "차이": f"{int(_r.get('차이(차트-한솔)', 0)):,}원",
+                    "의미": "PG금액이 차트보다 많음 → 이중결제 또는 차트 미반영",
+                })
+
+            if _t2b_alerts:
+                st.markdown("##### 👇 확인 필요한 환자 (차트 vs PG 금액 차이)")
+                # 차이 절대값 기준 정렬
+                _t2b_df = pd.DataFrame(_t2b_alerts)
+                st.dataframe(_t2b_df, width='stretch', hide_index=True)
+                st.caption(f"✅ 정상 일치: {len(ok_match)}명 | 위 {len(_t2b_alerts)}명만 확인하세요")
+            else:
+                st.success(f"✅ 모든 환자({len(ok_match)}명) 카드금액이 PG사와 일치합니다.")
+
+            st.divider()
+
+            # ── 기존 상세 ──
+            st.markdown("##### 전체 상세")
             view = st.radio("표시", ["누락/불일치만", "전체"], horizontal=True, key="t2b_view")
             disp = missing_only if view == "누락/불일치만" else missing_all
             disp_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액", "차트카드건수",
                                      "한솔매칭금액", "한솔매칭건수", "일마카드금액", "차이(차트-한솔)", "불일치원인"] if c in disp.columns]
             st.dataframe(disp[disp_cols].sort_values("매칭상태"), width='stretch', hide_index=True)
-
-            # 누락 요약 통계
-            st.markdown("#### 누락 분석 요약")
-            no_match = missing_all[missing_all["매칭상태"] == "❌한솔매칭없음"]
-            under_match = missing_all[missing_all["매칭상태"] == "⚠️금액부족"]
-            over_match = missing_all[missing_all["매칭상태"] == "⚠️초과매칭"]
-            ok_match = missing_all[missing_all["매칭상태"] == "✅일치"]
-            summary_items = []
-            summary_items.append(f"✅ 완전일치: {len(ok_match)}건")
-            if len(no_match):
-                summary_items.append(f"❌ 한솔매칭없음: {len(no_match)}건 (차트금액 합계 {int(no_match['차트카드금액'].sum()):,}원)")
-            if len(under_match):
-                summary_items.append(f"⚠️ 금액부족: {len(under_match)}건 (부족금액 합계 {int(under_match['차이(차트-한솔)'].sum()):,}원)")
-            if len(over_match):
-                summary_items.append(f"⚠️ 초과매칭: {len(over_match)}건 (초과금액 합계 {int(abs(over_match['차이(차트-한솔)'].sum())):,}원)")
-            for item in summary_items:
-                st.markdown(f"- {item}")
         else:
             st.success("✅ 모든 차트 카드수납이 한솔과 정상 매칭되었습니다.")
 
     with t3:
         st.subheader("📊 일마↔차트 수단별")
         if not pc.empty:
+            # ── 핵심 요약: 결제수단이 다른 환자 ──
+            _t3_mismatch = pc[pc["불일치상세"] != "✅일치"]
+            if not _t3_mismatch.empty:
+                st.markdown("##### 👇 결제수단이 다른 환자 (프론트 입력 vs 차트 기록)")
+                _t3_items = []
+                for _, _r in _t3_mismatch.iterrows():
+                    _ilma_card = int(_r.get("[일마]카드", 0) or 0)
+                    _chart_card = int(_r.get("[차트]카드", 0) or 0)
+                    _ilma_cash = int(_r.get("[일마]현금+이체", 0) or 0)
+                    _chart_cash = int(_r.get("[차트]현금+이체", 0) or 0)
+                    _t3_items.append({
+                        "차트번호": _r.get("차트번호", ""),
+                        "환자명": _r.get("성명", ""),
+                        "불일치 내용": str(_r.get("불일치상세", "")),
+                        "프론트 카드": f"{_ilma_card:,}",
+                        "차트 카드": f"{_chart_card:,}",
+                        "카드차이": f"{_ilma_card - _chart_card:,}",
+                        "프론트 현금": f"{_ilma_cash:,}",
+                        "차트 현금": f"{_chart_cash:,}",
+                    })
+                st.dataframe(pd.DataFrame(_t3_items), width='stretch', hide_index=True)
+                st.caption(f"✅ 일치: {len(pc) - len(_t3_mismatch)}명 | 위 {len(_t3_mismatch)}명만 확인하세요. 카드↔현금 수단 바뀜이 대부분입니다.")
+            else:
+                st.success(f"✅ 모든 환자({len(pc)}명) 결제수단이 프론트와 차트에서 일치합니다.")
+
+            st.divider()
+
+            # ── 기존 상세 ──
+            st.markdown("##### 전체 상세")
             vw = st.radio("표시", ["불일치만", "전체"], horizontal=True)
             disp = pc if vw == "전체" else pc[pc["불일치상세"] != "✅일치"]
             cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
