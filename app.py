@@ -1,11 +1,14 @@
 """
-병원 정산 3-Way 차이 추적기
+병원 정산 3-Way 차이 추적기 (채널 합계 대사 중심)
 
-목표 (우선순위):
-  ① 한솔(PG) ↔ 차트마감(EMR) 카드결제 차이 — ★최우선
-  ② 한솔(PG) ↔ 일일마감(프론트) 카드결제 차이
+목표 (재정의):
+  ★ 결제채널별(카드/현금+이체/플랫폼) 3개 파일 합계 차이 산출
+  ★ 차이금액을 설명할 후보 환자·거래 추적 (잘못 기입/누락 즉시 수정)
 
-원칙: 방대한 raw data 생성 금지 / AI에 보낼 데이터 최소화 (무료 API 한도 내) / 차이만 추출.
+원칙:
+  - 채널 합계 차이 → 의심 후보(소수) → AI 한 줄 진단 흐름
+  - 1:1 매칭은 후보 식별 도구로만 사용 (메인 산출물 아님)
+  - AI 입력 ≤ ~600자 / 출력 ≤ 800토큰 / 무료 한도(2.5-flash-lite 기준) 내
 """
 
 import importlib
@@ -1375,49 +1378,203 @@ def compute_totals(hansol, daily, daily_refund, patient):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AI 분석 텍스트 (최대 ~1800자 / ~750토큰)
+# ★ 채널 합계 대사 (메인 산출물)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_text(p1_diff, h_um, d_um, totals, max_chars=1800):
+def compute_channel_recon(totals):
+    """3개 파일 결제채널별 합계 + 차이값 산출.
+
+    채널 정의:
+      - 카드: 한솔(카드 승인) / 일마(카드) / 차트(분류=카드)
+      - 현금+이체: 한솔(현금영수증) / 일마(현금+이체) / 차트(현금+이체)
+        ※ 한솔은 현금영수증만 처리하므로 일마/차트 합과 동일하지 않을 수 있음
+      - 플랫폼: 한솔(비경유) / 일마(플랫폼 합) / 차트(분류=플랫폼)
+    """
+    rows = [
+        {
+            "채널": "카드",
+            "한솔": totals["h_card"],
+            "일마": totals["d_card"],
+            "차트": totals["p_card"],
+            "한솔-차트": totals["h_card"] - totals["p_card"],
+            "한솔-일마": totals["h_card"] - totals["d_card"],
+            "일마-차트": totals["d_card"] - totals["p_card"],
+        },
+        {
+            "채널": "현금+이체",
+            "한솔": totals["h_cash"],
+            "일마": totals["d_cashxfer"],
+            "차트": totals["p_cashxfer"],
+            "한솔-차트": totals["h_cash"] - totals["p_cashxfer"],
+            "한솔-일마": totals["h_cash"] - totals["d_cashxfer"],
+            "일마-차트": totals["d_cashxfer"] - totals["p_cashxfer"],
+        },
+        {
+            "채널": "플랫폼",
+            "한솔": None,
+            "일마": totals["d_plat"],
+            "차트": totals["p_plat"],
+            "한솔-차트": None,
+            "한솔-일마": None,
+            "일마-차트": totals["d_plat"] - totals["p_plat"],
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def find_channel_suspects(channel, hansol, daily, patient, top_n=6):
+    """채널 차이를 설명할 후보 거래 추출 (multiset diff 기반).
+
+    원리: 각 파일의 금액 multiset에서 짝지어지지 않는 금액만 추출.
+         이렇게 하면 의심 후보의 합이 실제 채널 합계 차이와 정확히 일치.
+    """
+    from collections import Counter
+    suspects = []
+
+    if channel == "카드":
+        # 1) 한솔(정상카드) vs 일마(카드>0) multiset diff
+        h_ok = hansol[hansol["tx_status"] == "정상"] if "tx_status" in hansol.columns else hansol
+        h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
+        h_amts = [int(x) for x in h_card["금액"].tolist()] if not h_card.empty else []
+        d_amts = [int(x) for x in daily.loc[daily["카드"] > 0, "카드"].tolist()] if not daily.empty else []
+
+        ch_h, ch_d = Counter(h_amts), Counter(d_amts)
+        only_h = ch_h - ch_d
+        only_d = ch_d - ch_h
+
+        # 한솔에만 (일마에 누락 의심)
+        h_remaining = h_card.copy()
+        for amt, cnt in sorted(only_h.items(), key=lambda x: -abs(x[0]))[:top_n]:
+            rows = h_remaining[h_remaining["금액"] == amt].head(cnt)
+            for _, r in rows.iterrows():
+                cn = str(r.get("카드번호", ""))
+                cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                suspects.append({
+                    "출처": "한솔에만 존재",
+                    "금액": int(amt),
+                    "단서": f"{r.get('시간표시','')} 말미{cn_tail} 승인{r.get('승인번호','')} {str(r.get('카드사',''))[:6]}",
+                    "조치": "일마/차트에 같은 금액 결제 누락 → 추가 입력",
+                })
+
+        # 일마에만 (PG미경유 or 일마오기재)
+        for amt, cnt in sorted(only_d.items(), key=lambda x: -abs(x[0]))[:top_n]:
+            rows = daily[(daily["카드"] == amt)].head(cnt)
+            for _, r in rows.iterrows():
+                suspects.append({
+                    "출처": "일마에만 존재",
+                    "금액": int(amt),
+                    "단서": f"차트{r['차트번호']} {str(r.get('성명',''))[:6]}",
+                    "조치": "PG 승인내역 없음 → 결제수단 오기재(현금/이체) 또는 미수납 확인",
+                })
+
+        # 2) 차트(환자집계) vs 일마 카드 분류 차이 (참고)
+        if not patient.empty and not daily.empty and "분류" in patient.columns:
+            p_card = patient[patient["분류"] == "카드"].groupby("차트번호")["금액"].sum()
+            d_by_chart = daily.groupby("차트번호")["카드"].sum()
+            common = set(p_card.index) & set(d_by_chart.index) - {""}
+            for ch in common:
+                pv, dv = int(p_card.get(ch, 0)), int(d_by_chart.get(ch, 0))
+                if pv != dv:
+                    suspects.append({
+                        "출처": "차트↔일마 분류차이",
+                        "금액": dv - pv,
+                        "단서": f"차트{ch} (차트={pv:,} / 일마={dv:,})",
+                        "조치": "결제수단(카드↔현금↔이체) 오기재 가능성",
+                    })
+
+    elif channel == "현금+이체":
+        if not patient.empty and not daily.empty:
+            p_cx = patient[patient.get("분류", "").isin(["현금", "이체"])].groupby("차트번호")["금액"].sum()
+            d_cx = daily.groupby("차트번호").apply(lambda x: int(x["현금"].sum() + x["이체"].sum()))
+            common = set(p_cx.index) & set(d_cx.index)
+            mismatches = []
+            for ch in common:
+                pv, dv = int(p_cx.get(ch, 0)), int(d_cx.get(ch, 0))
+                if pv != dv:
+                    mismatches.append((ch, pv, dv, abs(pv - dv)))
+            mismatches.sort(key=lambda x: -x[3])
+            for ch, pv, dv, _ in mismatches[:top_n]:
+                suspects.append({
+                    "출처": "차트↔일마 분류차이",
+                    "금액": dv - pv,
+                    "단서": f"차트{ch} / 차트현금+이체={pv:,} 일마={dv:,}",
+                    "조치": "현금↔이체↔카드 오기재 확인",
+                })
+
+    elif channel == "플랫폼":
+        if not patient.empty and not daily.empty:
+            p_pl = patient[patient.get("분류", "") == "플랫폼"].groupby("차트번호")["금액"].sum()
+            d_pl = daily.groupby("차트번호")["플랫폼합"].sum()
+            common = set(p_pl.index) & set(d_pl.index) | set(p_pl.index) | set(d_pl.index)
+            mismatches = []
+            for ch in common:
+                pv, dv = int(p_pl.get(ch, 0)), int(d_pl.get(ch, 0))
+                if pv != dv:
+                    mismatches.append((ch, pv, dv, abs(pv - dv)))
+            mismatches.sort(key=lambda x: -x[3])
+            for ch, pv, dv, _ in mismatches[:top_n]:
+                suspects.append({
+                    "출처": "차트↔일마 플랫폼차이",
+                    "금액": dv - pv,
+                    "단서": f"차트{ch} / 차트플랫폼={pv:,} 일마={dv:,}",
+                    "조치": "플랫폼 종류/금액 오기재 확인",
+                })
+
+    return suspects
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AI 분석 텍스트 (채널 중심 ~600자 / ~250토큰)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def build_ai_text(channel_df, suspects_by_channel, max_chars=700):
+    """채널 합계 대사 + 채널별 의심후보 TOP만 전달 (~500자 목표).
+    구분자는 파이프(|) 사용 — 숫자 천단위 콤마와 충돌 방지."""
+    def _f(v):
+        if v is None:
+            return "-"
+        try:
+            if pd.isna(v):
+                return "-"
+        except Exception:
+            pass
+        return str(int(v))  # 토큰 절약: 콤마 제거
+
     L = []
-    L.append("[합계] 구분,한솔,일마,차트,차트-한솔,한솔-일마")
-    L.append(f"카드,{totals['h_card']},{totals['d_card']},{totals['p_card']},{totals['p_card']-totals['h_card']:+},{totals['h_card']-totals['d_card']:+}")
-    L.append(f"현금+이체,{totals['h_cash']},{totals['d_cashxfer']},{totals['p_cashxfer']},{totals['p_cashxfer']-totals['h_cash']:+},{totals['h_cash']-totals['d_cashxfer']:+}")
-    L.append(f"플랫폼,(비경유),{totals['d_plat']},{totals['p_plat']},{totals['p_plat']-totals['d_plat']:+},-")
+    L.append("채널|한솔|일마|차트|한솔-차트|한솔-일마|일마-차트")
+    for _, r in channel_df.iterrows():
+        L.append(f"{r['채널']}|{_f(r['한솔'])}|{_f(r['일마'])}|{_f(r['차트'])}|{_f(r['한솔-차트'])}|{_f(r['한솔-일마'])}|{_f(r['일마-차트'])}")
 
-    if not p1_diff.empty:
-        s = int(p1_diff["차이"].sum())
-        L.append(f"\n[P1★한솔↔차트] {len(p1_diff)}건 불일치 (차트-한솔합={s:+,})")
-        L.append("차트,이름,차트카드(건),한솔카드(건),차이,승인번호")
-        for _, r in p1_diff.head(10).iterrows():
-            appr = str(r.get("한솔승인번호", "") or r.get("차트승인번호", ""))[:24]
-            L.append(f"{r['차트번호']},{str(r.get('이름',''))[:8]},{r['차트카드']}({r['차트건수']}),{r['한솔카드']}({r['한솔건수']}),{r['차이']:+},{appr}")
-        if len(p1_diff) > 10:
-            L.append(f"...외 {len(p1_diff)-10}건")
+    nonzero_channels = []
+    for _, r in channel_df.iterrows():
+        diffs = []
+        for col in ["한솔-차트", "한솔-일마", "일마-차트"]:
+            v = r[col]
+            if v is None:
+                continue
+            try:
+                if pd.isna(v):
+                    continue
+            except Exception:
+                pass
+            if int(v) != 0:
+                diffs.append(f"{col}={int(v):+d}")
+        if diffs:
+            nonzero_channels.append((r["채널"], diffs))
+
+    if not nonzero_channels:
+        L.append("\n[결과] 모든채널 일치")
     else:
-        L.append("\n[P1★한솔↔차트] 모두 일치")
-
-    if not h_um.empty:
-        s = int(h_um["금액"].sum())
-        L.append(f"\n[P2한솔미매칭] {len(h_um)}건 {s:+,}원 (PG승인/일마누락 의심)")
-        L.append("시간,금액,카드말미,승인번호,카드사")
-        tmp = h_um.copy()
-        tmp["_말미"] = tmp["카드번호"].apply(lambda x: str(x)[-4:] if str(x).strip() and str(x).strip() != "nan" else "")
-        tmp = tmp.sort_values("금액", key=abs, ascending=False)
-        for _, r in tmp.head(6).iterrows():
-            L.append(f"{r.get('시간표시','')},{int(r['금액'])},{r['_말미']},{r.get('승인번호','')},{str(r.get('카드사',''))[:8]}")
-        if len(h_um) > 6:
-            L.append(f"...외 {len(h_um)-6}건")
-
-    if not d_um.empty:
-        s = int(d_um["카드"].sum())
-        L.append(f"\n[P2일마미매칭] {len(d_um)}건 {s:+,}원 (PG미경유/일마오기재 의심)")
-        L.append("차트,성명,카드금액")
-        for _, r in d_um.sort_values("카드", key=abs, ascending=False).head(6).iterrows():
-            L.append(f"{r['차트번호']},{str(r['성명'])[:8]},{int(r['카드'])}")
-        if len(d_um) > 6:
-            L.append(f"...외 {len(d_um)-6}건")
+        for ch, diffs in nonzero_channels:
+            L.append(f"\n[{ch}] {' / '.join(diffs)}")
+            sus = suspects_by_channel.get(ch, [])
+            if sus:
+                L.append("출처|금액|단서")
+                for s in sus[:5]:
+                    clue = str(s.get("단서", ""))[:50].replace("|", " ")
+                    L.append(f"{s['출처']}|{int(s['금액']):+d}|{clue}")
 
     text = "\n".join(L)
     if len(text) > max_chars:
@@ -1425,24 +1582,22 @@ def build_ai_text(p1_diff, h_um, d_um, totals, max_chars=1800):
     return text
 
 
-AI_SYSTEM = "병원 정산 분석관. 차트마감(EMR)=원장. 한솔(PG)·일마(프론트)·차트(EMR) 불일치를 환자단위로 추적."
+AI_SYSTEM = "병원 정산 분석관. 한솔(PG)·일마(프론트)·차트(EMR) 채널합계 차이의 원인 거래를 짧게 진단."
 
-AI_USER = """3-Way 정산 결과:
+AI_USER = """3개 파일 채널 합계 대사:
 
 {data}
 
-1200토큰 이내로 다음 형식 답변:
+800토큰 이내, 다음 형식만 출력:
 
-### ① P1★ 한솔↔차트 (최우선)
-- 카드 합계차이(차트-한솔) = ?원
-- 차이큰 환자 TOP5:
-| # | 차트 | 이름 | 차트카드 | 한솔카드 | 차이 | 원인추정 | 조치 |
+### 채널별 차이 진단
+각 차이가 0이 아닌 채널마다 ↓
+- **{{채널}}**: 한솔-차트=?원 / 한솔-일마=?원 / 일마-차트=?원
+  - 가장 유력한 원인: (예: "한솔 PG에 X원 결제건 누락" / "차트에서 카드↔현금 오기재")
+  - 의심 후보 TOP3 (출처/금액/조치)
 
-### ② P2 한솔↔일마
-- 한솔미매칭 핵심 1-2건 (수납누락 의심)
-- 일마미매칭 핵심 1-2건 (PG미경유 의심)
-
-### ③ 결론 (1-2문장)"""
+### 결론 (1문장)
+어느 파일의 어느 거래를 수정해야 합계가 맞을지."""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1450,10 +1605,30 @@ AI_USER = """3-Way 정산 결과:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_excel(p1_diff, h_um, d_um, totals):
+def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_channel=None):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        # 시트1: P1 (★최우선)
+        # 시트0: 채널 합계 대사 (★메인)
+        if channel_df is not None and not channel_df.empty:
+            ch_out = channel_df.copy()
+            for c in ch_out.columns:
+                if c == "채널":
+                    continue
+                ch_out[c] = ch_out[c].apply(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else int(v))
+            ch_out.to_excel(w, sheet_name="0_채널대사", index=False)
+
+        # 시트0b: 의심 후보 (채널별 통합)
+        if suspects_by_channel:
+            rows = []
+            for ch, sus in suspects_by_channel.items():
+                for s in sus:
+                    rows.append({"채널": ch, **s})
+            if rows:
+                pd.DataFrame(rows).to_excel(w, sheet_name="0_의심후보", index=False)
+            else:
+                pd.DataFrame({"상태": ["의심 후보 없음 — 합계 일치"]}).to_excel(w, sheet_name="0_의심후보", index=False)
+
+        # 시트1: P1 (보조)
         if not p1_diff.empty:
             cols = [c for c in ["차트번호", "이름", "차트카드", "차트건수", "한솔카드", "한솔건수",
                                 "차이", "일마카드", "차트카드사", "한솔카드사",
@@ -1497,14 +1672,34 @@ def build_ai_excel(p1_diff, h_um, d_um, totals):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _gemini_wait():
-    """무료 한도 RPM 15 → 분당 12회로 안전 동작."""
+# Gemini 무료 한도 (2026년 기준, 모델별 일일 호출수 RPD 기준):
+#   gemini-2.5-flash-lite  : 15 RPM / 250K TPM / 1000 RPD  ← 무료 RPD 최다, 권장 기본값
+#   gemini-2.5-flash       : 10 RPM / 250K TPM /  500 RPD
+#   gemini-2.0-flash       : 15 RPM /   1M TPM /  200 RPD  ← TPM은 크지만 RPD 적음
+#   gemini-2.0-flash-lite  : 30 RPM /   1M TPM /  200 RPD
+GEMINI_MODELS = {
+    "gemini-2.5-flash-lite": {"rpm": 15, "rpd": 1000, "label": "Flash Lite 2.5 (권장·RPD1000)"},
+    "gemini-2.5-flash":      {"rpm": 10, "rpd": 500,  "label": "Flash 2.5 (RPD500)"},
+    "gemini-2.0-flash":      {"rpm": 15, "rpd": 200,  "label": "Flash 2.0 (RPD200)"},
+    "gemini-2.0-flash-lite": {"rpm": 30, "rpd": 200,  "label": "Flash Lite 2.0 (RPM30)"},
+}
+GEMINI_FALLBACK_ORDER = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+]
+
+
+def _gemini_wait(rpm_limit=15):
+    """모델별 RPM의 80%로 안전 동작."""
     import time as _t
     if "_g_times" not in st.session_state:
         st.session_state["_g_times"] = []
+    safe_rpm = max(2, int(rpm_limit * 0.8))
     now = _t.time()
     st.session_state["_g_times"] = [t for t in st.session_state["_g_times"] if now - t < 60]
-    if len(st.session_state["_g_times"]) >= 12:
+    if len(st.session_state["_g_times"]) >= safe_rpm:
         wait = 60 - (now - st.session_state["_g_times"][0]) + 1
         if wait > 0:
             with st.spinner(f"분당 한도 보호 — {int(wait)}초 대기"):
@@ -1541,8 +1736,10 @@ def _cache_set(k, v):
         pass
 
 
-def run_gemini(api_key, data_text, question="", model="gemini-2.0-flash"):
-    import time as _t, hashlib
+def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", allow_fallback=True):
+    """무료 한도 친화: 캐시 → 호출 → 한도초과 시 다른 무료 모델로 자동 폴백."""
+    import time as _t
+    import hashlib
     import google.generativeai as genai
     genai.configure(api_key=api_key)
 
@@ -1550,38 +1747,56 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.0-flash"):
     if question:
         prompt += f"\n\n추가 질문: {question}"
 
-    ckey = hashlib.md5((model + "|" + data_text + "|" + question).encode()).hexdigest()
+    # 캐시 키는 데이터+질문 기준 (모델 무관 → 모델 폴백시에도 캐시 재활용)
+    ckey = hashlib.md5((data_text + "|" + question).encode()).hexdigest()
     if st.session_state.get("_ai_ck") == ckey and st.session_state.get("_ai_cv"):
-        return st.session_state["_ai_cv"]
+        return st.session_state["_ai_cv"], st.session_state.get("_ai_used_model", model)
     p = _cache_get(ckey)
     if p:
         st.session_state["_ai_ck"] = ckey
         st.session_state["_ai_cv"] = p
-        return p
+        return p, model + " (cache)"
 
-    m = genai.GenerativeModel(model_name=model, system_instruction=AI_SYSTEM)
-    _gemini_wait()
-    for attempt in range(4):
+    # 폴백 순서: 사용자 선택 모델 우선, 그 후 권장 순서
+    if allow_fallback:
+        try_order = [model] + [m for m in GEMINI_FALLBACK_ORDER if m != model]
+    else:
+        try_order = [model]
+
+    last_err = None
+    for try_model in try_order:
+        rpm = GEMINI_MODELS.get(try_model, {}).get("rpm", 10)
+        m = genai.GenerativeModel(model_name=try_model, system_instruction=AI_SYSTEM)
+        _gemini_wait(rpm_limit=rpm)
+        # 모델당 1회만 시도 (재시도 대기 누적 방지) → 즉시 다음 모델로
         try:
             r = m.generate_content(
                 prompt,
-                generation_config=genai.types.GenerationConfig(max_output_tokens=1200, temperature=0.3),
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=800, temperature=0.2,
+                ),
             )
             out = r.text
             st.session_state["_ai_ck"] = ckey
             st.session_state["_ai_cv"] = out
+            st.session_state["_ai_used_model"] = try_model
             _cache_set(ckey, out)
-            return out
+            return out, try_model
         except Exception as e:
+            last_err = e
             err = str(e)
-            if attempt < 3 and ("429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower()):
-                wait = 65 * (attempt + 1)
-                with st.spinner(f"한도 초과 — {wait}초 대기 후 재시도 ({attempt+1}/3)"):
-                    _t.sleep(wait)
+            if "429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower():
+                # 한도 초과 → 다음 모델 즉시 시도
                 if "_g_times" in st.session_state:
-                    st.session_state["_g_times"] = [_t.time()]
+                    st.session_state["_g_times"] = []
+                if not allow_fallback:
+                    break
                 continue
+            # 다른 오류는 즉시 raise (인증 등)
             raise
+
+    # 모든 모델 한도 초과
+    raise last_err if last_err else RuntimeError("All Gemini models quota exceeded")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1589,7 +1804,7 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.0-flash"):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 st.title("📊 병원 정산 3-Way 차이 추적기")
-st.caption("목표: ① 한솔 ↔ 차트마감 차이  ② 한솔 ↔ 일일마감 차이")
+st.caption("★ 결제채널별 3개 파일 합계 차이를 먼저 산출 → 차이를 설명할 후보 거래 추적")
 
 if "done" not in st.session_state:
     c1, c2, c3 = st.columns(3)
@@ -1621,6 +1836,11 @@ if "done" not in st.session_state:
                 p1_full, p1_diff = compute_p1(match_df, patient, daily)
                 h_um, d_um = compute_p2(hansol, daily, matched_h, matched_dc)
                 totals = compute_totals(hansol, daily, daily_refund, patient)
+                channel_df = compute_channel_recon(totals)
+                suspects_by_channel = {
+                    ch: find_channel_suspects(ch, hansol, daily, patient)
+                    for ch in ["카드", "현금+이체", "플랫폼"]
+                }
 
                 ss = st.session_state
                 ss["done"] = True
@@ -1629,6 +1849,8 @@ if "done" not in st.session_state:
                 ss["p1_full"], ss["p1_diff"] = p1_full, p1_diff
                 ss["h_um"], ss["d_um"] = h_um, d_um
                 ss["totals"] = totals
+                ss["channel_df"] = channel_df
+                ss["suspects_by_channel"] = suspects_by_channel
             st.rerun()
     else:
         st.info("3개 파일을 모두 업로드하세요.")
@@ -1640,116 +1862,181 @@ else:
     p1_full, p1_diff = ss["p1_full"], ss["p1_diff"]
     h_um, d_um = ss["h_um"], ss["d_um"]
     totals = ss["totals"]
+    channel_df = ss["channel_df"]
+    suspects_by_channel = ss["suspects_by_channel"]
 
     if st.button("🔄 새 파일로 다시"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
-    # KPI
+    # ── 채널 합계 차이 요약 (★메인) ──
+    def _nonzero(v):
+        if v is None:
+            return False
+        try:
+            if pd.isna(v):
+                return False
+        except Exception:
+            pass
+        return int(v) != 0
+
+    nonzero_count = sum(
+        1 for _, r in channel_df.iterrows()
+        for col in ["한솔-차트", "한솔-일마", "일마-차트"]
+        if _nonzero(r[col])
+    )
+    total_abs_gap = sum(
+        abs(int(r[col])) for _, r in channel_df.iterrows()
+        for col in ["한솔-차트", "한솔-일마", "일마-차트"]
+        if _nonzero(r[col])
+    )
+
     n_ok = len(hansol[hansol["tx_status"] == "정상"])
     n_m = len(matched_h)
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("한솔 정상", n_ok)
     k2.metric("자동매칭", n_m, f"{n_m/n_ok*100:.0f}%" if n_ok else "0%")
-    k3.metric("🔴 P1 차이 차트수", len(p1_diff), delta_color="inverse")
-    k4.metric("🟠 P2 미매칭", f"{len(h_um)} / {len(d_um)}", delta_color="inverse")
+    k3.metric("🔴 채널 차이 합계", f"{total_abs_gap:,}원", delta_color="inverse")
+    k4.metric("⚠️ 차이있는 채널-쌍", nonzero_count, delta_color="inverse")
 
-    # 합계 비교 (상단)
-    st.markdown("### 합계 비교")
-    sum_df = pd.DataFrame([
-        {"구분": "카드", "한솔": totals["h_card"], "일마": totals["d_card"], "차트": totals["p_card"],
-         "차트-한솔 (P1)": totals["p_card"] - totals["h_card"],
-         "한솔-일마 (P2)": totals["h_card"] - totals["d_card"]},
-        {"구분": "현금+이체", "한솔": totals["h_cash"], "일마": totals["d_cashxfer"], "차트": totals["p_cashxfer"],
-         "차트-한솔 (P1)": totals["p_cashxfer"] - totals["h_cash"],
-         "한솔-일마 (P2)": totals["h_cash"] - totals["d_cashxfer"]},
-        {"구분": "플랫폼", "한솔": "(비경유)", "일마": totals["d_plat"], "차트": totals["p_plat"],
-         "차트-한솔 (P1)": "-", "한솔-일마 (P2)": "-"},
-    ])
-    st.dataframe(sum_df, width="stretch", hide_index=True)
+    st.markdown("### ★ 채널별 합계 대사 (3개 파일)")
+    st.caption("각 채널의 한솔·일마·차트 합계를 비교 — **0이 아닌 차이값이 있으면 그 채널을 우선 추적**")
+    disp_df = channel_df.copy()
+    for c in disp_df.columns:
+        if c == "채널":
+            continue
+        disp_df[c] = disp_df[c].apply(lambda v: "-" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{int(v):,}")
+    st.dataframe(disp_df, width="stretch", hide_index=True)
 
-    # 탭 3개
+    if nonzero_count == 0:
+        st.success("✅ 모든 채널 합계 일치 — 추가 분석 불필요")
+
+    # 탭 3개 - 메인 탭은 의심 후보 추적
     tab1, tab2, tab3 = st.tabs([
-        "🔴 P1: 한솔 ↔ 차트마감 (★최우선)",
-        "🟠 P2: 한솔 ↔ 일일마감",
-        "🤖 AI 분석",
+        "🎯 차이 원인 추적 (★메인)",
+        "🔬 1:1 매칭 상세 (보조)",
+        "🤖 AI 진단",
     ])
 
     with tab1:
-        st.markdown("**차트번호 단위 카드결제 비교** — 차트는 EMR 원장, 한솔은 PG 실승인")
-        if p1_diff.empty:
-            st.success("✅ 모든 차트번호에서 한솔↔차트 카드금액 일치")
-        else:
-            total_diff = int(p1_diff["차이"].sum())
-            st.warning(f"⚠️ 불일치 {len(p1_diff)}건 — 합계 차이 (차트-한솔) = **{total_diff:+,}원**")
-            cols = [c for c in ["차트번호", "이름", "차트카드", "차트건수", "한솔카드", "한솔건수",
-                                "차이", "일마카드", "차트카드사", "한솔카드사",
-                                "한솔승인번호", "차트승인번호"] if c in p1_diff.columns]
-            st.dataframe(p1_diff[cols], width="stretch", hide_index=True)
+        st.markdown("**채널별 차이가 0이 아닌 항목** → 차이를 설명할 후보 거래를 확인하세요.")
+        any_diff = False
+        for _, r in channel_df.iterrows():
+            ch = r["채널"]
+            diffs = []
+            for col in ["한솔-차트", "한솔-일마", "일마-차트"]:
+                if _nonzero(r[col]):
+                    diffs.append(f"**{col} = {int(r[col]):+,}원**")
+            if not diffs:
+                continue
+            any_diff = True
+            st.markdown(f"#### 🔴 {ch} 채널 — {' / '.join(diffs)}")
+            sus = suspects_by_channel.get(ch, [])
+            if not sus:
+                st.info("후보 거래가 추출되지 않았습니다. 원본 파일을 직접 확인하세요.")
+            else:
+                sus_df = pd.DataFrame(sus)
+                sus_df["금액"] = sus_df["금액"].apply(lambda v: f"{int(v):+,}")
+                st.dataframe(sus_df, width="stretch", hide_index=True)
+            st.markdown("---")
+        if not any_diff:
+            st.success("✅ 추적할 채널 차이 없음")
 
     with tab2:
-        st.markdown("**한솔 미매칭** = PG 승인됐으나 일마 카드 컬럼에 미기재 (수납누락 의심)")
-        if h_um.empty:
-            st.success("✅ 한솔 미매칭 없음")
-        else:
-            st.warning(f"⚠️ {len(h_um)}건, 합계 {int(h_um['금액'].sum()):+,}원")
-            cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "카드사"] if c in h_um.columns]
-            st.dataframe(h_um[cols].sort_values("금액", key=abs, ascending=False),
-                         width="stretch", hide_index=True)
-
-        st.markdown("---")
-        st.markdown("**일마 미매칭** = 일마 카드 컬럼에 있으나 한솔에 없음 (PG미경유/일마오기재 의심)")
-        if d_um.empty:
-            st.success("✅ 일마 미매칭 없음")
-        else:
-            st.warning(f"⚠️ {len(d_um)}건, 합계 {int(d_um['카드'].sum()):+,}원")
-            cols = [c for c in ["차트번호", "성명", "카드", "내원순서"] if c in d_um.columns]
-            st.dataframe(d_um[cols].sort_values("카드", key=abs, ascending=False),
-                         width="stretch", hide_index=True)
+        st.caption("1:1 매칭은 본질적 합계 차이가 아니라 매칭 알고리즘의 미매칭 결과 — 참고용")
+        sub1, sub2, sub3 = st.tabs(["차트번호별 카드", "한솔 미매칭", "일마 미매칭"])
+        with sub1:
+            if p1_diff.empty:
+                st.success("✅ 차트번호별 한솔↔차트 카드금액 모두 일치")
+            else:
+                total_diff = int(p1_diff["차이"].sum())
+                st.warning(f"불일치 {len(p1_diff)}건 / 합계 차이 = {total_diff:+,}원 (1:1 매칭 누적)")
+                cols = [c for c in ["차트번호", "이름", "차트카드", "차트건수", "한솔카드", "한솔건수",
+                                    "차이", "일마카드", "차트카드사", "한솔카드사",
+                                    "한솔승인번호", "차트승인번호"] if c in p1_diff.columns]
+                st.dataframe(p1_diff[cols], width="stretch", hide_index=True)
+        with sub2:
+            if h_um.empty:
+                st.success("✅ 한솔 미매칭 없음")
+            else:
+                st.warning(f"{len(h_um)}건 / 합계 {int(h_um['금액'].sum()):+,}원")
+                cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호", "카드사"] if c in h_um.columns]
+                st.dataframe(h_um[cols].sort_values("금액", key=abs, ascending=False),
+                             width="stretch", hide_index=True)
+        with sub3:
+            if d_um.empty:
+                st.success("✅ 일마 미매칭 없음")
+            else:
+                st.warning(f"{len(d_um)}건 / 합계 {int(d_um['카드'].sum()):+,}원")
+                cols = [c for c in ["차트번호", "성명", "카드", "내원순서"] if c in d_um.columns]
+                st.dataframe(d_um[cols].sort_values("카드", key=abs, ascending=False),
+                             width="stretch", hide_index=True)
 
     with tab3:
-        ai_text = build_ai_text(p1_diff, h_um, d_um, totals)
+        ai_text = build_ai_text(channel_df, suspects_by_channel)
         st.session_state["_ai_data"] = ai_text
 
-        api_key = st.text_input(
-            "Google AI API Key",
-            type="password",
-            value=st.session_state.get("_api_key", "AIzaSyA7qOuf9itKxxQ4pGsoXtNSboQXZbQKcGE"),
-            key="_api_key",
-            help="https://aistudio.google.com/apikey",
-        )
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            api_key = st.text_input(
+                "Google AI API Key",
+                type="password",
+                value=st.session_state.get("_api_key", ""),
+                key="_api_key",
+                help="https://aistudio.google.com/apikey 에서 무료 발급 (개인 키 권장)",
+            )
+        with col_b:
+            model_choice = st.selectbox(
+                "모델 (무료 한도 우선)",
+                options=list(GEMINI_MODELS.keys()),
+                index=0,
+                format_func=lambda k: GEMINI_MODELS[k]["label"],
+                key="_model_choice",
+            )
+
         question = st.text_area(
             "추가 질문(선택)",
-            placeholder="예: P1 차이 큰 5명 자세히 / 차트 12345 한솔미매칭에서 추적",
+            placeholder="예: 카드 27,400원 차이가 어디서 났을지 추정",
             height=70,
         )
 
         est_in = int(len(ai_text) / 2.5) + 150
-        est_total = est_in + 1200
+        est_total = est_in + 800
         col = "🟢" if est_total < 3000 else "🟡" if est_total < 5000 else "🔴"
-        st.caption(f"{col} 데이터 {len(ai_text):,}자 / 예상 토큰 입력~{est_in}+출력~1200 = ~{est_total}  | 무료 한도 RPM15·TPM100만·RPD1500")
+        rpd = GEMINI_MODELS[model_choice]["rpd"]
+        rpm = GEMINI_MODELS[model_choice]["rpm"]
+        st.caption(f"{col} 데이터 {len(ai_text):,}자 / 토큰 ~{est_in}입력+~800출력 = ~{est_total}  | 선택모델 무료한도 RPM{rpm}·RPD{rpd} (한도 시 다른 무료 모델로 자동 폴백)")
 
         with st.expander("📄 전송 데이터 미리보기"):
             st.code(ai_text, language="text")
 
-        if api_key and st.button("🚀 AI 분석 시작", type="primary"):
+        if not api_key:
+            st.info("ℹ️ Google AI API Key를 입력해 주세요 — https://aistudio.google.com/apikey 에서 무료 발급")
+        elif st.button("🚀 AI 분석 시작", type="primary"):
             with st.spinner("AI 분석 중..."):
                 try:
-                    result = run_gemini(api_key, ai_text, question)
+                    result, used_model = run_gemini(api_key, ai_text, question, model=model_choice)
                     st.session_state["_ai_result"] = result
+                    st.session_state["_ai_used"] = used_model
                 except Exception as e:
                     err = str(e)
-                    if "401" in err or "invalid" in err.lower():
-                        st.error("❌ API 키 오류")
-                    elif "429" in err or "quota" in err.lower() or "rate" in err.lower():
-                        st.error("⚠️ 한도초과 (3회 재시도 실패).\n\n해결: 5분 후 재시도 / 다른 Google 계정으로 키 발급 / 유료 전환")
+                    if "401" in err or "invalid" in err.lower() or "api key" in err.lower():
+                        st.error("❌ API 키 오류 — 키가 올바른지 확인하세요.")
+                    elif "429" in err or "quota" in err.lower() or "rate" in err.lower() or "resource" in err.lower():
+                        st.error(
+                            "⚠️ 모든 무료 모델 한도 초과.\n\n"
+                            "해결: ① 24시간 후 재시도 (RPD 리셋) "
+                            "② 다른 Google 계정으로 새 키 발급 "
+                            "③ 결제 활성화 (유료 전환)"
+                        )
                     else:
                         st.error(f"오류: {err}")
 
         if "_ai_result" in st.session_state:
             st.markdown("---")
-            st.markdown("### 📋 AI 분석 결과")
+            used = st.session_state.get("_ai_used", "")
+            st.markdown(f"### 📋 AI 분석 결과  _(모델: {used})_")
             st.markdown(st.session_state["_ai_result"])
             st.download_button(
                 "결과 텍스트 저장",
@@ -1759,12 +2046,12 @@ else:
             )
 
         st.markdown("---")
-        with st.expander("📥 (대안) AI 통합 엑셀 다운로드 — 다른 AI에 업로드용"):
-            excel = build_ai_excel(p1_diff, h_um, d_um, totals)
+        with st.expander("📥 (대안) 통합 엑셀 다운로드 — 다른 AI/수작업용"):
+            excel = build_ai_excel(p1_diff, h_um, d_um, totals, channel_df, suspects_by_channel)
             st.download_button(
-                "AI 통합 엑셀 다운로드 (4시트)",
+                "통합 엑셀 다운로드 (5시트)",
                 data=excel,
                 file_name=f"정산차이_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.caption("시트: 1_P1_한솔vs차트(★) / 2_P2_한솔미매칭 / 3_P2_일마미매칭 / 4_합계")
+            st.caption("시트: 0_채널대사(★) / 0_의심후보(★) / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭")
