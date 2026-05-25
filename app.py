@@ -1444,6 +1444,32 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
     from collections import Counter
     suspects = []
 
+    # 차트번호 → 환자이름 조회맵 (daily 성명 우선, patient 이름 보완)
+    name_map = {}
+    if not daily.empty and "차트번호" in daily.columns and "성명" in daily.columns:
+        for _, row in daily[["차트번호", "성명"]].drop_duplicates("차트번호").iterrows():
+            ch_no = str(row["차트번호"]).strip()
+            nm = str(row["성명"]).strip()
+            if ch_no and nm and nm != "nan":
+                name_map[ch_no] = nm
+    if not patient.empty and "차트번호" in patient.columns and "이름" in patient.columns:
+        for _, row in patient[["차트번호", "이름"]].drop_duplicates("차트번호").iterrows():
+            ch_no = str(row["차트번호"]).strip()
+            nm = str(row["이름"]).strip()
+            if ch_no and nm and nm != "nan" and ch_no not in name_map:
+                name_map[ch_no] = nm
+
+    # 일마 금액 → 환자이름 후보 (한솔에만 존재 건의 환자 추정용)
+    d_amt_to_names: dict = {}
+    if not daily.empty and "카드" in daily.columns and "성명" in daily.columns:
+        for _, row in daily.iterrows():
+            amt_key = int(row["카드"]) if row["카드"] > 0 else None
+            nm = str(row.get("성명", "")).strip()
+            if amt_key and nm and nm != "nan":
+                d_amt_to_names.setdefault(amt_key, [])
+                if nm not in d_amt_to_names[amt_key]:
+                    d_amt_to_names[amt_key].append(nm)
+
     if channel == "카드":
         h_ok = hansol[hansol["tx_status"] == "정상"] if "tx_status" in hansol.columns else hansol
         h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
@@ -1470,8 +1496,12 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                 cn_tail = cn[-5:] if cn and cn != "nan" else ""
                 near = abs(abs(amt) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
                 tag = "한솔에만 존재★" if near else "한솔에만 존재"
+                # 같은 금액의 일마 환자명을 추정 후보로 표시
+                name_candidates = d_amt_to_names.get(int(amt), [])
+                patient_hint = "·".join(name_candidates[:2]) + ("?" if name_candidates else "")
                 suspects.append({
                     "출처": tag,
+                    "환자(추정)": patient_hint,
                     "금액": int(amt),
                     "단서": f"{r.get('시간표시','')} 말미{cn_tail} 승인{r.get('승인번호','')} {str(r.get('카드사',''))[:6]}",
                     "조치": "일마/차트에 같은 금액 누락 또는 부분취소 가능성",
@@ -1483,10 +1513,12 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
             for _, r in rows.iterrows():
                 near = abs(abs(amt) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
                 tag = "일마에만 존재★" if near else "일마에만 존재"
+                nm = str(r.get("성명", "")).strip()
                 suspects.append({
                     "출처": tag,
+                    "환자": nm,
                     "금액": int(amt),
-                    "단서": f"차트{r['차트번호']} {str(r.get('성명',''))[:6]}",
+                    "단서": f"차트{r['차트번호']}",
                     "조치": "PG 승인내역 없음 → 결제수단 오기재 또는 미수납",
                 })
 
@@ -1496,8 +1528,10 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
             for h_amt in list(only_h.keys())[:20]:
                 for d_amt in list(only_d.keys())[:20]:
                     if (h_amt - d_amt) == gap:
+                        d_names = "·".join(d_amt_to_names.get(int(d_amt), [])[:2])
                         suspects.insert(0, {
                             "출처": "★ 차이값 정확매칭 페어",
+                            "환자(추정)": d_names,
                             "금액": gap,
                             "단서": f"한솔 {h_amt:,} 와 일마 {d_amt:,} 의 차이가 정확히 {gap:+,}",
                             "조치": "두 거래가 같은 환자(부분취소·오기재 의심) — 즉시 확인",
@@ -1518,6 +1552,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
             for ch, pv, dv in mismatches[:top_n]:
                 suspects.append({
                     "출처": "차트↔일마 분류차이",
+                    "환자": name_map.get(str(ch).strip(), ""),
                     "금액": dv - pv,
                     "단서": f"차트{ch} (차트={pv:,} / 일마={dv:,})",
                     "조치": "결제수단(카드↔현금↔이체) 오기재 가능성",
@@ -1537,6 +1572,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
             for ch, pv, dv, _ in mismatches[:top_n]:
                 suspects.append({
                     "출처": "차트↔일마 분류차이",
+                    "환자": name_map.get(str(ch).strip(), ""),
                     "금액": dv - pv,
                     "단서": f"차트{ch} / 차트현금+이체={pv:,} 일마={dv:,}",
                     "조치": "현금↔이체↔카드 오기재 확인",
@@ -1556,6 +1592,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
             for ch, pv, dv, _ in mismatches[:top_n]:
                 suspects.append({
                     "출처": "차트↔일마 플랫폼차이",
+                    "환자": name_map.get(str(ch).strip(), ""),
                     "금액": dv - pv,
                     "단서": f"차트{ch} / 차트플랫폼={pv:,} 일마={dv:,}",
                     "조치": "플랫폼 종류/금액 오기재 확인",
@@ -1611,10 +1648,11 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=700):
             L.append(f"\n[{ch}] {' / '.join(diffs)}")
             sus = suspects_by_channel.get(ch, [])
             if sus:
-                L.append("출처|금액|단서")
+                L.append("출처|환자|금액|단서")
                 for s in sus[:5]:
                     clue = str(s.get("단서", ""))[:50].replace("|", " ")
-                    L.append(f"{s['출처']}|{int(s['금액']):+d}|{clue}")
+                    nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:8]
+                    L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
 
     text = "\n".join(L)
     if len(text) > max_chars:
@@ -1634,7 +1672,7 @@ AI_USER = """3개 파일 채널 합계 대사:
 각 차이가 0이 아닌 채널마다 ↓
 - **{{채널}}**: 한솔-차트=?원 / 한솔-일마=?원 / 일마-차트=?원
   - 가장 유력한 원인: (예: "한솔 PG에 X원 결제건 누락" / "차트에서 카드↔현금 오기재")
-  - 의심 후보 TOP3 (출처/금액/조치)
+  - 의심 후보 TOP3 (출처/환자/금액/조치)
 
 ### 결론 (1문장)
 어느 파일의 어느 거래를 수정해야 합계가 맞을지."""
@@ -1981,7 +2019,16 @@ else:
             else:
                 sus_df = pd.DataFrame(sus)
                 sus_df["금액"] = sus_df["금액"].apply(lambda v: f"{int(v):+,}")
-                st.dataframe(sus_df, width="stretch", hide_index=True)
+                # 환자명 컬럼 통합 (환자 / 환자(추정) 둘 중 하나)
+                if "환자" not in sus_df.columns and "환자(추정)" in sus_df.columns:
+                    sus_df.rename(columns={"환자(추정)": "환자"}, inplace=True)
+                elif "환자" in sus_df.columns and "환자(추정)" in sus_df.columns:
+                    sus_df["환자"] = sus_df["환자"].fillna("").replace("", None)
+                    sus_df["환자(추정)"] = sus_df["환자(추정)"].fillna("").replace("", None)
+                    sus_df["환자"] = sus_df["환자"].combine_first(sus_df["환자(추정)"])
+                    sus_df.drop(columns=["환자(추정)"], inplace=True)
+                col_order = [c for c in ["출처", "환자", "금액", "단서", "조치"] if c in sus_df.columns]
+                st.dataframe(sus_df[col_order], width="stretch", hide_index=True)
             st.markdown("---")
         if not any_diff:
             st.success("✅ 추적할 채널 차이 없음")
