@@ -1470,6 +1470,43 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                 if nm not in d_amt_to_names[amt_key]:
                     d_amt_to_names[amt_key].append(nm)
 
+    # 승인번호(전체/끝8자리) → (차트번호, 이름) 조회맵 — 차트의 승인번호목록 기반
+    appr_to_patient: dict = {}
+    if not patient.empty and "승인번호목록" in patient.columns:
+        for _, row in patient.iterrows():
+            appr_list = row.get("승인번호목록", []) or []
+            nm = str(row.get("이름", "")).strip()
+            ch_no = str(row.get("차트번호", "")).strip()
+            if not (nm and ch_no):
+                continue
+            for a in appr_list:
+                a_str = str(a).strip()
+                if not a_str:
+                    continue
+                appr_to_patient[a_str] = (ch_no, nm)
+                # 한솔 승인번호와 자릿수 차이 대비: 끝 8자리 매칭도 등록
+                if len(a_str) >= 8:
+                    appr_to_patient[a_str[-8:]] = (ch_no, nm)
+
+    def _lookup_by_appr(appr_no: str):
+        """한솔 승인번호로 차트 환자 조회 (전체/끝8자리 비교)."""
+        a = str(appr_no).strip()
+        if not a:
+            return None
+        if a in appr_to_patient:
+            return appr_to_patient[a]
+        if len(a) >= 8 and a[-8:] in appr_to_patient:
+            return appr_to_patient[a[-8:]]
+        return None
+
+    # 일마 환자별 카드 합계 (★★ 동일환자 확정 검증용)
+    d_by_name_card: dict = {}
+    if not daily.empty and "성명" in daily.columns and "카드" in daily.columns:
+        for nm, grp in daily.groupby("성명"):
+            total = int(grp["카드"].sum())
+            if total > 0 and str(nm).strip() and str(nm).strip() != "nan":
+                d_by_name_card[str(nm).strip()] = total
+
     if channel == "카드":
         h_ok = hansol[hansol["tx_status"] == "정상"] if "tx_status" in hansol.columns else hansol
         h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
@@ -1487,23 +1524,75 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
             if gap == 0:
                 gap = totals.get("h_card", 0) - totals.get("p_card", 0)
 
-        # 한솔에만 (일마에 누락 의심) — 차이값 근접도 우선 정렬
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ★★ 동일환자 확정 (최우선): 한솔 거래의 승인번호가 차트의 특정
+        # 환자에 속하고, 그 환자가 일마에는 다른 금액으로 기재된 경우.
+        # 카운터 차분으로 미매칭에서 빠진 거래도 잡기 위해 only_h에 한정하지 않고
+        # 동일 금액의 모든 한솔 거래를 승인번호로 검증한다.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        confirmed_suspects = []
+        seen_confirmed = set()
         h_remaining = h_card.copy()
+        # only_h 금액과 더불어, gap에 근접한 모든 한솔 카드 거래도 후보로
+        amts_to_probe = set(int(a) for a in only_h.keys())
+        tol_gap = max(1000, abs(gap) * 0.05) if gap else 0
+        for hr_amt in h_card["금액"].unique():
+            if gap != 0 and abs(abs(int(hr_amt)) - abs(gap)) <= max(50000, abs(gap) * 2):
+                amts_to_probe.add(int(hr_amt))
+        for amt in amts_to_probe:
+            rows = h_card[h_card["금액"] == amt]
+            for _, r in rows.iterrows():
+                appr = str(r.get("승인번호", "")).strip()
+                hit = _lookup_by_appr(appr)
+                if not hit:
+                    continue
+                ch_no, nm = hit
+                d_total = d_by_name_card.get(nm, 0)
+                diff = d_total - int(amt)
+                if d_total > 0 and diff != 0:
+                    key = (ch_no, int(amt), d_total)
+                    if key in seen_confirmed:
+                        continue
+                    seen_confirmed.add(key)
+                    cn = str(r.get("카드번호", ""))
+                    cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                    near = (gap != 0 and abs(abs(diff) - abs(gap)) <= tol_gap)
+                    tag = "★★ 동일환자 확정(gap일치)" if near else "★★ 동일환자 확정"
+                    confirmed_suspects.append({
+                        "출처": tag,
+                        "환자": f"{nm}({ch_no})",
+                        "금액": diff,
+                        "단서": f"한솔 {int(amt):,}원(승인{appr} 말미{cn_tail}) vs 일마 {nm} 카드합 {d_total:,}원 → 차이 {diff:+,}",
+                        "조치": "한솔=부분취소/차트=오기재 → 동일환자의 두 금액 즉시 확인",
+                        "_near": 1 if near else 0,
+                    })
+
+        # gap일치 → 그 외 순으로 정렬
+        confirmed_suspects.sort(key=lambda x: -x.pop("_near"))
+        suspects.extend(confirmed_suspects)
+
+        # 한솔에만 (일마에 누락 의심) — 차이값 근접도 우선 정렬
         for amt, cnt in sorted(only_h.items(), key=lambda x: _rank_key(x[0], gap))[:top_n]:
             rows = h_remaining[h_remaining["금액"] == amt].head(cnt)
             for _, r in rows.iterrows():
                 cn = str(r.get("카드번호", ""))
                 cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                appr = str(r.get("승인번호", "")).strip()
                 near = abs(abs(amt) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
+                # 승인번호로 차트 환자 확정 시도
+                hit = _lookup_by_appr(appr)
+                if hit:
+                    ch_no, nm = hit
+                    patient_field = f"{nm}({ch_no})✓"
+                else:
+                    name_candidates = d_amt_to_names.get(int(amt), [])
+                    patient_field = "·".join(name_candidates[:2]) + ("?" if name_candidates else "")
                 tag = "한솔에만 존재★" if near else "한솔에만 존재"
-                # 같은 금액의 일마 환자명을 추정 후보로 표시
-                name_candidates = d_amt_to_names.get(int(amt), [])
-                patient_hint = "·".join(name_candidates[:2]) + ("?" if name_candidates else "")
                 suspects.append({
                     "출처": tag,
-                    "환자(추정)": patient_hint,
+                    "환자": patient_field,
                     "금액": int(amt),
-                    "단서": f"{r.get('시간표시','')} 말미{cn_tail} 승인{r.get('승인번호','')} {str(r.get('카드사',''))[:6]}",
+                    "단서": f"{r.get('시간표시','')} 말미{cn_tail} 승인{appr} {str(r.get('카드사',''))[:6]}",
                     "조치": "일마/차트에 같은 금액 누락 또는 부분취소 가능성",
                 })
 
@@ -1522,20 +1611,54 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                     "조치": "PG 승인내역 없음 → 결제수단 오기재 또는 미수납",
                 })
 
-        # 추가: 차이값 정확히 일치하는 후보 페어 (한솔의 X - 일마의 Y = gap)
-        # 예: 박인희 케이스 — 한솔 27,600 - 일마(같은환자) 55,000 = -27,400
+        # ★ 차이값 정확매칭 페어 (h_amt - d_amt = gap) — 환자 확정 시도
         if gap != 0 and only_h and only_d:
             for h_amt in list(only_h.keys())[:20]:
                 for d_amt in list(only_d.keys())[:20]:
                     if (h_amt - d_amt) == gap:
-                        d_names = "·".join(d_amt_to_names.get(int(d_amt), [])[:2])
-                        suspects.insert(0, {
-                            "출처": "★ 차이값 정확매칭 페어",
-                            "환자(추정)": d_names,
-                            "금액": gap,
-                            "단서": f"한솔 {h_amt:,} 와 일마 {d_amt:,} 의 차이가 정확히 {gap:+,}",
-                            "조치": "두 거래가 같은 환자(부분취소·오기재 의심) — 즉시 확인",
-                        })
+                        # 한솔 h_amt 거래의 승인번호로 환자 확정 시도
+                        h_rows = h_card[h_card["금액"] == h_amt]
+                        d_rows = daily[daily["카드"] == d_amt]
+                        d_names = [str(x).strip() for x in d_rows.get("성명", []) if str(x).strip() and str(x).strip() != "nan"]
+                        # 한솔 승인번호 ↔ 차트 환자 매칭하여 일마 환자와 일치하는지 확인
+                        confirmed_name = None
+                        confirmed_chart = None
+                        confirmed_clue_extra = ""
+                        for _, hr in h_rows.iterrows():
+                            appr = str(hr.get("승인번호", "")).strip()
+                            hit = _lookup_by_appr(appr)
+                            if hit:
+                                ch_no, nm = hit
+                                if nm in d_names:
+                                    confirmed_name = nm
+                                    confirmed_chart = ch_no
+                                    cn = str(hr.get("카드번호", ""))
+                                    cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                                    confirmed_clue_extra = f" / 승인{appr} 말미{cn_tail}"
+                                    break
+                        if confirmed_name:
+                            # 이미 ★★에 추가된 경우 중복 방지
+                            already = any(
+                                s["출처"].startswith("★★") and confirmed_chart and confirmed_chart in str(s.get("환자", ""))
+                                for s in suspects
+                            )
+                            if not already:
+                                suspects.insert(0, {
+                                    "출처": "★★ 동일환자 확정 페어",
+                                    "환자": f"{confirmed_name}({confirmed_chart})",
+                                    "금액": gap,
+                                    "단서": f"한솔 {h_amt:,} 와 일마 {d_amt:,} 차이가 정확히 {gap:+,}{confirmed_clue_extra}",
+                                    "조치": "동일환자 — 한솔 부분취소 또는 차트 오기재 확인",
+                                })
+                        else:
+                            d_names_str = "·".join(d_names[:2])
+                            suspects.append({
+                                "출처": "★ 차이값 정확매칭 페어",
+                                "환자": d_names_str + ("?" if d_names_str else ""),
+                                "금액": gap,
+                                "단서": f"한솔 {h_amt:,} 와 일마 {d_amt:,} 의 차이가 정확히 {gap:+,}",
+                                "조치": "두 거래가 같은 환자(부분취소·오기재 의심) — 즉시 확인",
+                            })
 
         # 차트(환자집계) vs 일마 카드 분류 차이 (참고)
         if not patient.empty and not daily.empty and "분류" in patient.columns:
@@ -1606,7 +1729,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_text(channel_df, suspects_by_channel, max_chars=700):
+def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
     """채널 합계 대사 + 채널별 의심후보 TOP만 전달 (~500자 목표).
     구분자는 파이프(|) 사용 — 숫자 천단위 콤마와 충돌 방지."""
     def _f(v):
@@ -1648,10 +1771,19 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=700):
             L.append(f"\n[{ch}] {' / '.join(diffs)}")
             sus = suspects_by_channel.get(ch, [])
             if sus:
+                # ★★ 우선 → ★ 다음 → 나머지 순으로 정렬하여 상위 6개 송신
+                def _prio(s):
+                    src = str(s.get("출처", ""))
+                    if src.startswith("★★"):
+                        return 0
+                    if src.startswith("★") or "★" in src:
+                        return 1
+                    return 2
+                sus_sorted = sorted(sus, key=_prio)
                 L.append("출처|환자|금액|단서")
-                for s in sus[:5]:
-                    clue = str(s.get("단서", ""))[:50].replace("|", " ")
-                    nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:8]
+                for s in sus_sorted[:6]:
+                    clue = str(s.get("단서", ""))[:70].replace("|", " ")
+                    nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
                     L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
 
     text = "\n".join(L)
@@ -1660,22 +1792,42 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=700):
     return text
 
 
-AI_SYSTEM = "병원 정산 분석관. 한솔(PG)·일마(프론트)·차트(EMR) 채널합계 차이의 원인 거래를 짧게 진단."
+AI_SYSTEM = (
+    "병원 정산 분석관. 한솔(PG)·일마(프론트)·차트(EMR) 채널합계 차이의 원인 거래를 짧게 진단. "
+    "출처 태그 우선순위는 절대규칙: ★★ > ★ > 일반. "
+    "★★(동일환자 확정)이 1건이라도 있으면 그것이 최종답이며, 반드시 TOP1에 환자명·차트번호와 함께 명시."
+)
 
-AI_USER = """3개 파일 채널 합계 대사:
+AI_USER = """3개 파일 채널 합계 대사 + 채널별 의심후보 표:
 
 {data}
+
+[출처 태그 의미 — 우선순위 순]
+- ★★ 동일환자 확정 / ★★ 동일환자 확정 페어 / ★★ 동일환자 확정(gap일치):
+    한솔 거래의 승인번호가 차트의 특정 환자와 일치하며, 일마에 동일 환자가 다른 금액으로 기재됨.
+    부분취소·오기재의 결정적 증거. 환자명·차트번호 확정. → 무조건 TOP1에 노출, "환자명(차트번호)" 명시.
+- ★ 차이값 정확매칭 페어:
+    한솔의 X원과 일마의 Y원의 차이가 채널 gap과 정확히 일치. 환자명은 추정. ★★ 없을 때 TOP1 후보.
+- 한솔에만 존재★ / 일마에만 존재★:
+    채널 gap과 금액 근접도가 높은 미매칭 거래. 환자 뒤 "✓"=승인번호로 확정, "?"=금액만으로 추정.
+- 그 외(★ 없음): 참고용. 환자명이 비어있거나 ?면 신뢰도 낮음.
+
+[추론 규칙]
+1. ★★ 항목이 보이면 그것이 정답이다. 환자명·차트번호·승인번호·말미를 그대로 결론에 옮긴다.
+2. ★★이 없고 ★(차이값 정확매칭 페어)가 있다면 그것을 TOP1으로 둔다.
+3. 의심후보 TOP3은 위 우선순위로만 선정한다. 환자명이 비어있는 항목은 가능하면 제외.
+4. "환자(추정)"이 여럿(A·B 형태)이면 모두 표기하되, 그 위의 ★★ 환자가 있으면 ★★ 환자가 우선.
 
 800토큰 이내, 다음 형식만 출력:
 
 ### 채널별 차이 진단
 각 차이가 0이 아닌 채널마다 ↓
 - **{{채널}}**: 한솔-차트=?원 / 한솔-일마=?원 / 일마-차트=?원
-  - 가장 유력한 원인: (예: "한솔 PG에 X원 결제건 누락" / "차트에서 카드↔현금 오기재")
-  - 의심 후보 TOP3 (출처/환자/금액/조치)
+  - 가장 유력한 원인: ★★/★ 항목의 환자명·차트번호·승인번호를 인용하여 한 문장.
+  - 의심 후보 TOP3 (출처/환자/금액/조치) — 반드시 ★★→★→일반 순.
 
 ### 결론 (1문장)
-어느 파일의 어느 거래를 수정해야 합계가 맞을지."""
+"<환자명>(<차트번호>)의 한솔 X원 vs 일마/차트 Y원을 확인·수정" 형식으로 단일 환자 지목."""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2017,7 +2169,16 @@ else:
             if not sus:
                 st.info("후보 거래가 추출되지 않았습니다. 원본 파일을 직접 확인하세요.")
             else:
-                sus_df = pd.DataFrame(sus)
+                # ★★ → ★ → 그 외 순으로 정렬해서 사용자가 한눈에 정답 후보부터 보도록
+                def _prio_row(s):
+                    src = str(s.get("출처", ""))
+                    if src.startswith("★★"):
+                        return 0
+                    if "★" in src:
+                        return 1
+                    return 2
+                sus_sorted = sorted(sus, key=_prio_row)
+                sus_df = pd.DataFrame(sus_sorted)
                 sus_df["금액"] = sus_df["금액"].apply(lambda v: f"{int(v):+,}")
                 # 환자명 컬럼 통합 (환자 / 환자(추정) 둘 중 하나)
                 if "환자" not in sus_df.columns and "환자(추정)" in sus_df.columns:
