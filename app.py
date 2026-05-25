@@ -2022,12 +2022,13 @@ else:
 
         col_a, col_b = st.columns([2, 1])
         with col_a:
+            default_key = st.secrets.get("GOOGLE_API_KEY", "") if "GOOGLE_API_KEY" in st.secrets else ""
             api_key = st.text_input(
                 "Google AI API Key",
                 type="password",
-                value=st.session_state.get("_api_key", "AIzaSyA7qOuf9itKxxQ4pGsoXtNSboQXZbQKcGE"),
+                value=st.session_state.get("_api_key", default_key),
                 key="_api_key",
-                help="https://aistudio.google.com/apikey 에서 무료 발급",
+                help="https://aistudio.google.com/apikey 에서 무료 발급 (Secrets 또는 여기 입력)",
             )
         with col_b:
             model_choice = st.selectbox(
