@@ -452,8 +452,14 @@ def parse_daily(raw):
         df = df[chart_valid | name_valid]
     df = df.reset_index(drop=True)
 
-    df["차트번호"] = df["차트번호"].apply(clean_no)
-    df["성명"] = df["성명"].apply(clean_name)
+    if "차트번호" in df.columns:
+        df["차트번호"] = df["차트번호"].apply(clean_no)
+    else:
+        df["차트번호"] = ""
+    if "성명" in df.columns:
+        df["성명"] = df["성명"].apply(clean_name)
+    else:
+        df["성명"] = ""
 
     order_col = next((c for c in df.columns if "내원" in str(c) and "순서" in str(c)), None)
     if order_col is None:
