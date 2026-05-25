@@ -1781,7 +1781,7 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
                     return 2
                 sus_sorted = sorted(sus, key=_prio)
                 L.append("출처|환자|금액|단서")
-                for s in sus_sorted[:6]:
+                for s in sus_sorted[:10]:
                     clue = str(s.get("단서", ""))[:70].replace("|", " ")
                     nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
                     L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
