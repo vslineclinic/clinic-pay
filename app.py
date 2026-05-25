@@ -1423,17 +1423,28 @@ def compute_channel_recon(totals):
     return pd.DataFrame(rows)
 
 
-def find_channel_suspects(channel, hansol, daily, patient, top_n=6):
+def _rank_key(amt, channel_gap):
+    """채널 차이값 근처 금액을 우선 + 동률시 큰 금액 우선.
+    예: gap=-27,400일 때 27,600(차이200) > 714,000(차이686,600).
+    """
+    a = abs(int(amt))
+    g = abs(int(channel_gap)) if channel_gap else 0
+    return (abs(a - g), -a)
+
+
+def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12):
     """채널 차이를 설명할 후보 거래 추출 (multiset diff 기반).
 
-    원리: 각 파일의 금액 multiset에서 짝지어지지 않는 금액만 추출.
-         이렇게 하면 의심 후보의 합이 실제 채널 합계 차이와 정확히 일치.
+    원리:
+      1. 한솔/일마 카드 금액 multiset에서 짝지어지지 않는 금액 추출
+         → 이 후보들의 합 = 실제 채널 합계 차이와 정확히 일치
+      2. 정렬은 채널 차이값 근접도 우선 — 작은 차이는 작은 후보를 우선해야 잡힘
+         (예: gap=-27,400원이면 27,600원이 714,000원보다 더 유력한 후보)
     """
     from collections import Counter
     suspects = []
 
     if channel == "카드":
-        # 1) 한솔(정상카드) vs 일마(카드>0) multiset diff
         h_ok = hansol[hansol["tx_status"] == "정상"] if "tx_status" in hansol.columns else hansol
         h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
         h_amts = [int(x) for x in h_card["금액"].tolist()] if not h_card.empty else []
@@ -1443,45 +1454,74 @@ def find_channel_suspects(channel, hansol, daily, patient, top_n=6):
         only_h = ch_h - ch_d
         only_d = ch_d - ch_h
 
-        # 한솔에만 (일마에 누락 의심)
+        # 채널 차이값 기준 (한솔-일마 또는 한솔-차트 중 0이 아닌 값)
+        gap = 0
+        if totals:
+            gap = totals.get("h_card", 0) - totals.get("d_card", 0)
+            if gap == 0:
+                gap = totals.get("h_card", 0) - totals.get("p_card", 0)
+
+        # 한솔에만 (일마에 누락 의심) — 차이값 근접도 우선 정렬
         h_remaining = h_card.copy()
-        for amt, cnt in sorted(only_h.items(), key=lambda x: -abs(x[0]))[:top_n]:
+        for amt, cnt in sorted(only_h.items(), key=lambda x: _rank_key(x[0], gap))[:top_n]:
             rows = h_remaining[h_remaining["금액"] == amt].head(cnt)
             for _, r in rows.iterrows():
                 cn = str(r.get("카드번호", ""))
                 cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                near = abs(abs(amt) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
+                tag = "한솔에만 존재★" if near else "한솔에만 존재"
                 suspects.append({
-                    "출처": "한솔에만 존재",
+                    "출처": tag,
                     "금액": int(amt),
                     "단서": f"{r.get('시간표시','')} 말미{cn_tail} 승인{r.get('승인번호','')} {str(r.get('카드사',''))[:6]}",
-                    "조치": "일마/차트에 같은 금액 결제 누락 → 추가 입력",
+                    "조치": "일마/차트에 같은 금액 누락 또는 부분취소 가능성",
                 })
 
         # 일마에만 (PG미경유 or 일마오기재)
-        for amt, cnt in sorted(only_d.items(), key=lambda x: -abs(x[0]))[:top_n]:
+        for amt, cnt in sorted(only_d.items(), key=lambda x: _rank_key(x[0], gap))[:top_n]:
             rows = daily[(daily["카드"] == amt)].head(cnt)
             for _, r in rows.iterrows():
+                near = abs(abs(amt) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
+                tag = "일마에만 존재★" if near else "일마에만 존재"
                 suspects.append({
-                    "출처": "일마에만 존재",
+                    "출처": tag,
                     "금액": int(amt),
                     "단서": f"차트{r['차트번호']} {str(r.get('성명',''))[:6]}",
-                    "조치": "PG 승인내역 없음 → 결제수단 오기재(현금/이체) 또는 미수납 확인",
+                    "조치": "PG 승인내역 없음 → 결제수단 오기재 또는 미수납",
                 })
 
-        # 2) 차트(환자집계) vs 일마 카드 분류 차이 (참고)
+        # 추가: 차이값 정확히 일치하는 후보 페어 (한솔의 X - 일마의 Y = gap)
+        # 예: 박인희 케이스 — 한솔 27,600 - 일마(같은환자) 55,000 = -27,400
+        if gap != 0 and only_h and only_d:
+            for h_amt in list(only_h.keys())[:20]:
+                for d_amt in list(only_d.keys())[:20]:
+                    if (h_amt - d_amt) == gap:
+                        suspects.insert(0, {
+                            "출처": "★ 차이값 정확매칭 페어",
+                            "금액": gap,
+                            "단서": f"한솔 {h_amt:,} 와 일마 {d_amt:,} 의 차이가 정확히 {gap:+,}",
+                            "조치": "두 거래가 같은 환자(부분취소·오기재 의심) — 즉시 확인",
+                        })
+
+        # 차트(환자집계) vs 일마 카드 분류 차이 (참고)
         if not patient.empty and not daily.empty and "분류" in patient.columns:
             p_card = patient[patient["분류"] == "카드"].groupby("차트번호")["금액"].sum()
             d_by_chart = daily.groupby("차트번호")["카드"].sum()
-            common = set(p_card.index) & set(d_by_chart.index) - {""}
+            common = (set(p_card.index) & set(d_by_chart.index)) - {""}
+            mismatches = []
             for ch in common:
                 pv, dv = int(p_card.get(ch, 0)), int(d_by_chart.get(ch, 0))
                 if pv != dv:
-                    suspects.append({
-                        "출처": "차트↔일마 분류차이",
-                        "금액": dv - pv,
-                        "단서": f"차트{ch} (차트={pv:,} / 일마={dv:,})",
-                        "조치": "결제수단(카드↔현금↔이체) 오기재 가능성",
-                    })
+                    mismatches.append((ch, pv, dv))
+            # 차트↔일마 차이도 channel gap 근접도 우선
+            mismatches.sort(key=lambda x: _rank_key(x[2] - x[1], gap))
+            for ch, pv, dv in mismatches[:top_n]:
+                suspects.append({
+                    "출처": "차트↔일마 분류차이",
+                    "금액": dv - pv,
+                    "단서": f"차트{ch} (차트={pv:,} / 일마={dv:,})",
+                    "조치": "결제수단(카드↔현금↔이체) 오기재 가능성",
+                })
 
     elif channel == "현금+이체":
         if not patient.empty and not daily.empty:
@@ -1838,7 +1878,7 @@ if "done" not in st.session_state:
                 totals = compute_totals(hansol, daily, daily_refund, patient)
                 channel_df = compute_channel_recon(totals)
                 suspects_by_channel = {
-                    ch: find_channel_suspects(ch, hansol, daily, patient)
+                    ch: find_channel_suspects(ch, hansol, daily, patient, totals=totals)
                     for ch in ["카드", "현금+이체", "플랫폼"]
                 }
 
