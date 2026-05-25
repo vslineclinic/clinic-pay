@@ -1778,10 +1778,9 @@ def _cache_set(k, v):
 
 def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", allow_fallback=True):
     """무료 한도 친화: 캐시 → 호출 → 한도초과 시 다른 무료 모델로 자동 폴백."""
-    import time as _t
     import hashlib
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
+    from google import genai
+    from google.genai import types
 
     prompt = AI_USER.format(data=data_text)
     if question:
@@ -1797,6 +1796,8 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
         st.session_state["_ai_cv"] = p
         return p, model + " (cache)"
 
+    client = genai.Client(api_key=api_key)
+
     # 폴백 순서: 사용자 선택 모델 우선, 그 후 권장 순서
     if allow_fallback:
         try_order = [model] + [m for m in GEMINI_FALLBACK_ORDER if m != model]
@@ -1806,14 +1807,16 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
     last_err = None
     for try_model in try_order:
         rpm = GEMINI_MODELS.get(try_model, {}).get("rpm", 10)
-        m = genai.GenerativeModel(model_name=try_model, system_instruction=AI_SYSTEM)
         _gemini_wait(rpm_limit=rpm)
         # 모델당 1회만 시도 (재시도 대기 누적 방지) → 즉시 다음 모델로
         try:
-            r = m.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=800, temperature=0.2,
+            r = client.models.generate_content(
+                model=try_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=AI_SYSTEM,
+                    max_output_tokens=800,
+                    temperature=0.2,
                 ),
             )
             out = r.text
