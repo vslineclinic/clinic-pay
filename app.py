@@ -2106,10 +2106,14 @@ def build_patient_compare(daily, patient, daily_refund=None):
 def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, matched_dc,
                                   missing_all, missing_only, pc, unified_info,
                                   daily_refund=None, h_cancel=None):
-    """한솔-일마-차트 3개 소스를 모두 종합하여 미매칭/의심건을 통합 분석.
+    """3-Way 종합 미매칭 분석 (오류 우선순위 기반).
 
-    모든 환자(차트번호)에 대해 3개 소스 정보를 유기적으로 연결하고,
-    명확하게 의심되는 누락·오기재 건을 우선순위와 함께 반환한다.
+    우선순위 체계:
+      🔴P1 한솔↔차트 — 차트(EMR)에 카드 있는데 한솔(PG) 매칭 실패 / 카드 금액 차이 / 카드사 불일치
+                       ※ 차트마감 = 기준원장이므로 P1이 가장 중요
+      🟠P2 한솔↔일마 — 한솔 미매칭(수납누락 의심) / 일마 미매칭(PG미경유 의심)
+      🟡참고 일마↔차트 — 한솔 비경유 플랫폼 결제 차이만 부각 (카드/현금 차이는 P1/P2에서 다룸)
+      🟡기타 차트번호 오기재 / 취소거래 검증
     """
     findings = []
 
@@ -2117,63 +2121,11 @@ def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, ma
     h_um = h_ok[~h_ok["h_idx"].isin(matched_h)]
     d_um = daily[(daily["카드"] > 0) & (~daily["d_idx"].isin(matched_dc))]
 
-    # ── (A) 한솔 미매칭: PG에 승인되었으나 일마에 없는 건 → 수납 누락 의심 ──
-    for _, r in h_um.iterrows():
-        amt = int(r["금액"])
-        time_str = r.get("시간표시", "")
-        card_no = str(r.get("카드번호", ""))[:12] if pd.notna(r.get("카드번호")) else ""
-        appr = str(r.get("승인번호", "")).strip() if pd.notna(r.get("승인번호")) else ""
-        is_cash = r.get("is_현금", False)
-        pay_type = "현금영수증" if is_cash else "카드"
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 🔴 P1: 한솔(PG) vs 차트(EMR) — ★최우선
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # 차트에서 이 승인번호로 찾을 수 있는지 확인
-        chart_match = ""
-        if appr:
-            for _, pr in patient.iterrows():
-                if isinstance(pr.get("승인번호목록"), list) and appr in pr["승인번호목록"]:
-                    chart_match = f"차트 {pr['차트번호']} {pr['이름']} 에서 승인번호 발견"
-                    break
-
-        findings.append({
-            "우선순위": "🔴높음",
-            "유형": "한솔 미매칭 (수납누락 의심)",
-            "차트번호": "",
-            "환자명": "",
-            "한솔정보": f"{pay_type} {time_str} {amt:,}원" + (f" 승인#{appr}" if appr else ""),
-            "일마정보": "❌ 매칭 없음",
-            "차트정보": chart_match if chart_match else "❌ 미확인",
-            "의심금액": amt,
-            "상세사유": f"PG사({pay_type})에 {amt:,}원 정상승인되었으나 일일마감에 미기재 → 수납 누락 가능성",
-        })
-
-    # ── (B) 일마 미매칭: 프론트에서 카드수납 했으나 한솔에 없는 건 ──
-    for _, r in d_um.iterrows():
-        ch = str(r.get("차트번호", ""))
-        nm = str(r.get("성명", ""))
-        card_amt = int(r.get("카드", 0))
-
-        # 차트에서 이 환자 정보 찾기
-        p_rows = patient[patient["차트번호"] == ch]
-        chart_info = ""
-        if not p_rows.empty:
-            p_card = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum())
-            chart_info = f"차트 카드 {p_card:,}원"
-        else:
-            chart_info = "❌ 차트 없음"
-
-        findings.append({
-            "우선순위": "🔴높음",
-            "유형": "일마 미매칭 (PG미경유 의심)",
-            "차트번호": ch,
-            "환자명": nm,
-            "한솔정보": "❌ 매칭 없음",
-            "일마정보": f"카드 {card_amt:,}원",
-            "차트정보": chart_info,
-            "의심금액": card_amt,
-            "상세사유": f"일마에 카드 {card_amt:,}원 기재되었으나 PG사(한솔)에 해당 거래 없음 → 수기수납 또는 결제수단 오기재 가능성",
-        })
-
-    # ── (C) 한솔↔차트 누락: 차트에 카드수납이 있으나 한솔에서 매칭 안 됨 ──
+    # (P1-A) 차트엔 카드 있는데 한솔 매칭 실패 / 금액 차이
     if not missing_only.empty:
         for _, r in missing_only.iterrows():
             ch = str(r.get("차트번호", ""))
@@ -2184,19 +2136,13 @@ def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, ma
             status = str(r.get("매칭상태", ""))
             reason = str(r.get("불일치원인", ""))
 
-            # 일마에서 이 환자 찾기
+            # 일마에서 이 환자 찾기 (P2 보조 정보)
             d_rows = daily[daily["차트번호"] == ch]
-            daily_info = ""
-            if not d_rows.empty:
-                d_card = int(d_rows["카드"].sum())
-                daily_info = f"일마 카드 {d_card:,}원"
-            else:
-                daily_info = "❌ 일마 없음"
+            daily_info = f"일마 카드 {int(d_rows['카드'].sum()):,}원" if not d_rows.empty else "❌ 일마 없음"
 
-            prio = "🟠중간" if hansol_amt > 0 else "🔴높음"
             findings.append({
-                "우선순위": prio,
-                "유형": f"한솔↔차트 불일치 ({status})",
+                "우선순위": "🔴P1",
+                "유형": f"P1 한솔vs차트 ({status})",
                 "차트번호": ch,
                 "환자명": nm,
                 "한솔정보": f"매칭 {hansol_amt:,}원" if hansol_amt > 0 else "❌ 매칭 없음",
@@ -2206,69 +2152,91 @@ def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, ma
                 "상세사유": f"차트 카드 {chart_card:,}원 vs 한솔 매칭 {hansol_amt:,}원 → 차이 {diff:,}원" + (f" ({reason})" if reason else ""),
             })
 
-    # ── (D) 일마↔차트 결제수단 불일치: 수단별 금액이 다른 환자 ──
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 🟠 P2: 한솔(PG) vs 일마(프론트)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # (P2-A) 한솔 미매칭: PG에 승인되었으나 일마에 없음 → 수납 누락 의심
+    for _, r in h_um.iterrows():
+        amt = int(r["금액"])
+        time_str = r.get("시간표시", "")
+        appr = str(r.get("승인번호", "")).strip() if pd.notna(r.get("승인번호")) else ""
+        is_cash = r.get("is_현금", False)
+        pay_type = "현금영수증" if is_cash else "카드"
+
+        # 승인번호로 차트 역추적 (P1 cross-check)
+        chart_match = ""
+        chart_ch_found = ""
+        if appr:
+            for _, pr in patient.iterrows():
+                if isinstance(pr.get("승인번호목록"), list) and appr in pr["승인번호목록"]:
+                    chart_ch_found = str(pr["차트번호"])
+                    chart_match = f"차트 {pr['차트번호']} {pr['이름']} 에서 승인번호 발견 → P1 영향"
+                    break
+
+        findings.append({
+            "우선순위": "🟠P2",
+            "유형": "P2-A 한솔미매칭 (일마 수납누락 의심)",
+            "차트번호": chart_ch_found,
+            "환자명": "",
+            "한솔정보": f"{pay_type} {time_str} {amt:,}원" + (f" 승인#{appr}" if appr else ""),
+            "일마정보": "❌ 매칭 없음",
+            "차트정보": chart_match if chart_match else "❌ 미확인",
+            "의심금액": amt,
+            "상세사유": f"PG사({pay_type}) {amt:,}원 정상승인 / 일마 미기재 → 수납 누락 의심",
+        })
+
+    # (P2-B) 일마 미매칭: 일마에 카드 있으나 한솔에 없음 → PG미경유/오기재 의심
+    for _, r in d_um.iterrows():
+        ch = str(r.get("차트번호", ""))
+        nm = str(r.get("성명", ""))
+        card_amt = int(r.get("카드", 0))
+
+        p_rows = patient[patient["차트번호"] == ch]
+        if not p_rows.empty:
+            p_card = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum())
+            chart_info = f"차트 카드 {p_card:,}원"
+        else:
+            chart_info = "❌ 차트 없음"
+
+        findings.append({
+            "우선순위": "🟠P2",
+            "유형": "P2-B 일마미매칭 (PG미경유 의심)",
+            "차트번호": ch,
+            "환자명": nm,
+            "한솔정보": "❌ 매칭 없음",
+            "일마정보": f"카드 {card_amt:,}원",
+            "차트정보": chart_info,
+            "의심금액": card_amt,
+            "상세사유": f"일마 카드 {card_amt:,}원 / 한솔 거래 없음 → 수기수납·결제수단 오기재 가능성",
+        })
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 🟡 참고: 일마(프론트) vs 차트(EMR) — 한솔 비경유 플랫폼 결제만 추출
+    #   카드/현금 차이는 이미 P1/P2에서 다루므로 여기서는 제외
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if not pc.empty:
-        mismatch_pc = pc[pc["불일치상세"] != "✅일치"].copy()
-        for _, r in mismatch_pc.iterrows():
+        for _, r in pc.iterrows():
+            i_plat = int(r.get("[일마]플랫폼", 0) or 0)
+            c_plat = int(r.get("[차트]플랫폼", 0) or 0)
+            if i_plat == c_plat:
+                continue
+            plat_diff = i_plat - c_plat
             ch = str(r.get("차트번호", ""))
-            nm = str(r.get("성명", ""))
-            detail = str(r.get("불일치상세", ""))
-            matching = str(r.get("매칭", ""))
-
-            # 이미 (B)나 (C)에서 다룬 환자인지 확인 (중복 방지)
-            already_found = any(
-                f.get("차트번호") == ch and f.get("유형") != "일마↔차트 수단별 불일치"
-                for f in findings if f.get("차트번호")
-            )
-
-            # 일마 금액
-            i_card = int(r.get("[일마]카드", 0))
-            i_cash_xfer = int(r.get("[일마]현금+이체", 0)) if "[일마]현금+이체" in r.index else 0
-            # 차트 금액
-            c_card = int(r.get("[차트]카드", 0))
-            c_cash_xfer = int(r.get("[차트]현금+이체", 0)) if "[차트]현금+이체" in r.index else 0
-
-            # 카드 불일치 금액
-            card_diff = i_card - c_card
-
-            # 환자 전체 합계 불일치 확인
-            i_total = int(r.get("[일마]합계", 0)) if "[일마]합계" in r.index else 0
-            c_total = int(r.get("[차트]합계", 0)) if "[차트]합계" in r.index else 0
-            total_diff = i_total - c_total
-
-            # 한솔 매칭 정보 찾기
-            h_info = ""
-            if not match_df.empty and "일마_차트" in match_df.columns:
-                h_matches = match_df[match_df["일마_차트"].apply(clean_no) == ch]
-                if not h_matches.empty:
-                    h_amt = int(h_matches["한솔_금액"].sum())
-                    h_info = f"한솔 매칭 {h_amt:,}원"
-                else:
-                    h_info = "한솔 매칭 없음"
-
-            if matching in ["❌차트누락", "❌일마누락"]:
-                prio = "🔴높음"
-                stype = f"소스 누락 ({matching})"
-            elif total_diff != 0:
-                prio = "🟠중간"
-                stype = "금액 불일치"
-            else:
-                prio = "🟡낮음"
-                stype = "수단 오분류 (합계일치)"
-
+            nm = str(r.get("성명", "") or r.get("성명_차트", ""))
             findings.append({
-                "우선순위": prio,
-                "유형": f"일마↔차트 수단별 불일치",
+                "우선순위": "🟡참고",
+                "유형": "참고 일마vs차트 (플랫폼)",
                 "차트번호": ch,
                 "환자명": nm,
-                "한솔정보": h_info,
-                "일마정보": f"카드 {i_card:,} / 현금+이체 {i_cash_xfer:,}",
-                "차트정보": f"카드 {c_card:,} / 현금+이체 {c_cash_xfer:,}",
-                "의심금액": abs(total_diff) if total_diff != 0 else abs(card_diff),
-                "상세사유": f"{detail}" + (f" (합계차이 {total_diff:+,}원)" if total_diff != 0 else " (합계는 일치, 수단분류만 다름)"),
+                "한솔정보": "— (한솔 비경유)",
+                "일마정보": f"플랫폼 {i_plat:,}원",
+                "차트정보": f"플랫폼 {c_plat:,}원",
+                "의심금액": abs(plat_diff),
+                "상세사유": f"플랫폼 결제 차이 {plat_diff:+,}원 — 한솔 비경유 결제수단이므로 일마↔차트로만 검증",
             })
 
-    # ── (E) 차트번호 불일치: 일마/차트 간 같은 환자인데 차트번호가 다른 경우 ──
+    # ── 기타: 차트번호 불일치(동일환자) ──
     d_ch = set(daily["차트번호"].unique())
     p_ch = set(patient["차트번호"].unique())
     dn = dict(zip(daily["차트번호"], daily["성명"]))
@@ -2280,7 +2248,7 @@ def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, ma
         for pc_no in p_ch - d_ch:
             if clean_name(nm) == clean_name(pn.get(pc_no, "")) and similar_chart_no(dc, pc_no):
                 findings.append({
-                    "우선순위": "🟠중간",
+                    "우선순위": "🟡기타",
                     "유형": "차트번호 불일치 (동일환자)",
                     "차트번호": f"{dc} / {pc_no}",
                     "환자명": nm,
@@ -2288,32 +2256,28 @@ def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, ma
                     "일마정보": f"차트번호 {dc}",
                     "차트정보": f"차트번호 {pc_no}",
                     "의심금액": 0,
-                    "상세사유": f"동일 환자({nm})가 일마에서는 {dc}, 차트에서는 {pc_no}로 기재 → 차트번호 오기재 또는 이중차트",
+                    "상세사유": f"동일 환자({nm})가 일마={dc}, 차트={pc_no} → 차트번호 오기재 또는 이중차트",
                 })
 
-    # ── (F) 취소/환불 교차검증 ──
+    # ── 기타: 취소/환불 교차검증 ──
     if h_cancel is not None and not h_cancel.empty:
         for _, r in h_cancel.iterrows():
             amt = int(r["금액"])
             time_str = r.get("시간표시", "")
-            # 일마 환불에서 대응 건 찾기
-            d_refund_match = ""
-            if daily_refund is not None and not daily_refund.empty:
-                d_refund_match = f"일마 환불 총 {int(daily_refund['총액'].sum()):,}원"
-            # 차트 환불에서 대응 건 찾기
+            d_refund_match = f"일마 환불 총 {int(daily_refund['총액'].sum()):,}원" if daily_refund is not None and not daily_refund.empty else "-"
             p_cancel_rows = patient[patient["is_취소"]] if "is_취소" in patient.columns else pd.DataFrame()
             p_cancel_info = f"차트 환불 {int(abs(p_cancel_rows['금액'].sum())):,}원" if not p_cancel_rows.empty else "차트 환불 없음"
 
             findings.append({
-                "우선순위": "🟡낮음",
+                "우선순위": "🟡기타",
                 "유형": "취소거래 검증",
                 "차트번호": "",
                 "환자명": "",
                 "한솔정보": f"취소 {time_str} {amt:,}원",
-                "일마정보": d_refund_match if d_refund_match else "-",
+                "일마정보": d_refund_match,
                 "차트정보": p_cancel_info,
                 "의심금액": amt,
-                "상세사유": f"한솔 취소 {amt:,}원 → 일마·차트 환불기록과 대조 필요",
+                "상세사유": f"한솔 취소 {amt:,}원 → 일마·차트 환불기록 대조 필요",
             })
 
     if not findings:
@@ -2321,13 +2285,12 @@ def build_comprehensive_mismatch(hansol, daily, patient, match_df, matched_h, ma
                                       "일마정보", "차트정보", "의심금액", "상세사유"])
 
     result = pd.DataFrame(findings)
-    # 우선순위 정렬: 높음 > 중간 > 낮음, 같으면 금액 내림차순
-    prio_order = {"🔴높음": 0, "🟠중간": 1, "🟡낮음": 2}
+    # 우선순위 정렬: P1 > P2 > 참고 > 기타, 같으면 금액 내림차순
+    prio_order = {"🔴P1": 0, "🟠P2": 1, "🟡참고": 2, "🟡기타": 3}
     result["_prio"] = result["우선순위"].map(prio_order).fillna(9)
     result = result.sort_values(["_prio", "의심금액"], ascending=[True, False]).drop(columns=["_prio"]).reset_index(drop=True)
 
     # 중복 제거: 같은 차트번호 + 같은 유형이면 금액이 큰 것만 유지
-    # (단, 차트번호가 빈 건은 중복 제거 안 함)
     seen = set()
     dedup_idx = []
     for idx, row in result.iterrows():
@@ -2407,79 +2370,183 @@ def build_refund_detail(daily_refund, patient):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _build_cross_reference_sheet(match_df, patient, hansol, unified_info=None):
-    """크로스레퍼런스 시트: 차트번호별 모든 연결 정보를 한눈에 볼 수 있게 구성"""
-    if match_df.empty:
-        return pd.DataFrame()
+def _build_cross_reference_sheet(match_df, patient, hansol, unified_info=None, daily=None):
+    """크로스레퍼런스 시트 — 오류 우선순위 기반 차트번호별 통합 뷰.
 
+    설계 원칙:
+      • 차트번호가 마스터 키. 한 차트번호에 여러 카드/플랫폼 결제가 있을 수 있다 (복합결제).
+      • 차트 승인번호 → 한솔 카드번호 → 차트번호로 카드결제건들을 연결.
+      • 플랫폼 결제는 한솔 비경유 → 일마↔차트로만 비교(참고).
+
+    출력 컬럼 그룹:
+      [차트정보] 차트_카드금액·차트_플랫폼금액·차트_승인번호·차트_카드사·차트_카드건수
+      [한솔정보] 한솔_매칭금액·한솔_카드번호·한솔_카드사·한솔_승인번호·한솔_매칭건수
+      [일마정보] 일마_카드금액·일마_플랫폼금액·일마_현금이체금액
+      [P1] 한솔카드 vs 차트카드 차이/상태 (★최우선)
+      [P2] 한솔카드 vs 일마카드 차이/상태
+      [참고] 일마플랫폼 vs 차트플랫폼 차이 (한솔 비경유)
+    """
     rows = []
-    # 차트번호별 매칭 정보 집계
     charts = set()
-    if "일마_차트" in match_df.columns:
+    if match_df is not None and not match_df.empty and "일마_차트" in match_df.columns:
         charts = set(match_df["일마_차트"].apply(clean_no).unique())
-    for ch in patient["차트번호"].unique():
-        charts.add(clean_no(ch))
+    if patient is not None and not patient.empty and "차트번호" in patient.columns:
+        for ch in patient["차트번호"].unique():
+            charts.add(clean_no(ch))
+    if daily is not None and not daily.empty and "차트번호" in daily.columns:
+        for ch in daily["차트번호"].unique():
+            charts.add(clean_no(ch))
+    if not charts:
+        return pd.DataFrame()
 
     for ch in sorted(charts):
         if not ch:
             continue
-        # 차트마감 정보
-        p_rows = patient[patient["차트번호"] == ch]
+
+        # ── 차트마감(EMR) — 기준원장 ──
+        p_rows = patient[patient["차트번호"] == ch] if patient is not None else pd.DataFrame()
         p_name = p_rows["이름"].iloc[0] if not p_rows.empty else ""
-        # 통합정보에서 이름 보완: 차트에 이름이 없으면 일마/매칭결과에서 가져옴
         if not p_name and unified_info and ch in unified_info:
             p_name = unified_info[ch].get("best_name", "")
-        p_card_amt = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum())
-        p_cash_amt = int(p_rows[p_rows["분류"] == "현금"]["금액"].sum())
-        p_xfer_amt = int(p_rows[p_rows["분류"] == "이체"]["금액"].sum())
-        p_plat_amt = int(p_rows[p_rows["분류"] == "플랫폼"]["금액"].sum())
-        p_total = int(p_rows["금액"].sum())
+        p_card_rows = p_rows[p_rows["분류"] == "카드"] if not p_rows.empty else pd.DataFrame()
+        p_card_amt = int(p_card_rows["금액"].sum()) if not p_card_rows.empty else 0
+        p_card_cnt = len(p_card_rows)
+        p_cash_amt = int(p_rows[p_rows["분류"] == "현금"]["금액"].sum()) if not p_rows.empty else 0
+        p_xfer_amt = int(p_rows[p_rows["분류"] == "이체"]["금액"].sum()) if not p_rows.empty else 0
+        p_plat_rows = p_rows[p_rows["분류"] == "플랫폼"] if not p_rows.empty else pd.DataFrame()
+        p_plat_amt = int(p_plat_rows["금액"].sum()) if not p_plat_rows.empty else 0
+        p_plat_kinds = sorted({str(x).strip() for x in p_plat_rows.get("플랫폼구분", []) if str(x).strip()})
+        p_total = int(p_rows["금액"].sum()) if not p_rows.empty else 0
         p_apprs = []
-        for _, pr in p_rows.iterrows():
+        for _, pr in p_card_rows.iterrows():
             if isinstance(pr.get("승인번호목록"), list):
-                p_apprs.extend(pr["승인번호목록"])
-        p_card_cos = [str(x) for x in p_rows[p_rows["분류"] == "카드"]["카드사"].unique() if str(x).strip()]
+                p_apprs.extend([clean_no(a) for a in pr["승인번호목록"] if clean_no(a)])
+        p_apprs = sorted(set(p_apprs))
+        p_card_cos = sorted({str(x).strip() for x in p_card_rows.get("카드사", []) if str(x).strip()})
 
-        # 매칭 정보 (카드 매칭만 카드금액 비교에 사용, 현금영수증 매칭은 별도)
-        m_rows = match_df[match_df["일마_차트"].apply(clean_no) == ch] if "일마_차트" in match_df.columns else pd.DataFrame()
+        # ── 한솔(PG) — 차트번호와 연결된 카드 매칭건 ──
+        m_rows = match_df[match_df["일마_차트"].apply(clean_no) == ch] if match_df is not None and not match_df.empty and "일마_차트" in match_df.columns else pd.DataFrame()
         m_card_rows = m_rows[m_rows["한솔_유형"] != "현금영수증"] if not m_rows.empty and "한솔_유형" in m_rows.columns else m_rows
-        m_card_amt = int(m_card_rows["한솔_금액"].sum()) if not m_card_rows.empty else 0
-        m_count = len(m_rows)
-        m_card_nos = list(set(clean_no(str(x))[:12] for x in m_rows.get("한솔_카드번호", []) if clean_no(str(x))))
-        m_apprs = list(set(str(x) for x in m_rows.get("한솔_승인번호", []) if str(x).strip()))
-        m_rules = list(m_rows["매칭규칙"].unique()) if not m_rows.empty else []
-        m_confs = list(m_rows["확신도"].unique()) if not m_rows.empty else []
+        h_match_amt = int(m_card_rows["한솔_금액"].sum()) if not m_card_rows.empty else 0
+        h_match_cnt = len(m_card_rows)
+        h_card_nos = sorted({clean_no(str(x))[:12] for x in m_rows.get("한솔_카드번호", []) if clean_no(str(x))})
+        h_apprs = sorted({str(x).strip() for x in m_rows.get("한솔_승인번호", []) if str(x).strip() and str(x).strip() != "nan"})
+        h_card_cos = sorted({str(x).strip() for x in m_card_rows.get("한솔_카드사", []) if str(x).strip() and str(x).strip() != "nan"})
+        m_rules = sorted({str(x) for x in m_rows.get("매칭규칙", []) if str(x).strip()})
 
-        # 통합정보에서 카드번호·승인번호 보완 (매칭결과에 없는 정보도 통합)
+        # 통합정보에서 카드번호·승인번호 보완 (승인번호 매핑을 통해 한솔 카드번호 추가 연결)
         if unified_info and ch in unified_info:
             ui = unified_info[ch]
-            # 매칭 카드번호에 통합정보 카드번호 추가
-            all_card_nos = set(m_card_nos) | ui.get("card_numbers", set())
-            m_card_nos = sorted(all_card_nos)
-            # 매칭 승인번호에 통합정보 승인번호 추가
-            all_apprs = set(m_apprs) | ui.get("approval_numbers", set())
-            m_apprs = sorted(all_apprs)
+            h_card_nos = sorted(set(h_card_nos) | ui.get("card_numbers", set()))
+            h_apprs = sorted(set(h_apprs) | ui.get("approval_numbers", set()))
+            h_card_cos = sorted(set(h_card_cos) | ui.get("card_companies", set()))
+
+        # ── 일마(프론트) ──
+        d_rows = daily[daily["차트번호"] == ch] if daily is not None and not daily.empty and "차트번호" in daily.columns else pd.DataFrame()
+        d_card_amt = int(d_rows["카드"].sum()) if not d_rows.empty and "카드" in d_rows.columns else 0
+        d_cash_xfer = int(d_rows.get("현금", pd.Series([0])).sum()) + int(d_rows.get("이체", pd.Series([0])).sum()) if not d_rows.empty else 0
+        d_plat_amt = int(d_rows["플랫폼합"].sum()) if not d_rows.empty and "플랫폼합" in d_rows.columns else 0
+
+        # ── P1: 한솔카드 vs 차트카드 (★최우선) ──
+        p1_diff = h_match_amt - p_card_amt
+        if p_card_amt == 0 and h_match_amt == 0:
+            p1_status = "—"  # 둘 다 카드 없음
+        elif p_card_amt == h_match_amt and p_card_amt > 0:
+            p1_status = "✅일치"
+        elif h_match_amt == 0 and p_card_amt > 0:
+            p1_status = "❌한솔누락"  # 차트엔 카드, 한솔엔 없음
+        elif p_card_amt == 0 and h_match_amt > 0:
+            p1_status = "❌차트누락"  # 한솔엔 카드, 차트엔 없음
+        else:
+            p1_status = "⚠️금액차이"
+
+        # 카드사 검증 (P1 보조)
+        card_co_chk = "—"
+        if h_card_cos and p_card_cos:
+            if any(card_company_match(h, p) for h in h_card_cos for p in p_card_cos):
+                card_co_chk = "✅"
+            else:
+                card_co_chk = "⚠️불일치"
+
+        # ── P2: 한솔카드 vs 일마카드 ──
+        p2_diff = h_match_amt - d_card_amt
+        if d_card_amt == 0 and h_match_amt == 0:
+            p2_status = "—"
+        elif d_card_amt == h_match_amt and d_card_amt > 0:
+            p2_status = "✅일치"
+        elif h_match_amt == 0 and d_card_amt > 0:
+            p2_status = "❌한솔누락"  # 일마엔 카드, 한솔엔 없음(PG미경유)
+        elif d_card_amt == 0 and h_match_amt > 0:
+            p2_status = "❌일마누락"  # 한솔엔 카드, 일마엔 없음(수납누락)
+        else:
+            p2_status = "⚠️금액차이"
+
+        # ── 참고: 일마플랫폼 vs 차트플랫폼 ──
+        plat_diff = d_plat_amt - p_plat_amt
+        if d_plat_amt == 0 and p_plat_amt == 0:
+            plat_status = "—"
+        elif d_plat_amt == p_plat_amt:
+            plat_status = "✅일치"
+        else:
+            plat_status = "⚠️플랫폼차이"
+
+        # 종합 상태 (오류 우선순위 반영)
+        if p1_status.startswith("❌") or p1_status.startswith("⚠️"):
+            overall = f"🔴P1:{p1_status}"
+        elif p2_status.startswith("❌") or p2_status.startswith("⚠️"):
+            overall = f"🟠P2:{p2_status}"
+        elif plat_status.startswith("⚠️"):
+            overall = f"🟡참고:{plat_status}"
+        else:
+            overall = "✅일치"
 
         rows.append({
             "차트번호": ch,
             "환자명": p_name,
+            # [P1] 한솔↔차트 (★최우선)
+            "P1_한솔vs차트": p1_status,
+            "P1_차이": p1_diff,
+            "카드사검증": card_co_chk,
+            # [P2] 한솔↔일마
+            "P2_한솔vs일마": p2_status,
+            "P2_차이": p2_diff,
+            # [참고] 일마↔차트 플랫폼
+            "참고_플랫폼": plat_status,
+            "참고_플랫폼차이": plat_diff,
+            # [차트정보 - 기준]
             "차트_카드금액": p_card_amt,
+            "차트_카드건수": p_card_cnt,
+            "차트_플랫폼금액": p_plat_amt,
+            "차트_플랫폼종류": ", ".join(p_plat_kinds),
             "차트_현금금액": p_cash_amt,
             "차트_이체금액": p_xfer_amt,
-            "차트_플랫폼금액": p_plat_amt,
             "차트_총액": p_total,
             "차트_승인번호": ", ".join(p_apprs),
             "차트_카드사": ", ".join(p_card_cos),
-            "매칭_건수": m_count,
-            "매칭_금액합": m_card_amt,
-            "매칭_카드번호": ", ".join(m_card_nos),
-            "매칭_승인번호": ", ".join(m_apprs),
-            "매칭_규칙": ", ".join(m_rules),
-            "매칭_확신도": ", ".join(m_confs),
-            "차이(차트-매칭)": p_card_amt - m_card_amt,
-            "상태": "✅일치" if p_card_amt == m_card_amt else ("⚠️차이" if m_card_amt > 0 else "❌미매칭"),
+            # [한솔정보 - 매칭]
+            "한솔_매칭금액": h_match_amt,
+            "한솔_매칭건수": h_match_cnt,
+            "한솔_카드번호": ", ".join(h_card_nos),
+            "한솔_카드사": ", ".join(h_card_cos),
+            "한솔_승인번호": ", ".join(h_apprs),
+            "매칭규칙": ", ".join(m_rules),
+            # [일마정보]
+            "일마_카드금액": d_card_amt,
+            "일마_플랫폼금액": d_plat_amt,
+            "일마_현금이체": d_cash_xfer,
+            # 종합
+            "상태": overall,
         })
-    return pd.DataFrame(rows)
+
+    if not rows:
+        return pd.DataFrame()
+    df_out = pd.DataFrame(rows)
+    # 우선순위 정렬: 🔴P1 > 🟠P2 > 🟡참고 > ✅
+    _ord = {"🔴": 0, "🟠": 1, "🟡": 2, "✅": 3}
+    df_out["_o"] = df_out["상태"].apply(lambda s: _ord.get(str(s)[:1], 9))
+    df_out["_a"] = df_out["P1_차이"].abs() + df_out["P2_차이"].abs()
+    df_out = df_out.sort_values(["_o", "_a"], ascending=[True, False]).drop(columns=["_o", "_a"]).reset_index(drop=True)
+    return df_out
 
 
 def _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_dc):
@@ -2542,207 +2609,192 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
 
-        # ── Sheet 1: AI_안내 (간결한 데이터 사전 + 한도 안내) ──
+        # ── Sheet 0: AI_안내 (오류 우선순위 체계) ──
         guide_rows = [
-            ["시스템", "병원 정산 3-Way 대사 v3.1 (Gemini 무료한도 최적화)"],
+            ["시스템", "병원 정산 3-Way 대사 v3.2 (오류 우선순위 기반)"],
             ["분석일시", datetime.now().strftime("%Y-%m-%d %H:%M")],
-            ["목적", "한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 총합 불일치 거래건 추적"],
-            ["기준 원장", "차트마감(EMR)이 최종 기준"],
-            ["연결 키", "승인번호→한솔↔차트, 차트번호→일마↔차트, 카드번호→동일환자 다건"],
-            ["AI 한도 대응", "각 시트의 ✅일치 행은 요약 1줄로 압축, 불일치만 상세 표시"],
+            ["목적", "한솔(PG)·일마(프론트)·차트(EMR) 3-Way 차이의 원인 환자 특정"],
+            ["기준 원장", "차트마감(EMR) = 최종 기준"],
             ["", ""],
-            ["[시트 안내] ★=AI가 먼저 봐야 할 시트", ""],
-            ["1_한솔페이(불일치)", "PG 거래 중 미매칭·의심건만 (매칭건 요약만)"],
-            ["2_일일마감(불일치)", "프론트 수납 중 미매칭·불일치건만"],
-            ["3_차트마감(불일치)", "EMR 중 불일치 환자만"],
-            ["4_매칭결과", "한솔↔일마 자동매칭 결과"],
-            ["5_한솔미매칭", "★한솔에만 있는 건 → 최우선 점검"],
-            ["6_일마미매칭", "일마에만 있는 건 → PG 미경유 확인"],
-            ["7_한솔vs차트", "차트 기준 한솔 매칭 비교 (일치 행은 요약)"],
-            ["8_일마vs차트", "수단별 교차비교 (일치 행은 요약)"],
-            ["9_종합분석", "3소스 종합 미매칭 (우선순위 순)"],
-            ["10_합계비교", "★전체 균형 확인 (여기서 시작)"],
-            ["11_크로스레퍼런스", "★차트번호별 통합뷰 (일치 행은 요약 1줄)"],
-            ["12_무결성검증", "데이터 정확도 검증"],
+            ["[★오류 탐색 우선순위]", ""],
+            ["🔴 P1 (★최우선)", "한솔 vs 차트 — 차트 승인번호로 한솔 카드번호 연결, 카드 누락/금액 차이 탐지"],
+            ["🟠 P2", "한솔 vs 일마 — 한솔미매칭(수납누락) / 일마미매칭(PG미경유) 탐지"],
+            ["🟡 참고", "일마 vs 차트 — 한솔 비경유 플랫폼 결제 확인 용도 (카드/현금 차이는 P1/P2에서)"],
+            ["", ""],
+            ["[연결 키 — 복합결제 처리]", ""],
+            ["1차 키", "승인번호 → 한솔 카드번호 ↔ 차트번호 (차트의 승인번호로 한솔 매칭)"],
+            ["2차 키", "차트번호 → 한 차트에 여러 카드/플랫폼 결제건 묶음 (복합결제)"],
+            ["3차 키", "카드번호 → 공유카드(2명 이상)·복수환자 매칭"],
+            ["", ""],
+            ["[시트 안내] ★ = AI가 먼저 봐야 할 시트", ""],
+            ["0_AI안내", "이 시트 (우선순위·연결키·분석순서)"],
+            ["1_P1_한솔vs차트", "★ 최우선 — 차트번호별 한솔카드 vs 차트카드 차이 (불일치 건만)"],
+            ["2_P2_한솔vs일마", "★ 한솔↔일마 매칭결과·미매칭 (불일치 건만)"],
+            ["3_참고_일마vs차트_플랫폼", "참고 — 한솔 비경유 플랫폼 결제 차이만"],
+            ["4_크로스레퍼런스", "★ 차트번호별 통합뷰 (복합결제 합산, P1·P2·참고 상태)"],
+            ["5_종합미매칭", "★ P1→P2→참고 순 우선순위 통합 리스트"],
+            ["6_합계비교", "3소스 총합 비교 (균형 점검)"],
+            ["7_한솔미매칭", "P2 한솔 미매칭 원본"],
+            ["8_일마미매칭", "P2 일마 미매칭 원본"],
+            ["9_매칭결과", "한솔↔일마 자동매칭 원본"],
+            ["10_한솔페이_원본", "한솔 PG 거래 (매칭 요약 포함)"],
+            ["11_일일마감_원본", "일마 프론트 수납 (매칭 요약 포함)"],
+            ["12_차트마감_원본", "차트 EMR 환자별 (매칭 요약 포함)"],
+            ["13_무결성검증", "데이터 정확도 자동 검증"],
             ["", ""],
             ["[분석순서]", ""],
-            ["1단계", "10_합계비교 → 카드/현금/플랫폼 어디서 차이나는지"],
-            ["2단계", "11_크로스레퍼런스 → ❌미매칭/⚠️차이 환자 특정"],
-            ["3단계", "5_한솔미매칭 승인번호를 3_차트마감에서 역추적"],
-            ["4단계", "8_일마vs차트 → 수단 오분류 확인"],
-            ["5단계", "불일치 건 합계 = 총합차이 일치 검증"],
+            ["1단계", "6_합계비교 → 카드/현금/플랫폼 어디서 차이 나는지 확인"],
+            ["2단계 (★P1)", "1_P1_한솔vs차트 → 차이 큰 차트번호 환자 특정"],
+            ["3단계 (★P2)", "2_P2_한솔vs일마 → 미매칭 거래 / 차트 승인번호로 역추적"],
+            ["4단계 (참고)", "3_참고_일마vs차트_플랫폼 → 한솔 비경유 플랫폼만 검증"],
+            ["5단계", "4_크로스레퍼런스 / 5_종합미매칭으로 환자별 종합 점검"],
+            ["검증", "P1 환자 차이합 ≈ 합계비교 카드차이 일치 여부"],
         ]
         guide_df = pd.DataFrame(guide_rows, columns=["항목", "설명"])
         guide_df.to_excel(writer, sheet_name="0_AI안내", index=False)
 
-        # ── Sheet 2: 한솔페이 (불일치 건만 + 매칭건 요약) ──
-        h_export = hansol.copy()
-        h_cols = [c for c in ["h_idx", "금액", "시간표시", "tx_status", "카드사",
-                               "승인번호", "카드번호", "is_현금"] if c in h_export.columns]
-        h_export = h_export[h_cols].rename(columns={
-            "h_idx": "순번", "tx_status": "거래상태", "is_현금": "현금여부"
-        })
-        # 매칭된 건 제외, 미매칭·취소 건만 포함 + 매칭 요약 행 추가
+        # ── 사전 계산: 문제 차트번호 집합 ──
         _matched_hidx = set(match_df["한솔_hidx"].tolist()) if not match_df.empty and "한솔_hidx" in match_df.columns else set()
-        h_unmatched = h_export[~h_export["순번"].isin(_matched_hidx)]
-        h_matched_count = len(_matched_hidx)
-        h_matched_amt = int(h_export[h_export["순번"].isin(_matched_hidx)]["금액"].sum()) if h_matched_count > 0 else 0
-        # 요약 행 추가
-        summary_row = pd.DataFrame([{
-            "순번": "요약", "금액": h_matched_amt, "시간표시": "",
-            "거래상태": f"매칭완료 {h_matched_count}건 (이 시트에서 생략)",
-            "카드사": "", "승인번호": "", "카드번호": "", "현금여부": ""
-        }])
-        _common_cols = [c for c in h_unmatched.columns if c in summary_row.columns]
-        if _common_cols and not h_unmatched.empty:
-            h_final = pd.concat([summary_row[_common_cols], h_unmatched], ignore_index=True)
-        elif not h_unmatched.empty:
-            h_final = h_unmatched
-        else:
-            h_final = h_export  # 미매칭 없으면 원본 그대로
-        h_final.to_excel(writer, sheet_name="1_한솔페이", index=False)
-
-        # ── Sheet 3: 일일마감 (불일치 건만) ──
-        d_export = daily.copy()
-        d_cols = [c for c in ["d_idx", "내원순서", "차트번호", "성명", "카드", "현금",
-                               "이체", "여신티켓", "강남언니", "나만의닥터", "제로페이",
-                               "기타지역화폐", "플랫폼합", "총액"] if c in d_export.columns]
-        d_export = d_export[d_cols].rename(columns={"d_idx": "순번"})
-        # 미매칭 차트번호 + 수단불일치 차트번호만 포함
         _d_um_charts = set(d_um["차트번호"].tolist()) if not d_um.empty and "차트번호" in d_um.columns else set()
         _pc_mismatch_charts = set()
         if not pc.empty and "불일치상세" in pc.columns and "차트번호" in pc.columns:
             _pc_mismatch = pc[pc["불일치상세"] != "✅일치"]
             _pc_mismatch_charts = set(_pc_mismatch["차트번호"].tolist()) if not _pc_mismatch.empty else set()
-        _d_problem_charts = _d_um_charts | _pc_mismatch_charts
-        if _d_problem_charts and "차트번호" in d_export.columns:
-            d_filtered = d_export[d_export["차트번호"].isin(_d_problem_charts)]
-            d_matched_count = len(d_export) - len(d_filtered)
-            summary_row_d = pd.DataFrame([{
-                "순번": "요약", "차트번호": "", "성명": f"매칭완료 {d_matched_count}건 (생략)",
-                "카드": int(d_export[~d_export["차트번호"].isin(_d_problem_charts)]["카드"].sum()) if "카드" in d_export.columns else 0
-            }])
-            _common_cols_d = [c for c in d_filtered.columns if c in summary_row_d.columns]
-            if _common_cols_d and not d_filtered.empty:
-                d_final = pd.concat([summary_row_d[_common_cols_d], d_filtered], ignore_index=True)
-            elif not d_filtered.empty:
-                d_final = d_filtered
-            else:
-                d_final = d_export
-        else:
-            d_final = d_export
-        d_final.to_excel(writer, sheet_name="2_일일마감", index=False)
-
-        # ── Sheet 4: 차트마감 (불일치 환자만) ──
-        p_export = patient.copy()
-        p_cols = [c for c in ["p_idx", "차트번호", "이름", "분류", "플랫폼구분", "금액", "카드사",
-                               "본부금", "승인번호목록"] if c in p_export.columns]
-        p_export = p_export[p_cols].rename(columns={"p_idx": "순번"})
-        if "승인번호목록" in p_export.columns:
-            p_export["승인번호목록"] = p_export["승인번호목록"].apply(
-                lambda x: ", ".join(x) if isinstance(x, list) else str(x))
-        # 불일치 차트번호만 포함 (크로스레퍼런스의 불일치 + 미매칭)
-        _all_problem_charts = _d_problem_charts.copy()
+        _all_problem_charts = _d_um_charts | _pc_mismatch_charts
         if not missing_all.empty and "차트번호" in missing_all.columns:
             _miss_charts = missing_all[missing_all["매칭상태"].isin(["미반영", "부족", "초과"])] if "매칭상태" in missing_all.columns else missing_all
             _all_problem_charts |= set(_miss_charts["차트번호"].tolist())
-        if _all_problem_charts and "차트번호" in p_export.columns:
-            p_filtered = p_export[p_export["차트번호"].isin(_all_problem_charts)]
-            p_matched_count = len(p_export) - len(p_filtered)
-            summary_row_p = pd.DataFrame([{
-                "순번": "요약", "차트번호": "", "이름": f"일치 {p_matched_count}건 (생략)",
-                "금액": int(p_export[~p_export["차트번호"].isin(_all_problem_charts)]["금액"].sum()) if "금액" in p_export.columns else 0
-            }])
-            _common_cols_p = [c for c in p_filtered.columns if c in summary_row_p.columns]
-            if _common_cols_p and not p_filtered.empty:
-                p_final = pd.concat([summary_row_p[_common_cols_p], p_filtered], ignore_index=True)
-            elif not p_filtered.empty:
-                p_final = p_filtered
-            else:
-                p_final = p_export
-        else:
-            p_final = p_export
-        p_final.to_excel(writer, sheet_name="3_차트마감", index=False)
 
-        # ── Sheet 5: 매칭결과 ──
-        if not match_df.empty:
-            m_export = match_df.copy()
-            m_export.to_excel(writer, sheet_name="4_매칭결과", index=False)
-
-        # ── Sheet 6: 한솔 미매칭 ──
-        if not h_um.empty:
-            h_um_export = h_um.copy()
-            h_um_cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호",
-                                      "is_현금", "카드사"] if c in h_um_export.columns]
-            h_um_export = h_um_export[h_um_cols]
-            h_um_export.to_excel(writer, sheet_name="5_한솔미매칭", index=False)
-        else:
-            pd.DataFrame({"상태": ["한솔 미매칭 건 없음"]}).to_excel(
-                writer, sheet_name="5_한솔미매칭", index=False)
-
-        # ── Sheet 7: 일마 미매칭 ──
-        if not d_um.empty:
-            d_um_export = d_um[["내원순서", "성명", "차트번호", "카드"]].copy()
-            d_um_export.to_excel(writer, sheet_name="6_일마미매칭", index=False)
-        else:
-            pd.DataFrame({"상태": ["일마 미매칭 건 없음"]}).to_excel(
-                writer, sheet_name="6_일마미매칭", index=False)
-
-        # ── Sheet 8: 한솔↔차트 누락추정 (불일치만 — ✅일치 행 제거로 시트 압축) ──
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 🔴 Sheet 1 — P1 한솔 vs 차트 (★최우선)
+        # 차트 카드결제와 한솔 매칭 카드결제 비교 (차트번호 단위 복합결제 합산)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if not missing_all.empty:
             miss_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
                                       "차트카드건수", "한솔매칭금액", "한솔매칭건수",
                                       "일마카드금액", "차이(차트-한솔)"] if c in missing_all.columns]
-            ma = missing_all[miss_cols].copy()
-            # 일치 건은 합계 행으로 압축, 불일치만 상세 표시
-            if "매칭상태" in ma.columns:
-                ok = ma[ma["매칭상태"] == "✅일치"]
-                ng = ma[ma["매칭상태"] != "✅일치"]
-                if not ok.empty:
-                    ok_sum = pd.DataFrame([{
-                        "매칭상태": f"✅일치 {len(ok)}건 (요약)",
-                        "차트번호": "",
-                        "이름": "",
-                        "차트카드금액": int(ok["차트카드금액"].sum()) if "차트카드금액" in ok.columns else 0,
-                        "차트카드건수": int(ok["차트카드건수"].sum()) if "차트카드건수" in ok.columns else 0,
-                        "한솔매칭금액": int(ok["한솔매칭금액"].sum()) if "한솔매칭금액" in ok.columns else 0,
-                        "한솔매칭건수": int(ok["한솔매칭건수"].sum()) if "한솔매칭건수" in ok.columns else 0,
-                        "일마카드금액": int(ok["일마카드금액"].sum()) if "일마카드금액" in ok.columns else 0,
+            ma_p1 = missing_all[miss_cols].copy()
+            if "매칭상태" in ma_p1.columns:
+                ok_p1 = ma_p1[ma_p1["매칭상태"] == "✅일치"]
+                ng_p1 = ma_p1[ma_p1["매칭상태"] != "✅일치"]
+                if not ok_p1.empty:
+                    ok_sum_p1 = pd.DataFrame([{
+                        "매칭상태": f"✅일치 {len(ok_p1)}건 (요약)",
+                        "차트번호": "", "이름": "",
+                        "차트카드금액": int(ok_p1["차트카드금액"].sum()) if "차트카드금액" in ok_p1.columns else 0,
+                        "차트카드건수": int(ok_p1["차트카드건수"].sum()) if "차트카드건수" in ok_p1.columns else 0,
+                        "한솔매칭금액": int(ok_p1["한솔매칭금액"].sum()) if "한솔매칭금액" in ok_p1.columns else 0,
+                        "한솔매칭건수": int(ok_p1["한솔매칭건수"].sum()) if "한솔매칭건수" in ok_p1.columns else 0,
+                        "일마카드금액": int(ok_p1["일마카드금액"].sum()) if "일마카드금액" in ok_p1.columns else 0,
                         "차이(차트-한솔)": 0,
                     }])
-                    _common = [c for c in miss_cols if c in ok_sum.columns]
-                    ma = pd.concat([ok_sum[_common], ng], ignore_index=True)
+                    _common_p1 = [c for c in miss_cols if c in ok_sum_p1.columns]
+                    ma_p1 = pd.concat([ok_sum_p1[_common_p1], ng_p1], ignore_index=True)
                 else:
-                    ma = ng
-            ma.to_excel(writer, sheet_name="7_한솔vs차트_누락추정", index=False)
+                    ma_p1 = ng_p1
+            ma_p1.to_excel(writer, sheet_name="1_P1_한솔vs차트", index=False)
+        else:
+            pd.DataFrame({"상태": ["P1 비교 데이터 없음"]}).to_excel(
+                writer, sheet_name="1_P1_한솔vs차트", index=False)
 
-        # ── Sheet 9: 일마↔차트 수단별 비교 (불일치만 — 일치 행은 요약 1줄) ──
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 🟠 Sheet 2 — P2 한솔 vs 일마 (매칭결과 + 미매칭 요약)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if not match_df.empty:
+            p2_match_cols = [c for c in [
+                "한솔_hidx", "한솔_시간", "한솔_금액", "한솔_카드번호", "한솔_카드사", "한솔_승인번호",
+                "한솔_유형", "일마_차트", "일마_성명", "일마_카드", "매칭규칙", "확신도", "비고"
+            ] if c in match_df.columns]
+            p2_df = match_df[p2_match_cols].copy()
+            p2_summary = pd.DataFrame([{
+                "한솔_hidx": "[P2-A 미매칭]",
+                "한솔_시간": f"한솔미매칭 {len(h_um)}건",
+                "한솔_금액": int(h_um["금액"].sum()) if not h_um.empty else 0,
+                "한솔_카드번호": "수납누락 의심 — 시트 7 참조",
+            }, {
+                "한솔_hidx": "[P2-B 미매칭]",
+                "한솔_시간": f"일마미매칭 {len(d_um)}건",
+                "한솔_금액": int(d_um["카드"].sum()) if not d_um.empty and "카드" in d_um.columns else 0,
+                "한솔_카드번호": "PG미경유 의심 — 시트 8 참조",
+            }])
+            _common_p2 = [c for c in p2_summary.columns if c in p2_df.columns]
+            if _common_p2:
+                p2_out = pd.concat([p2_summary[_common_p2], p2_df], ignore_index=True)
+            else:
+                p2_out = p2_df
+            p2_out.to_excel(writer, sheet_name="2_P2_한솔vs일마", index=False)
+        else:
+            pd.DataFrame({"상태": ["매칭 결과 없음"]}).to_excel(
+                writer, sheet_name="2_P2_한솔vs일마", index=False)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 🟡 Sheet 3 — 참고: 일마 vs 차트 (한솔 비경유 플랫폼 중심)
+        # 카드/현금 차이는 P1/P2에서 다룸 → 여기서는 플랫폼 차이만 부각
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if not pc.empty:
-            pc_cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
-                                    "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
-                                    "[일마]현금+이체", "[차트]현금+이체",
-                                    "[일마]플랫폼", "[차트]플랫폼"] if c in pc.columns]
-            pc_d = pc[pc_cols].copy()
-            if "불일치상세" in pc_d.columns:
-                ok = pc_d[pc_d["불일치상세"] == "✅일치"]
-                ng = pc_d[pc_d["불일치상세"] != "✅일치"]
-                if not ok.empty:
-                    pc_d = pd.concat([
-                        pd.DataFrame([{c: ("" if c not in ["매칭", "불일치상세"] else (f"✅일치 {len(ok)}건 (요약)" if c == "불일치상세" else "")) for c in pc_cols}]),
-                        ng,
-                    ], ignore_index=True)
+            pc_ref_cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
+                                       "[일마]플랫폼", "[차트]플랫폼",
+                                       "[일마]카드", "[차트]카드",
+                                       "[일마]현금+이체", "[차트]현금+이체",
+                                       "[차트]본부금(참고)"] if c in pc.columns]
+            pc_ref = pc[pc_ref_cols].copy()
+            if "[일마]플랫폼" in pc_ref.columns and "[차트]플랫폼" in pc_ref.columns:
+                plat_mm = pc_ref[pc_ref["[일마]플랫폼"] != pc_ref["[차트]플랫폼"]].copy()
+                plat_ok = pc_ref[pc_ref["[일마]플랫폼"] == pc_ref["[차트]플랫폼"]]
+                if not plat_ok.empty:
+                    ok_row_ref = {c: "" for c in pc_ref_cols}
+                    ok_row_ref["매칭"] = f"플랫폼일치 {len(plat_ok)}건 요약"
+                    if "[일마]플랫폼" in ok_row_ref:
+                        ok_row_ref["[일마]플랫폼"] = int(plat_ok["[일마]플랫폼"].sum())
+                    if "[차트]플랫폼" in ok_row_ref:
+                        ok_row_ref["[차트]플랫폼"] = int(plat_ok["[차트]플랫폼"].sum())
+                    pc_ref = pd.concat([plat_mm, pd.DataFrame([ok_row_ref])], ignore_index=True)
                 else:
-                    pc_d = ng
-            pc_d.to_excel(writer, sheet_name="8_일마vs차트_수단별비교", index=False)
+                    pc_ref = plat_mm
+            pc_ref.to_excel(writer, sheet_name="3_참고_일마vs차트_플랫폼", index=False)
+        else:
+            pd.DataFrame({"상태": ["일마vs차트 비교 데이터 없음"]}).to_excel(
+                writer, sheet_name="3_참고_일마vs차트_플랫폼", index=False)
 
-        # ── Sheet 10: 종합 미매칭 분석 ──
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ★ Sheet 4 — 크로스레퍼런스 (차트번호별 통합 뷰, 복합결제 합산)
+        # 한 차트번호에 묶인 모든 카드/플랫폼 결제 + P1·P2·참고 상태
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        cross_ref = _build_cross_reference_sheet(match_df, patient, hansol, unified_info=unified_info, daily=daily)
+        if not cross_ref.empty:
+            if "상태" in cross_ref.columns:
+                ok_cr = cross_ref[cross_ref["상태"] == "✅일치"]
+                ng_cr = cross_ref[cross_ref["상태"] != "✅일치"]
+                if not ok_cr.empty:
+                    ok_row_cr = {c: "" for c in cross_ref.columns}
+                    ok_row_cr["차트번호"] = f"✅일치 {len(ok_cr)}건 요약"
+                    for num_c in ["차트_카드금액", "차트_현금금액", "차트_이체금액", "차트_플랫폼금액",
+                                   "차트_총액", "한솔_매칭건수", "한솔_매칭금액",
+                                   "일마_카드금액", "일마_플랫폼금액", "일마_현금이체"]:
+                        if num_c in ok_cr.columns:
+                            ok_row_cr[num_c] = int(ok_cr[num_c].sum())
+                    for diff_c in ["P1_차이", "P2_차이", "참고_플랫폼차이"]:
+                        if diff_c in ok_cr.columns:
+                            ok_row_cr[diff_c] = 0
+                    ok_row_cr["상태"] = f"✅일치 {len(ok_cr)}건"
+                    cross_ref = pd.concat([ng_cr, pd.DataFrame([ok_row_cr])], ignore_index=True)
+                else:
+                    cross_ref = ng_cr
+            cross_ref.to_excel(writer, sheet_name="4_크로스레퍼런스", index=False)
+        else:
+            pd.DataFrame({"상태": ["크로스레퍼런스 데이터 없음"]}).to_excel(
+                writer, sheet_name="4_크로스레퍼런스", index=False)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ★ Sheet 5 — 종합 미매칭 (P1→P2→참고 우선순위 정렬)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if comprehensive is not None and not comprehensive.empty:
-            comprehensive.to_excel(writer, sheet_name="9_종합미매칭분석", index=False)
+            comprehensive.to_excel(writer, sheet_name="5_종합미매칭", index=False)
         else:
             pd.DataFrame({"상태": ["종합 미매칭 건 없음"]}).to_excel(
-                writer, sheet_name="9_종합미매칭분석", index=False)
+                writer, sheet_name="5_종합미매칭", index=False)
 
-        # ── Sheet 11: 합계비교 ──
+        # ── Sheet 6 — 합계비교 (3소스 총합, P1/P2/참고 차이 컬럼) ──
         h_total_base = tots["h_card"] + tots["h_cash"]
         d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
         p_cash_xfer = tots["p_cash"] + tots["p_xfer"]
@@ -2772,35 +2824,114 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             "한솔페이": h_vals,
             "일일마감": d_vals,
             "차트마감": p_vals,
-            "한솔vs차트_차이": [h - p for h, p in zip(h_vals, p_vals)],
-            "일마vs차트_차이": [d - p for d, p in zip(d_vals, p_vals)],
+            "P1_한솔vs차트(★)": [h - p for h, p in zip(h_vals, p_vals)],
+            "P2_한솔vs일마": [h - d for h, d in zip(h_vals, d_vals)],
+            "참고_일마vs차트": [d - p for d, p in zip(d_vals, p_vals)],
         }
-        pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
+        pd.DataFrame(summary_data).to_excel(writer, sheet_name="6_합계비교", index=False)
 
-        # ── Sheet 12: 크로스레퍼런스 (차트번호별 통합 뷰 — ✅일치는 요약 행으로 압축) ──
-        cross_ref = _build_cross_reference_sheet(match_df, patient, hansol, unified_info=unified_info)
-        if not cross_ref.empty:
-            if "상태" in cross_ref.columns:
-                ok = cross_ref[cross_ref["상태"] == "✅일치"]
-                ng = cross_ref[cross_ref["상태"] != "✅일치"]
-                if not ok.empty:
-                    ok_row = {c: "" for c in cross_ref.columns}
-                    ok_row["차트번호"] = f"✅일치 {len(ok)}건 요약"
-                    for num_c in ["차트_카드금액", "차트_현금금액", "차트_이체금액", "차트_플랫폼금액",
-                                   "차트_총액", "매칭_건수", "매칭_금액합"]:
-                        if num_c in ok.columns:
-                            ok_row[num_c] = int(ok[num_c].sum())
-                    ok_row["차이(차트-매칭)"] = 0
-                    ok_row["상태"] = f"✅일치 {len(ok)}건"
-                    cross_ref = pd.concat([pd.DataFrame([ok_row]), ng], ignore_index=True)
-                else:
-                    cross_ref = ng
-            cross_ref.to_excel(writer, sheet_name="11_크로스레퍼런스", index=False)
+        # ── Sheet 7 — P2 한솔 미매칭 원본 ──
+        if not h_um.empty:
+            h_um_export = h_um.copy()
+            h_um_cols = [c for c in ["시간표시", "금액", "카드번호", "승인번호",
+                                      "is_현금", "카드사"] if c in h_um_export.columns]
+            h_um_export = h_um_export[h_um_cols]
+            h_um_export.to_excel(writer, sheet_name="7_한솔미매칭", index=False)
+        else:
+            pd.DataFrame({"상태": ["한솔 미매칭 건 없음"]}).to_excel(
+                writer, sheet_name="7_한솔미매칭", index=False)
 
-        # ── Sheet 13: 무결성 검증 ──
+        # ── Sheet 8 — P2 일마 미매칭 원본 ──
+        if not d_um.empty:
+            d_um_cols = [c for c in ["내원순서", "성명", "차트번호", "카드"] if c in d_um.columns]
+            d_um_export = d_um[d_um_cols].copy()
+            d_um_export.to_excel(writer, sheet_name="8_일마미매칭", index=False)
+        else:
+            pd.DataFrame({"상태": ["일마 미매칭 건 없음"]}).to_excel(
+                writer, sheet_name="8_일마미매칭", index=False)
+
+        # ── Sheet 9 — 한솔↔일마 매칭결과 원본 ──
+        if not match_df.empty:
+            match_df.to_excel(writer, sheet_name="9_매칭결과", index=False)
+
+        # ── Sheet 10 — 한솔페이 원본 (불일치/미매칭 + 매칭 요약 행) ──
+        h_export = hansol.copy()
+        h_cols = [c for c in ["h_idx", "금액", "시간표시", "tx_status", "카드사",
+                               "승인번호", "카드번호", "is_현금"] if c in h_export.columns]
+        h_export = h_export[h_cols].rename(columns={
+            "h_idx": "순번", "tx_status": "거래상태", "is_현금": "현금여부"
+        })
+        h_unmatched = h_export[~h_export["순번"].isin(_matched_hidx)]
+        h_matched_count = len(_matched_hidx)
+        h_matched_amt = int(h_export[h_export["순번"].isin(_matched_hidx)]["금액"].sum()) if h_matched_count > 0 else 0
+        summary_row_h = pd.DataFrame([{
+            "순번": "요약", "금액": h_matched_amt, "시간표시": "",
+            "거래상태": f"매칭완료 {h_matched_count}건 (이 시트에서 생략)",
+            "카드사": "", "승인번호": "", "카드번호": "", "현금여부": ""
+        }])
+        _common_cols_h = [c for c in h_unmatched.columns if c in summary_row_h.columns]
+        if _common_cols_h and not h_unmatched.empty:
+            h_final = pd.concat([summary_row_h[_common_cols_h], h_unmatched], ignore_index=True)
+        elif not h_unmatched.empty:
+            h_final = h_unmatched
+        else:
+            h_final = h_export
+        h_final.to_excel(writer, sheet_name="10_한솔페이_원본", index=False)
+
+        # ── Sheet 11 — 일일마감 원본 (불일치 차트만 + 매칭 요약 행) ──
+        d_export = daily.copy()
+        d_cols = [c for c in ["d_idx", "내원순서", "차트번호", "성명", "카드", "현금",
+                               "이체", "여신티켓", "강남언니", "나만의닥터", "제로페이",
+                               "기타지역화폐", "플랫폼합", "총액"] if c in d_export.columns]
+        d_export = d_export[d_cols].rename(columns={"d_idx": "순번"})
+        if _all_problem_charts and "차트번호" in d_export.columns:
+            d_filtered = d_export[d_export["차트번호"].isin(_all_problem_charts)]
+            d_matched_count = len(d_export) - len(d_filtered)
+            summary_row_d = pd.DataFrame([{
+                "순번": "요약", "차트번호": "", "성명": f"매칭완료 {d_matched_count}건 (생략)",
+                "카드": int(d_export[~d_export["차트번호"].isin(_all_problem_charts)]["카드"].sum()) if "카드" in d_export.columns else 0
+            }])
+            _common_cols_d = [c for c in d_filtered.columns if c in summary_row_d.columns]
+            if _common_cols_d and not d_filtered.empty:
+                d_final = pd.concat([summary_row_d[_common_cols_d], d_filtered], ignore_index=True)
+            elif not d_filtered.empty:
+                d_final = d_filtered
+            else:
+                d_final = d_export
+        else:
+            d_final = d_export
+        d_final.to_excel(writer, sheet_name="11_일일마감_원본", index=False)
+
+        # ── Sheet 12 — 차트마감 원본 (불일치 환자만 + 요약 행) ──
+        p_export = patient.copy()
+        p_cols = [c for c in ["p_idx", "차트번호", "이름", "분류", "플랫폼구분", "금액", "카드사",
+                               "본부금", "승인번호목록"] if c in p_export.columns]
+        p_export = p_export[p_cols].rename(columns={"p_idx": "순번"})
+        if "승인번호목록" in p_export.columns:
+            p_export["승인번호목록"] = p_export["승인번호목록"].apply(
+                lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+        if _all_problem_charts and "차트번호" in p_export.columns:
+            p_filtered = p_export[p_export["차트번호"].isin(_all_problem_charts)]
+            p_matched_count = len(p_export) - len(p_filtered)
+            summary_row_p = pd.DataFrame([{
+                "순번": "요약", "차트번호": "", "이름": f"일치 {p_matched_count}건 (생략)",
+                "금액": int(p_export[~p_export["차트번호"].isin(_all_problem_charts)]["금액"].sum()) if "금액" in p_export.columns else 0
+            }])
+            _common_cols_p = [c for c in p_filtered.columns if c in summary_row_p.columns]
+            if _common_cols_p and not p_filtered.empty:
+                p_final = pd.concat([summary_row_p[_common_cols_p], p_filtered], ignore_index=True)
+            elif not p_filtered.empty:
+                p_final = p_filtered
+            else:
+                p_final = p_export
+        else:
+            p_final = p_export
+        p_final.to_excel(writer, sheet_name="12_차트마감_원본", index=False)
+
+        # ── Sheet 13 — 무결성 검증 ──
         integrity = _build_integrity_check(hansol, daily, patient, match_df, matched_h, matched_dc)
         if not integrity.empty:
-            integrity.to_excel(writer, sheet_name="12_무결성검증", index=False)
+            integrity.to_excel(writer, sheet_name="13_무결성검증", index=False)
 
     buf.seek(0)
     return buf.getvalue()
@@ -2815,13 +2946,18 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
                             unified_info=None, cross_ref=None,
                             max_chars=4500):
-    """핵심 분석 데이터를 AI에 전송할 텍스트로 변환.
-    핵심 목표: 한솔페이(PG)↔차트마감(EMR) 차이가 '어디서' 발생하는지 추적.
-    토큰 최소화: 불일치 건만 전송, 일치 건은 통계만.
-    max_chars: 최대 문자 수 (Gemini 무료 한도 여유 확보, 4500자≈1800토큰 한국어 기준)."""
+    """오류 우선순위 기반 AI 분석 텍스트 생성.
+
+    탐색 우선순위:
+      P1 (★최우선) 한솔(PG) vs 차트(EMR) — 차트 승인번호 → 한솔 카드번호 연결
+      P2          한솔(PG) vs 일마(프론트) — PG 미경유/수납 누락 탐지
+      참고        일마 vs 차트 — 한솔 비경유 플랫폼 결제 확인 용도
+
+    토큰 최소화: 일치 건은 통계만, 불일치 건만 상세 전송.
+    max_chars: 최대 문자 수 (Gemini 무료 한도 여유, 4500자≈1800토큰 한국어 기준)."""
     lines = []
 
-    # ── 1. 합계비교 (3개 소스 총합 + 차이) ──
+    # ── 0. 합계비교 (3개 소스 총합) ──
     lines.append("[합계비교]")
     h_total_base = tots["h_card"] + tots["h_cash"]
     d_cash_xfer = tots["d_cash"] + tots["d_xfer"]
@@ -2831,7 +2967,7 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
     h_plat = tots["d_plat"] if plat_confirmed else 0
     h_total = h_total_base + h_plat
 
-    lines.append("구분,한솔,일마,차트,한솔-차트,일마-차트")
+    lines.append("구분,한솔,일마,차트,P1(한솔-차트),P2(한솔-일마),참고(일마-차트)")
     rows_data = [
         ("카드", tots["h_card"], tots["d_card"], tots["p_card"]),
         ("현금+이체", tots["h_cash"], d_cash_xfer, p_cash_xfer),
@@ -2841,130 +2977,150 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
         rows_data.append(("기타", 0, 0, p_etc))
     rows_data.append(("합계", h_total, tots["d_tot"], tots["p_tot"]))
     for label, h, d, p in rows_data:
-        lines.append(f"{label},{h},{d},{p},{h - p},{d - p}")
+        lines.append(f"{label},{h},{d},{p},{h - p},{h - d},{d - p}")
 
-    # ── 2. 차트번호별 크로스레퍼런스 (★핵심: 차이 나는 환자만) ──
-    # 한솔↔일마↔차트를 차트번호 기준으로 통합 → 불일치 건만 추출
+    # ── P1 (★최우선): 한솔 vs 차트 — 차트번호 단위 불일치 ──
+    # 차트의 카드결제(차트_카드금액)와 그 차트에 매칭된 한솔 카드금액을 비교.
+    # 차트 승인번호로 연결되며, 한 차트에 복합결제(여러 카드)가 있어도 합산 비교됨.
+    p1_rows, p2_rows = [], []
     if unified_info:
-        cross_rows = []
-        for ch, ui in unified_info.items():
+        for ch in unified_info.keys():
             if not ch:
                 continue
-            # 차트 금액
-            p_rows = patient[patient["차트번호"] == ch]
-            p_card = int(p_rows[p_rows["분류"] == "카드"]["금액"].sum()) if not p_rows.empty else 0
-            p_cash_xfer_ch = int(p_rows[p_rows["분류"].isin(["현금", "이체"])]["금액"].sum()) if not p_rows.empty else 0
-            p_plat_ch = int(p_rows[p_rows["분류"] == "플랫폼"]["금액"].sum()) if not p_rows.empty else 0
-            p_total_ch = int(p_rows["금액"].sum()) if not p_rows.empty else 0
-
-            # 일마 금액
+            ui = unified_info[ch]
+            p_rows_ch = patient[patient["차트번호"] == ch] if patient is not None else pd.DataFrame()
+            p_card = int(p_rows_ch[p_rows_ch["분류"] == "카드"]["금액"].sum()) if not p_rows_ch.empty else 0
+            p_card_cnt = int((p_rows_ch["분류"] == "카드").sum()) if not p_rows_ch.empty else 0
             d_card_ch = ui.get("daily_card_amt", 0)
-            d_cash_xfer_ch = ui.get("daily_cash_amt", 0) + ui.get("daily_xfer_amt", 0)
-
-            # 한솔 매칭 금액 (이 차트번호에 매칭된 한솔 건)
             m_rows = match_df[match_df["일마_차트"].apply(clean_no) == ch] if not match_df.empty and "일마_차트" in match_df.columns else pd.DataFrame()
-            h_matched_card = int(m_rows[m_rows["한솔_유형"] != "현금영수증"]["한솔_금액"].sum()) if not m_rows.empty and "한솔_유형" in m_rows.columns else (int(m_rows["한솔_금액"].sum()) if not m_rows.empty else 0)
+            h_card = int(m_rows[m_rows["한솔_유형"] != "현금영수증"]["한솔_금액"].sum()) if not m_rows.empty and "한솔_유형" in m_rows.columns else (int(m_rows["한솔_금액"].sum()) if not m_rows.empty else 0)
+            h_cnt = len(m_rows[m_rows["한솔_유형"] != "현금영수증"]) if not m_rows.empty and "한솔_유형" in m_rows.columns else len(m_rows)
 
-            # 차이 계산
-            diff_h_chart = h_matched_card - p_card  # 한솔매칭 vs 차트카드
-            diff_d_chart_card = d_card_ch - p_card  # 일마카드 vs 차트카드
-            diff_d_chart_cash = d_cash_xfer_ch - p_cash_xfer_ch  # 일마현금이체 vs 차트현금이체
+            name = ui.get("best_name", "") or (str(p_rows_ch["이름"].iloc[0]) if not p_rows_ch.empty else "")
+            d_h_card = h_card - p_card  # P1 차이
+            d_h_daily = h_card - d_card_ch  # P2 차이
 
-            # 불일치 건만 수집 (차이가 있는 건)
-            if diff_h_chart != 0 or diff_d_chart_card != 0 or diff_d_chart_cash != 0:
-                name = ui.get("best_name", "")
-                if not name and not p_rows.empty:
-                    name = str(p_rows["이름"].iloc[0])
-                cross_rows.append({
+            if d_h_card != 0:
+                p1_rows.append({
                     "ch": ch, "name": name,
-                    "h_card": h_matched_card, "d_card": d_card_ch, "p_card": p_card,
-                    "d_cx": d_cash_xfer_ch, "p_cx": p_cash_xfer_ch,
-                    "h_p": diff_h_chart, "d_p_card": diff_d_chart_card, "d_p_cx": diff_d_chart_cash,
+                    "h": h_card, "h_cnt": h_cnt,
+                    "p": p_card, "p_cnt": p_card_cnt,
+                    "diff": d_h_card,
+                })
+            if d_h_daily != 0:
+                p2_rows.append({
+                    "ch": ch, "name": name,
+                    "h": h_card, "d": d_card_ch, "diff": d_h_daily,
                 })
 
-        if cross_rows:
-            # 금액 차이 큰 순 정렬
-            cross_rows.sort(key=lambda x: abs(x["h_p"]) + abs(x["d_p_card"]), reverse=True)
-            lines.append(f"\n[차트번호별 불일치★] {len(cross_rows)}건 (차이 있는 환자만)")
-            lines.append("차트번호,이름,한솔매칭카드,일마카드,차트카드,한솔-차트,일마-차트")
-            _limit = min(6, max(3, 6 - len(cross_rows) // 20))
-            for r in cross_rows[:_limit]:
-                lines.append(f"{r['ch']},{r['name']},{r['h_card']},{r['d_card']},{r['p_card']},{r['h_p']},{r['d_p_card']}")
-            if len(cross_rows) > _limit:
-                lines.append(f"...외 {len(cross_rows) - _limit}건")
-            # 불일치 합계
-            sum_hp = sum(r["h_p"] for r in cross_rows)
-            sum_dp = sum(r["d_p_card"] for r in cross_rows)
-            lines.append(f"불일치합계: 한솔-차트={sum_hp}, 일마카드-차트={sum_dp}")
+    # P1 출력 (가장 큰 비중)
+    if p1_rows:
+        p1_rows.sort(key=lambda x: abs(x["diff"]), reverse=True)
+        sum_p1 = sum(r["diff"] for r in p1_rows)
+        lines.append(f"\n[P1★한솔vs차트] {len(p1_rows)}건 불일치 (한솔-차트 합={sum_p1:+,})")
+        lines.append("차트번호,이름,한솔카드(건수),차트카드(건수),차이")
+        _lim = 8 if len(p1_rows) <= 30 else 6
+        for r in p1_rows[:_lim]:
+            lines.append(f"{r['ch']},{r['name']},{r['h']}({r['h_cnt']}),{r['p']}({r['p_cnt']}),{r['diff']:+}")
+        if len(p1_rows) > _lim:
+            lines.append(f"...외 {len(p1_rows) - _lim}건")
+    else:
+        lines.append("\n[P1★한솔vs차트] 모든 차트번호 카드금액 일치")
 
-    # ── 3. 한솔 미매칭 (일마에 매칭 안 된 한솔 거래 → 차이의 직접 원인) ──
+    # ── P2: 한솔 vs 일마 — 미매칭 건 (PG미경유/수납누락) ──
     if not h_um.empty:
-        lines.append(f"\n[한솔 미매칭] {len(h_um)}건 (합계:{int(h_um['금액'].sum()):,}원)")
-        cols = [c for c in ["금액", "승인번호", "카드번호"] if c in h_um.columns]
+        h_um_total = int(h_um["금액"].sum())
+        lines.append(f"\n[P2-A한솔미매칭] {len(h_um)}건 ({h_um_total:+,}원) — PG는 승인 / 일마 기재 누락 의심")
+        cols = [c for c in ["금액", "승인번호", "카드번호", "시간표시"] if c in h_um.columns]
         h_um_sorted = h_um.copy()
         if "금액" in h_um_sorted.columns:
             h_um_sorted = h_um_sorted.sort_values("금액", key=abs, ascending=False)
         lines.append(",".join(cols))
-        _limit = 4
-        for _, row in h_um_sorted.head(_limit).iterrows():
+        _lim = 4
+        for _, row in h_um_sorted.head(_lim).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
-        if len(h_um) > _limit:
-            lines.append(f"...외 {len(h_um) - _limit}건")
+        if len(h_um) > _lim:
+            lines.append(f"...외 {len(h_um) - _lim}건")
 
-    # ── 4. 일마 미매칭 (한솔에 없는 일마 카드건) ──
     if not d_um.empty:
         d_um_total = int(pd.to_numeric(d_um["카드"], errors="coerce").fillna(0).sum()) if "카드" in d_um.columns else 0
-        lines.append(f"\n[일마 미매칭] {len(d_um)}건 (카드합계:{d_um_total:,}원)")
+        lines.append(f"\n[P2-B일마미매칭] {len(d_um)}건 ({d_um_total:+,}원) — 일마 카드 / 한솔 미존재 (PG미경유·오기재 의심)")
         cols = [c for c in ["성명", "차트번호", "카드"] if c in d_um.columns]
         d_um_sorted = d_um.copy()
         if "카드" in d_um_sorted.columns:
-            d_um_sorted["_abs_amt"] = pd.to_numeric(d_um_sorted["카드"], errors="coerce").fillna(0).abs()
-            d_um_sorted = d_um_sorted.sort_values("_abs_amt", ascending=False)
+            d_um_sorted["_a"] = pd.to_numeric(d_um_sorted["카드"], errors="coerce").fillna(0).abs()
+            d_um_sorted = d_um_sorted.sort_values("_a", ascending=False)
         lines.append(",".join(cols))
-        _limit = 4
-        for _, row in d_um_sorted.head(_limit).iterrows():
+        _lim = 4
+        for _, row in d_um_sorted.head(_lim).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
-        if len(d_um) > _limit:
-            lines.append(f"...외 {len(d_um) - _limit}건")
+        if len(d_um) > _lim:
+            lines.append(f"...외 {len(d_um) - _lim}건")
 
-    # ── 5. 일마↔차트 수단별 불일치 (위 [차트번호별 불일치]와 중복 최소화: 개수만) ──
+    # ── 참고: 일마 vs 차트 — 플랫폼 결제 차이만 부각 (한솔 비경유) ──
     if pc is not None and not pc.empty:
-        mm = pc[pc["불일치상세"] != "✅일치"] if "불일치상세" in pc.columns else pc
-        if not mm.empty:
-            lines.append(f"\n[일마vs차트 수단불일치] {len(mm)}건 (상세는 위 차트번호별 불일치 참조)")
+        plat_diff_rows = []
+        for _, r in pc.iterrows():
+            i_plat = int(r.get("[일마]플랫폼", 0) or 0)
+            c_plat = int(r.get("[차트]플랫폼", 0) or 0)
+            if i_plat != c_plat:
+                plat_diff_rows.append({
+                    "ch": str(r.get("차트번호", "")),
+                    "name": str(r.get("성명", "") or r.get("성명_차트", "")),
+                    "i": i_plat, "c": c_plat, "d": i_plat - c_plat,
+                })
+        if plat_diff_rows:
+            plat_diff_rows.sort(key=lambda x: abs(x["d"]), reverse=True)
+            sum_plat = sum(r["d"] for r in plat_diff_rows)
+            lines.append(f"\n[참고_일마vs차트플랫폼] {len(plat_diff_rows)}건 (일마-차트={sum_plat:+,}) — 한솔 비경유, 플랫폼 결제 검증용")
+            _lim = 3
+            for r in plat_diff_rows[:_lim]:
+                lines.append(f"{r['ch']},{r['name']},일마{r['i']},차트{r['c']},{r['d']:+}")
+            if len(plat_diff_rows) > _lim:
+                lines.append(f"...외 {len(plat_diff_rows) - _lim}건")
 
-    # ── 6. 통계 요약 ──
-    lines.append(f"\n[통계] 한솔{len(hansol)}건,일마{len(daily)}건,차트{len(patient)}건,매칭{len(match_df)}건,한솔미매칭{len(h_um)}건,일마미매칭{len(d_um)}건")
+    # ── 통계 요약 ──
+    lines.append(f"\n[통계] 한솔{len(hansol)}/일마{len(daily)}/차트{len(patient)}/매칭{len(match_df)} | P1불일치{len(p1_rows)}·P2-A{len(h_um)}·P2-B{len(d_um)}")
 
     result = "\n".join(lines)
 
-    # 최대 문자 수 초과 시 트렁케이트 (Gemini 무료 TPM 한도 대응)
     if len(result) > max_chars:
-        result = result[:max_chars] + f"\n...(데이터 축소됨: {len(result)}자 → {max_chars}자)"
+        result = result[:max_chars] + f"\n...(축소: {len(result)}자→{max_chars}자)"
 
     return result
 
 
-AI_SYSTEM_PROMPT = """병원 정산 전문 분석관. 차트마감=기준원장. 한솔(PG)·일마(프론트)·차트(EMR) 3-Way 차이의 원인(미매칭/수단오분류/금액)을 환자 단위로 특정. 간결·실무 중심·중복금지."""
+AI_SYSTEM_PROMPT = """병원 정산 전문 분석관. 차트마감(EMR)=기준원장.
+오류 탐색 우선순위:
+  P1(★최우선) 한솔(PG) vs 차트(EMR) — 차트 승인번호로 한솔 카드번호 연결, 카드금액 차이 환자 특정
+  P2         한솔(PG) vs 일마(프론트) — 미매칭 거래(수납누락·PG미경유) 탐지
+  참고       일마 vs 차트 — 한솔 비경유 플랫폼 결제 확인 (카드/현금 차이는 P1/P2에서 다룸)
+한 차트번호에 복합결제(N카드+M플랫폼)가 가능. 차트번호 단위 합산 비교가 기본.
+간결·실무 중심·중복 금지."""
 
-AI_USER_PROMPT = """3-Way 정산 대사 결과. 한솔(PG)↔차트(EMR) 차이의 원인을 환자 단위로 추적.
-(플랫폼은 한솔 비포함 → 일마↔차트 기준)
+AI_USER_PROMPT = """3-Way 정산 대사 결과. 오류 우선순위에 따라 환자 단위 추적.
 
 {data}
 
 ---
 다음 형식으로 1500토큰 이내 답변:
 
-### 1. 총합 차이 원인
-카드/현금/플랫폼별 차이금액과 핵심 원인 1줄씩
+### ① P1★ 한솔 vs 차트 (최우선)
+- 합계 차이: (한솔카드 - 차트카드) = ?원
+- 차이 큰 환자 최대 5명 표:
+| 순위 | 차트번호 | 환자명 | 한솔카드 | 차트카드 | 차이 | 추정원인 | 조치 |
 
-### 2. 차이 발생 환자 (큰 순 최대 5명)
-| 순위 | 차트번호 | 환자명 | 차이금액 | 원인 | 조치 |
+### ② P2 한솔 vs 일마
+- 한솔미매칭(수납누락 의심) / 일마미매칭(PG미경유 의심) 핵심 1~2건씩
+- 그 건이 차트에 존재하는지 1줄로 (승인번호·환자명으로 차트 역추적)
 
-### 3. 검증
-위 환자 차이합 = 총합차이 여부 (불일치면 누락건 1줄 지적)
+### ③ 참고 — 일마 vs 차트 (플랫폼만)
+- 한솔 비경유 플랫폼 결제 차이가 있다면 1~2줄. 없으면 "차이 없음".
 
-### 4. 결론 (1~2문장)"""
+### ④ 검증
+- 위 ①의 환자 차이합 ≈ 총합 카드차이 검증 (불일치하면 누락된 환자 1줄 지적)
+
+### ⑤ 결론 (1~2문장)"""
 
 
 def run_ai_analysis_claude(api_key, analysis_text, user_question=""):
@@ -3160,7 +3316,7 @@ def _render_ai_analysis_inline():
 
     user_question = st.text_area(
         "💬 AI에게 추가로 질문하기 (선택사항)",
-        placeholder="예: 가장의심되는 거래건들 먼저 알려줘",
+        placeholder="예: P1 한솔vs차트 차이 큰 환자 5명 자세히 / 한솔미매칭 승인번호로 차트 역추적해줘",
         key="ai_user_question_inline",
         height=80,
     )
@@ -4063,7 +4219,7 @@ else:
 
     with t6:
         st.subheader("🤖 AI 자동 분석")
-        st.caption("AI가 의심거래를 자동으로 분석하여 가장 먼저 확인해야 할 환자/거래를 알려줍니다.")
+        st.caption("오류 우선순위 — 🔴P1: 한솔vs차트 (★최우선) / 🟠P2: 한솔vs일마 / 🟡참고: 일마vs차트(플랫폼)")
 
         # ── 분석 데이터를 session_state에 미리 준비 (팝업에서 사용) ──
         st.session_state["_ai_analysis_text"] = _build_ai_analysis_text(
@@ -4106,21 +4262,34 @@ else:
             st.markdown("다운로드한 엑셀을 ChatGPT / Gemini / Claude에 업로드하고 아래 프롬프트를 붙여넣으세요.")
 
             ai_prompt = """첨부된 엑셀은 병원 3-Way 대사 결과입니다.
-목적: 한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 총합 불일치 거래건을 찾아주세요.
+목적: 오류 우선순위에 따라 불일치 거래건과 원인 환자를 특정해주세요.
 
-※ 0_AI안내 시트를 먼저 읽고 시트 구조와 분석순서를 확인하세요.
-※ 원본 데이터(1~3번 시트)는 불일치 건만 포함됩니다. 매칭 완료건은 요약 행으로 표시됩니다.
+※ 0_AI안내 시트의 우선순위 체계를 먼저 확인하세요.
+
+[★오류 탐색 우선순위]
+🔴 P1 (★최우선) 한솔(PG) vs 차트(EMR)
+   — 차트 승인번호 → 한솔 카드번호 연결, 차트 카드 vs 한솔 매칭 카드 차이
+🟠 P2  한솔(PG) vs 일마(프론트)
+   — 한솔미매칭(수납누락) / 일마미매칭(PG미경유)
+🟡 참고 일마 vs 차트
+   — 한솔 비경유 플랫폼 결제 차이만 (카드/현금 차이는 P1/P2에서 처리)
+
+[연결 키]
+• 차트번호 = 마스터 키 (한 차트에 N카드 + M플랫폼 결제 가능, 복합결제 합산 비교)
+• 차트 승인번호 → 한솔 카드번호 ↔ 차트번호로 카드결제 연결
 
 [분석 순서]
-1. 10_합계비교 → 카드/현금/플랫폼 각 차이 금액 확인
-2. 11_크로스레퍼런스 → ❌미매칭·⚠️차이 환자 추출, 차이금액 합 = 총합차이 검증
-3. 5_한솔미매칭 → 승인번호·카드번호를 3_차트마감에서 역추적
-4. 8_일마vs차트 → 수단 오분류(카드↔현금) 확인
-5. 불일치 건 합계 ≠ 총합차이 → 누락건 재탐색
+1. 6_합계비교 → 카드/현금/플랫폼 어디서 차이 나는지 확인
+2. ★1_P1_한솔vs차트 → 차트번호별 차트카드 vs 한솔카드 차이 (불일치 환자 1순위)
+3. ★2_P2_한솔vs일마 → 한솔/일마 미매칭 거래 (시트 7·8로 상세 확인)
+4. 3_참고_일마vs차트_플랫폼 → 한솔 비경유 플랫폼 결제 검증
+5. 4_크로스레퍼런스 / 5_종합미매칭 → 환자별 종합 점검
+6. 검증: P1 환자 차이합 ≈ 합계비교의 P1 카드차이
 
 [출력 형식]
-| 순위 | 차트번호 | 환자명 | 불일치금액 | 원인 | 근거시트 | 조치 |
-금액 큰 순 정렬. 합계 = 총합차이 검증 필수."""
+P1 표, P2 요약, 참고 1~2줄, 검증, 결론 순서로.
+| 순위 | 차트번호 | 환자명 | 한솔카드 | 차트카드 | 차이 | 원인 | 근거시트 | 조치 |
+금액 큰 순. 합계 = 총합차이 검증 필수."""
 
             st.code(ai_prompt, language=None)
 
@@ -4145,30 +4314,40 @@ else:
                 key="ai_excel_download",
             )
 
-            # 파일 내용 미리보기
-            st.markdown("#### 📑 포함 시트 목록")
+            # 파일 내용 미리보기 (오류 우선순위 기반 새 구조)
+            st.markdown("#### 📑 포함 시트 목록 (오류 우선순위 순)")
             preview_data = {
                 "시트명": [
-                    "0_AI안내", "1_한솔페이", "2_일일마감", "3_차트마감",
-                    "4_매칭결과", "5_한솔미매칭", "6_일마미매칭",
-                    "7_한솔vs차트_누락추정", "8_일마vs차트_수단별비교",
-                    "9_종합미매칭분석", "10_합계비교",
-                    "11_크로스레퍼런스", "12_무결성검증",
+                    "0_AI안내",
+                    "1_P1_한솔vs차트",
+                    "2_P2_한솔vs일마",
+                    "3_참고_일마vs차트_플랫폼",
+                    "4_크로스레퍼런스",
+                    "5_종합미매칭",
+                    "6_합계비교",
+                    "7_한솔미매칭",
+                    "8_일마미매칭",
+                    "9_매칭결과",
+                    "10_한솔페이_원본",
+                    "11_일일마감_원본",
+                    "12_차트마감_원본",
+                    "13_무결성검증",
                 ],
                 "설명": [
-                    "시트 구조·분석순서 안내 (간결)",
-                    f"PG 거래 불일치건만 ({len(h_um)}건) + 매칭 요약",
-                    f"일마 불일치건만 ({len(d_um)}건) + 매칭 요약",
-                    f"차트 불일치 환자만 + 일치건 요약",
-                    f"한솔↔일마 매칭 ({len(match_df)}건)",
-                    f"★ 한솔 미매칭 ({len(h_um)}건)",
-                    f"일마 미매칭 ({len(d_um)}건)",
-                    f"한솔↔차트 누락추정 ({len(missing_all)}건)",
-                    f"일마↔차트 수단별 비교 ({len(pc)}건)",
-                    f"★ 종합 미매칭 ({len(comprehensive)}건)" if not comprehensive.empty else "종합 미매칭 (0건)",
-                    "★ 3소스 합계 비교 (여기서 시작)",
-                    "★ 차트번호별 통합뷰 (불일치 환자 특정)",
-                    "데이터 정확도 검증",
+                    "오류 우선순위 체계 · 연결키 · 분석순서 안내",
+                    f"🔴 ★최우선 — 차트번호별 한솔카드 vs 차트카드 ({len(missing_all)}건)",
+                    f"🟠 한솔↔일마 매칭+미매칭 통합 ({len(match_df)}건 매칭 / 미매칭 {len(h_um)}·{len(d_um)})",
+                    f"🟡 참고 — 한솔 비경유 플랫폼 결제 차이 ({len(pc)}건 중 플랫폼 불일치)",
+                    "★ 차트번호별 통합뷰 (복합결제 합산, P1·P2·참고 상태 컬럼)",
+                    f"★ 종합 미매칭 (P1→P2→참고 순) ({len(comprehensive)}건)" if not comprehensive.empty else "종합 미매칭 (0건)",
+                    "3소스 합계 비교 (P1/P2/참고 차이 컬럼)",
+                    f"P2-A 한솔 미매칭 원본 ({len(h_um)}건)",
+                    f"P2-B 일마 미매칭 원본 ({len(d_um)}건)",
+                    f"한솔↔일마 매칭결과 원본 ({len(match_df)}건)",
+                    "한솔페이 원본 (불일치/미매칭 + 매칭 요약)",
+                    "일일마감 원본 (불일치 차트만 + 요약)",
+                    "차트마감 원본 (불일치 환자만 + 요약)",
+                    "데이터 무결성 자동 검증",
                 ],
             }
             st.dataframe(pd.DataFrame(preview_data), width='stretch', hide_index=True)
