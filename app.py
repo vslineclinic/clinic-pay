@@ -2022,9 +2022,9 @@ else:
             api_key = st.text_input(
                 "Google AI API Key",
                 type="password",
-                value=st.session_state.get("_api_key", ""),
+                value=st.session_state.get("_api_key", "AIzaSyA7qOuf9itKxxQ4pGsoXtNSboQXZbQKcGE"),
                 key="_api_key",
-                help="https://aistudio.google.com/apikey 에서 무료 발급 (개인 키 권장)",
+                help="https://aistudio.google.com/apikey 에서 무료 발급",
             )
         with col_b:
             model_choice = st.selectbox(
@@ -2051,9 +2051,7 @@ else:
         with st.expander("📄 전송 데이터 미리보기"):
             st.code(ai_text, language="text")
 
-        if not api_key:
-            st.info("ℹ️ Google AI API Key를 입력해 주세요 — https://aistudio.google.com/apikey 에서 무료 발급")
-        elif st.button("🚀 AI 분석 시작", type="primary"):
+        if api_key and st.button("🚀 AI 분석 시작", type="primary"):
             with st.spinner("AI 분석 중..."):
                 try:
                     result, used_model = run_gemini(api_key, ai_text, question, model=model_choice)
