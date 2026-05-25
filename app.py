@@ -2542,26 +2542,27 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
 
-        # ── Sheet 1: AI_안내 (간결한 데이터 사전) ──
+        # ── Sheet 1: AI_안내 (간결한 데이터 사전 + 한도 안내) ──
         guide_rows = [
-            ["시스템", "병원 정산 3-Way 대사 v3.0"],
+            ["시스템", "병원 정산 3-Way 대사 v3.1 (Gemini 무료한도 최적화)"],
             ["분석일시", datetime.now().strftime("%Y-%m-%d %H:%M")],
             ["목적", "한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 총합 불일치 거래건 추적"],
             ["기준 원장", "차트마감(EMR)이 최종 기준"],
             ["연결 키", "승인번호→한솔↔차트, 차트번호→일마↔차트, 카드번호→동일환자 다건"],
+            ["AI 한도 대응", "각 시트의 ✅일치 행은 요약 1줄로 압축, 불일치만 상세 표시"],
             ["", ""],
-            ["[시트 안내]", ""],
-            ["1_한솔페이(불일치)", "PG 거래 중 미매칭·의심건만 (매칭건 제외, 요약만 표시)"],
+            ["[시트 안내] ★=AI가 먼저 봐야 할 시트", ""],
+            ["1_한솔페이(불일치)", "PG 거래 중 미매칭·의심건만 (매칭건 요약만)"],
             ["2_일일마감(불일치)", "프론트 수납 중 미매칭·불일치건만"],
             ["3_차트마감(불일치)", "EMR 중 불일치 환자만"],
             ["4_매칭결과", "한솔↔일마 자동매칭 결과"],
             ["5_한솔미매칭", "★한솔에만 있는 건 → 최우선 점검"],
             ["6_일마미매칭", "일마에만 있는 건 → PG 미경유 확인"],
-            ["7_한솔vs차트", "차트 기준 한솔 매칭 비교"],
-            ["8_일마vs차트", "수단별 교차비교"],
-            ["9_종합분석", "3소스 종합 미매칭"],
+            ["7_한솔vs차트", "차트 기준 한솔 매칭 비교 (일치 행은 요약)"],
+            ["8_일마vs차트", "수단별 교차비교 (일치 행은 요약)"],
+            ["9_종합분석", "3소스 종합 미매칭 (우선순위 순)"],
             ["10_합계비교", "★전체 균형 확인 (여기서 시작)"],
-            ["11_크로스레퍼런스", "★차트번호별 통합뷰 (불일치 환자 특정)"],
+            ["11_크로스레퍼런스", "★차트번호별 통합뷰 (일치 행은 요약 1줄)"],
             ["12_무결성검증", "데이터 정확도 검증"],
             ["", ""],
             ["[분석순서]", ""],
@@ -2687,20 +2688,52 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
             pd.DataFrame({"상태": ["일마 미매칭 건 없음"]}).to_excel(
                 writer, sheet_name="6_일마미매칭", index=False)
 
-        # ── Sheet 8: 한솔↔차트 누락추정 ──
+        # ── Sheet 8: 한솔↔차트 누락추정 (불일치만 — ✅일치 행 제거로 시트 압축) ──
         if not missing_all.empty:
             miss_cols = [c for c in ["매칭상태", "차트번호", "이름", "차트카드금액",
                                       "차트카드건수", "한솔매칭금액", "한솔매칭건수",
                                       "일마카드금액", "차이(차트-한솔)"] if c in missing_all.columns]
-            missing_all[miss_cols].to_excel(writer, sheet_name="7_한솔vs차트_누락추정", index=False)
+            ma = missing_all[miss_cols].copy()
+            # 일치 건은 합계 행으로 압축, 불일치만 상세 표시
+            if "매칭상태" in ma.columns:
+                ok = ma[ma["매칭상태"] == "✅일치"]
+                ng = ma[ma["매칭상태"] != "✅일치"]
+                if not ok.empty:
+                    ok_sum = pd.DataFrame([{
+                        "매칭상태": f"✅일치 {len(ok)}건 (요약)",
+                        "차트번호": "",
+                        "이름": "",
+                        "차트카드금액": int(ok["차트카드금액"].sum()) if "차트카드금액" in ok.columns else 0,
+                        "차트카드건수": int(ok["차트카드건수"].sum()) if "차트카드건수" in ok.columns else 0,
+                        "한솔매칭금액": int(ok["한솔매칭금액"].sum()) if "한솔매칭금액" in ok.columns else 0,
+                        "한솔매칭건수": int(ok["한솔매칭건수"].sum()) if "한솔매칭건수" in ok.columns else 0,
+                        "일마카드금액": int(ok["일마카드금액"].sum()) if "일마카드금액" in ok.columns else 0,
+                        "차이(차트-한솔)": 0,
+                    }])
+                    _common = [c for c in miss_cols if c in ok_sum.columns]
+                    ma = pd.concat([ok_sum[_common], ng], ignore_index=True)
+                else:
+                    ma = ng
+            ma.to_excel(writer, sheet_name="7_한솔vs차트_누락추정", index=False)
 
-        # ── Sheet 9: 일마↔차트 수단별 비교 ──
+        # ── Sheet 9: 일마↔차트 수단별 비교 (불일치만 — 일치 행은 요약 1줄) ──
         if not pc.empty:
             pc_cols = [c for c in ["매칭", "차트번호", "성명", "불일치상세",
                                     "[일마]카드", "[차트]카드", "[차트]본부금(참고)",
                                     "[일마]현금+이체", "[차트]현금+이체",
                                     "[일마]플랫폼", "[차트]플랫폼"] if c in pc.columns]
-            pc[pc_cols].to_excel(writer, sheet_name="8_일마vs차트_수단별비교", index=False)
+            pc_d = pc[pc_cols].copy()
+            if "불일치상세" in pc_d.columns:
+                ok = pc_d[pc_d["불일치상세"] == "✅일치"]
+                ng = pc_d[pc_d["불일치상세"] != "✅일치"]
+                if not ok.empty:
+                    pc_d = pd.concat([
+                        pd.DataFrame([{c: ("" if c not in ["매칭", "불일치상세"] else (f"✅일치 {len(ok)}건 (요약)" if c == "불일치상세" else "")) for c in pc_cols}]),
+                        ng,
+                    ], ignore_index=True)
+                else:
+                    pc_d = ng
+            pc_d.to_excel(writer, sheet_name="8_일마vs차트_수단별비교", index=False)
 
         # ── Sheet 10: 종합 미매칭 분석 ──
         if comprehensive is not None and not comprehensive.empty:
@@ -2744,9 +2777,24 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
         }
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="10_합계비교", index=False)
 
-        # ── Sheet 12: 크로스레퍼런스 (차트번호별 통합 뷰) ──
+        # ── Sheet 12: 크로스레퍼런스 (차트번호별 통합 뷰 — ✅일치는 요약 행으로 압축) ──
         cross_ref = _build_cross_reference_sheet(match_df, patient, hansol, unified_info=unified_info)
         if not cross_ref.empty:
+            if "상태" in cross_ref.columns:
+                ok = cross_ref[cross_ref["상태"] == "✅일치"]
+                ng = cross_ref[cross_ref["상태"] != "✅일치"]
+                if not ok.empty:
+                    ok_row = {c: "" for c in cross_ref.columns}
+                    ok_row["차트번호"] = f"✅일치 {len(ok)}건 요약"
+                    for num_c in ["차트_카드금액", "차트_현금금액", "차트_이체금액", "차트_플랫폼금액",
+                                   "차트_총액", "매칭_건수", "매칭_금액합"]:
+                        if num_c in ok.columns:
+                            ok_row[num_c] = int(ok[num_c].sum())
+                    ok_row["차이(차트-매칭)"] = 0
+                    ok_row["상태"] = f"✅일치 {len(ok)}건"
+                    cross_ref = pd.concat([pd.DataFrame([ok_row]), ng], ignore_index=True)
+                else:
+                    cross_ref = ng
             cross_ref.to_excel(writer, sheet_name="11_크로스레퍼런스", index=False)
 
         # ── Sheet 13: 무결성 검증 ──
@@ -2766,11 +2814,11 @@ def build_ai_merged_excel(hansol, daily, patient, match_df, hc_compare,
 def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
                             tots, pc, missing_all, comprehensive,
                             unified_info=None, cross_ref=None,
-                            max_chars=8000):
+                            max_chars=4500):
     """핵심 분석 데이터를 AI에 전송할 텍스트로 변환.
     핵심 목표: 한솔페이(PG)↔차트마감(EMR) 차이가 '어디서' 발생하는지 추적.
     토큰 최소화: 불일치 건만 전송, 일치 건은 통계만.
-    max_chars: 최대 문자 수 (Gemini 무료 TPM 한도 대응, 8000자≈2000토큰)."""
+    max_chars: 최대 문자 수 (Gemini 무료 한도 여유 확보, 4500자≈1800토큰 한국어 기준)."""
     lines = []
 
     # ── 1. 합계비교 (3개 소스 총합 + 차이) ──
@@ -2838,10 +2886,10 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
             # 금액 차이 큰 순 정렬
             cross_rows.sort(key=lambda x: abs(x["h_p"]) + abs(x["d_p_card"]), reverse=True)
             lines.append(f"\n[차트번호별 불일치★] {len(cross_rows)}건 (차이 있는 환자만)")
-            lines.append("차트번호,이름,한솔매칭카드,일마카드,차트카드,일마현금이체,차트현금이체,한솔-차트,일마카드-차트,일마현금-차트")
-            _limit = min(12, max(5, 12 - len(cross_rows) // 10))  # 데이터 많으면 축소
+            lines.append("차트번호,이름,한솔매칭카드,일마카드,차트카드,한솔-차트,일마-차트")
+            _limit = min(6, max(3, 6 - len(cross_rows) // 20))
             for r in cross_rows[:_limit]:
-                lines.append(f"{r['ch']},{r['name']},{r['h_card']},{r['d_card']},{r['p_card']},{r['d_cx']},{r['p_cx']},{r['h_p']},{r['d_p_card']},{r['d_p_cx']}")
+                lines.append(f"{r['ch']},{r['name']},{r['h_card']},{r['d_card']},{r['p_card']},{r['h_p']},{r['d_p_card']}")
             if len(cross_rows) > _limit:
                 lines.append(f"...외 {len(cross_rows) - _limit}건")
             # 불일치 합계
@@ -2852,12 +2900,12 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
     # ── 3. 한솔 미매칭 (일마에 매칭 안 된 한솔 거래 → 차이의 직접 원인) ──
     if not h_um.empty:
         lines.append(f"\n[한솔 미매칭] {len(h_um)}건 (합계:{int(h_um['금액'].sum()):,}원)")
-        cols = [c for c in ["금액", "승인번호", "카드번호", "is_현금"] if c in h_um.columns]
+        cols = [c for c in ["금액", "승인번호", "카드번호"] if c in h_um.columns]
         h_um_sorted = h_um.copy()
         if "금액" in h_um_sorted.columns:
             h_um_sorted = h_um_sorted.sort_values("금액", key=abs, ascending=False)
         lines.append(",".join(cols))
-        _limit = 7
+        _limit = 4
         for _, row in h_um_sorted.head(_limit).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
         if len(h_um) > _limit:
@@ -2873,26 +2921,17 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
             d_um_sorted["_abs_amt"] = pd.to_numeric(d_um_sorted["카드"], errors="coerce").fillna(0).abs()
             d_um_sorted = d_um_sorted.sort_values("_abs_amt", ascending=False)
         lines.append(",".join(cols))
-        _limit = 7
+        _limit = 4
         for _, row in d_um_sorted.head(_limit).iterrows():
             lines.append(",".join(str(row.get(c, "")) for c in cols))
         if len(d_um) > _limit:
             lines.append(f"...외 {len(d_um) - _limit}건")
 
-    # ── 5. 일마↔차트 수단별 불일치 (결제수단 오분류 추적) ──
+    # ── 5. 일마↔차트 수단별 불일치 (위 [차트번호별 불일치]와 중복 최소화: 개수만) ──
     if pc is not None and not pc.empty:
         mm = pc[pc["불일치상세"] != "✅일치"] if "불일치상세" in pc.columns else pc
         if not mm.empty:
-            lines.append(f"\n[일마vs차트 수단불일치] {len(mm)}건")
-            cols = [c for c in ["차트번호", "성명", "불일치상세",
-                                "[일마]카드", "[차트]카드",
-                                "[일마]현금+이체", "[차트]현금+이체"] if c in mm.columns]
-            lines.append(",".join(cols))
-            _limit = 8
-            for _, row in mm.head(_limit).iterrows():
-                lines.append(",".join(str(row.get(c, "")) for c in cols))
-            if len(mm) > _limit:
-                lines.append(f"...외 {len(mm) - _limit}건")
+            lines.append(f"\n[일마vs차트 수단불일치] {len(mm)}건 (상세는 위 차트번호별 불일치 참조)")
 
     # ── 6. 통계 요약 ──
     lines.append(f"\n[통계] 한솔{len(hansol)}건,일마{len(daily)}건,차트{len(patient)}건,매칭{len(match_df)}건,한솔미매칭{len(h_um)}건,일마미매칭{len(d_um)}건")
@@ -2906,31 +2945,24 @@ def _build_ai_analysis_text(hansol, daily, patient, match_df, h_um, d_um,
     return result
 
 
-AI_SYSTEM_PROMPT = """병원 정산 전문 분석관. 한솔페이(PG)·일일마감(프론트)·차트마감(EMR) 3개 대사 결과에서 금액 차이의 원인을 추적.
-원칙: 차트마감=기준원장. 차이가 나는 환자를 특정하고, 왜 차이가 나는지(미매칭/수단오분류/금액불일치) 구분. 간결·실무 중심."""
+AI_SYSTEM_PROMPT = """병원 정산 전문 분석관. 차트마감=기준원장. 한솔(PG)·일마(프론트)·차트(EMR) 3-Way 차이의 원인(미매칭/수단오분류/금액)을 환자 단위로 특정. 간결·실무 중심·중복금지."""
 
-AI_USER_PROMPT = """아래는 병원 3-Way 대사 결과입니다.
-
-★핵심 질문: 한솔페이(PG)와 차트마감(EMR) 사이에 차이가 어디서, 왜 발생하는가?
-- [합계비교]에서 카드/현금별 차이 금액을 먼저 확인
-- [차트번호별 불일치]에서 어떤 환자에서 차이가 나는지 특정
-- [미매칭]에서 매칭 안 된 거래가 차이의 원인인지 확인
-- 플랫폼(강남언니 등)은 한솔에 없으므로 일마↔차트 기준으로 비교
+AI_USER_PROMPT = """3-Way 정산 대사 결과. 한솔(PG)↔차트(EMR) 차이의 원인을 환자 단위로 추적.
+(플랫폼은 한솔 비포함 → 일마↔차트 기준)
 
 {data}
 
 ---
-아래 형식으로 간결하게 답변해주세요:
+다음 형식으로 1500토큰 이내 답변:
 
 ### 1. 총합 차이 원인
-카드/현금+이체/플랫폼별 차이 금액과 그 차이를 만드는 구체적 원인
+카드/현금/플랫폼별 차이금액과 핵심 원인 1줄씩
 
-### 2. 차이 발생 환자 (금액 큰 순)
-| 순위 | 차트번호 | 환자명 | 차이금액 | 차이원인 | 조치방안 |
-|-----|---------|-------|---------|---------|---------|
+### 2. 차이 발생 환자 (큰 순 최대 5명)
+| 순위 | 차트번호 | 환자명 | 차이금액 | 원인 | 조치 |
 
-### 3. 차이금액 검증
-위 환자들의 차이금액 합 = 총합 차이와 일치하는지 확인. 불일치 시 누락 건 지적.
+### 3. 검증
+위 환자 차이합 = 총합차이 여부 (불일치면 누락건 1줄 지적)
 
 ### 4. 결론 (1~2문장)"""
 
@@ -2989,15 +3021,46 @@ def _gemini_rate_limit_wait():
     st.session_state["_gemini_call_times"].append(_time.time())
 
 
-def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
-    """Google Gemini API를 사용한 자동 분석 (무료 API 한도 대응: RPM 15, TPM 100만)"""
+def _persistent_cache_path():
+    """페이지 리로드/세션 종료 후에도 동일 데이터 재분석 시 API 호출 0회를 보장하는 영구 캐시."""
+    import tempfile, os
+    d = os.path.join(tempfile.gettempdir(), "clinic_pay_gemini_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _cache_get(key):
+    import os, json
+    p = os.path.join(_persistent_cache_path(), f"{key}.json")
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f).get("result")
+        except Exception:
+            return None
+    return None
+
+
+def _cache_set(key, result):
+    import os, json, time as _time
+    p = os.path.join(_persistent_cache_path(), f"{key}.json")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"result": result, "ts": _time.time()}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def run_ai_analysis_gemini(api_key, analysis_text, user_question="", model_name="gemini-2.0-flash"):
+    """Google Gemini API를 사용한 자동 분석 (무료 한도: gemini-2.0-flash 기준 RPM 15 / TPM 100만 / RPD 1500).
+    최적화: 입력 4500자(~1800토큰), 출력 1500토큰, 영구 캐시(파일 기반)로 동일 분석 재호출 0회."""
     import time as _time
     import hashlib
     import google.generativeai as genai
     genai.configure(api_key=api_key)
 
-    # 데이터가 너무 크면 Gemini 무료 TPM(분당 토큰) 한도에 걸리므로 축소
-    _MAX_ANALYSIS_CHARS = 8000  # ~2000 토큰 (한국어 ≈ 4자/토큰) — 무료 한도 여유 확보
+    # 데이터가 너무 크면 Gemini 무료 TPM 한도에 걸리므로 축소 (한국어 ≈ 2.5자/토큰)
+    _MAX_ANALYSIS_CHARS = 4500  # ~1800 토큰 — 무료 한도 여유 확보
     if len(analysis_text) > _MAX_ANALYSIS_CHARS:
         analysis_text = analysis_text[:_MAX_ANALYSIS_CHARS] + \
             f"\n...(데이터 축소: 원본 {len(analysis_text)}자 → {_MAX_ANALYSIS_CHARS}자. 핵심 불일치 건만 포함됨)"
@@ -3006,14 +3069,21 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     if user_question:
         prompt += f"\n\n추가 질문: {user_question}"
 
-    # ── 캐시 확인: 동일 데이터+질문이면 API 호출 없이 즉시 반환 ──
-    _cache_key = hashlib.md5((analysis_text + user_question).encode()).hexdigest()
+    # ── 캐시 확인: 동일 데이터+질문+모델이면 API 호출 없이 즉시 반환 ──
+    _cache_key = hashlib.md5((model_name + "|" + analysis_text + "|" + user_question).encode()).hexdigest()
+    # 1) 세션 캐시 (가장 빠름)
     if st.session_state.get("_gemini_cache_key") == _cache_key and st.session_state.get("_gemini_cache_result"):
         return st.session_state["_gemini_cache_result"]
+    # 2) 영구 캐시 (페이지 리로드 후에도 보존)
+    _persisted = _cache_get(_cache_key)
+    if _persisted:
+        st.session_state["_gemini_cache_key"] = _cache_key
+        st.session_state["_gemini_cache_result"] = _persisted
+        return _persisted
 
     # system_instruction을 별도 파라미터로 전달 → 토큰 효율 향상
     model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
+        model_name=model_name,
         system_instruction=AI_SYSTEM_PROMPT,
     )
 
@@ -3021,20 +3091,21 @@ def run_ai_analysis_gemini(api_key, analysis_text, user_question=""):
     _gemini_rate_limit_wait()
 
     # 무료 API 한도(RPM 15) 대응: 429 에러 시 최대 3회 재시도
-    # 첫 재시도에서 65초 대기 → 분당 윈도우가 완전히 리셋되도록 보장
     max_retries = 3
     for attempt in range(max_retries + 1):
         try:
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=2500,
+                    max_output_tokens=1500,  # 출력 토큰 축소 → TPM 부담 감소·속도 향상
+                    temperature=0.3,         # 결정성↑ → 동일 입력 결과 일관 → 캐시 효율↑
                 ),
             )
             result = response.text
-            # 성공 시 캐시 저장
+            # 성공 시 세션·영구 캐시 모두 저장
             st.session_state["_gemini_cache_key"] = _cache_key
             st.session_state["_gemini_cache_result"] = result
+            _cache_set(_cache_key, result)
             return result
         except Exception as e:
             err = str(e)
@@ -3104,17 +3175,27 @@ def _render_ai_analysis_inline():
             _remaining = int(_cooldown - _elapsed)
             st.warning(f"⏳ {_remaining}초 후 다시 시도 가능합니다 (API 한도 보호)")
 
-        # 토큰 추정치 표시
+        # 토큰 추정치 표시 (한국어 약 2.5자/토큰)
         _analysis_text = st.session_state.get("_ai_analysis_text", "")
         if _analysis_text and ai_provider == "Gemini (Google)":
-            _est_tokens = len(_analysis_text) // 4 + 800  # 시스템프롬프트+출력 포함 추정
-            _color = "🟢" if _est_tokens < 3000 else "🟡" if _est_tokens < 5000 else "🔴"
-            # 캐시 여부 확인
+            # 4500자로 자동 트렁케이트 → 실제 전송량 반영
+            _send_chars = min(len(_analysis_text), 4500)
+            _est_input_tokens = int(_send_chars / 2.5) + 200  # 시스템프롬프트+사용자질문 포함
+            _est_output_tokens = 1500
+            _est_total = _est_input_tokens + _est_output_tokens
+            _color = "🟢" if _est_total < 3000 else "🟡" if _est_total < 5000 else "🔴"
+            # 캐시 여부 확인 (세션 + 영구)
             import hashlib as _hl
-            _ck = _hl.md5((_analysis_text + (user_question or "")).encode()).hexdigest()
-            _cached = st.session_state.get("_gemini_cache_key") == _ck and st.session_state.get("_gemini_cache_result")
+            _ck = _hl.md5(("gemini-2.0-flash|" + _analysis_text[:4500] + "|" + (user_question or "")).encode()).hexdigest()
+            _cached = (st.session_state.get("_gemini_cache_key") == _ck and st.session_state.get("_gemini_cache_result")) \
+                      or (_cache_get(_ck) is not None)
             _cache_note = " | 📦 캐시됨 (API 호출 없이 즉시 반환)" if _cached else ""
-            st.caption(f"{_color} 예상 토큰: ~{_est_tokens:,} (데이터 {len(_analysis_text):,}자){_cache_note}")
+            _trunc_note = f" → 전송 {_send_chars:,}자" if len(_analysis_text) > 4500 else ""
+            st.caption(
+                f"{_color} 예상 토큰: 입력 ~{_est_input_tokens:,} + 출력 ~{_est_output_tokens:,} = ~{_est_total:,} "
+                f"(데이터 {len(_analysis_text):,}자{_trunc_note}){_cache_note}"
+            )
+            st.caption("💡 무료 한도: RPM 15회 · TPM 100만 토큰 · RPD 1,500회. 입력 + 출력 = 호출당 ~3,300 토큰 → 분당 ~300건, 일 1,500건 가능.")
 
         if st.button("🚀 AI 분석 시작", type="primary", key="ai_analyze_btn_inline", disabled=not _can_call):
             analysis_text = st.session_state.get("_ai_analysis_text", "")
