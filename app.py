@@ -1709,7 +1709,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_text(channel_df, suspects_by_channel, max_chars=950):
+def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
     """채널 합계 대사 + 채널별 의심후보 TOP10 전달.
     구분자는 파이프(|) 사용 — 숫자 천단위 콤마와 충돌 방지."""
     def _f(v):
@@ -1751,25 +1751,33 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=950):
             L.append(f"\n[{ch}] {' / '.join(diffs)}")
             sus = suspects_by_channel.get(ch, [])
             if sus:
-                # ★★ 항목(승인번호 확정)은 별도 섹션으로 맨 앞에 강조
+                # ★★ → ★ → 일반 우선순위로 정렬 (절대규칙)
                 star2_sus = [s for s in sus if "★★" in str(s.get("출처", ""))]
-                other_sus = [s for s in sus if "★★" not in str(s.get("출처", ""))]
+                star1_sus = [s for s in sus if "★★" not in str(s.get("출처", "")) and "★" in str(s.get("출처", ""))]
+                plain_sus = [s for s in sus if "★" not in str(s.get("출처", ""))]
                 if star2_sus:
-                    L.append("[★★ 승인번호확정-최우선]")
+                    L.append("[★★ 승인번호확정-최우선 (절대 1순위)]")
                     L.append("출처|환자|금액|단서")
-                    for s in star2_sus[:5]:
-                        clue = str(s.get("단서", ""))[:90].replace("|", " ")
+                    for s in star2_sus[:10]:
+                        clue = str(s.get("단서", ""))[:70].replace("|", " ")
                         nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
                         L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
-                    L.append("[이하 참고후보]")
-
-                L.append("출처|환자|금액|단서")
-                for s in other_sus[:(10 - len(star2_sus))]:
-                    is_star = "★" in str(s.get("출처", ""))
-                    clue_limit = 80 if is_star else 50
-                    clue = str(s.get("단서", ""))[:clue_limit].replace("|", " ")
-                    nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:12]
-                    L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
+                remaining = max(0, 10 - len(star2_sus[:10]))
+                if star1_sus and remaining > 0:
+                    L.append("[★ 유력후보 (2순위)]")
+                    L.append("출처|환자|금액|단서")
+                    for s in star1_sus[:remaining]:
+                        clue = str(s.get("단서", ""))[:70].replace("|", " ")
+                        nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
+                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
+                    remaining = max(0, remaining - len(star1_sus[:remaining]))
+                if plain_sus and remaining > 0:
+                    L.append("[참고후보 (3순위)]")
+                    L.append("출처|환자|금액|단서")
+                    for s in plain_sus[:remaining]:
+                        clue = str(s.get("단서", ""))[:70].replace("|", " ")
+                        nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
+                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
 
     text = "\n".join(L)
     if len(text) > max_chars:
@@ -1779,26 +1787,30 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=950):
 
 AI_SYSTEM = (
     "병원 정산 분석관. 한솔(PG)·일마(프론트)·차트(EMR) 채널합계 차이 원인 진단. "
-    "출처가 '★ 차이값 정확매칭 페어'인 항목은 gap을 수학적으로 완전히 설명하는 최우선 의심 거래이므로 "
-    "반드시 1순위로 제시. 출처에 ★이 있는 항목은 gap과 근사 일치하는 유력 후보로 ★ 없는 항목보다 위에 배치."
+    "[태그 우선순위 절대규칙] ★★ > ★ > 일반. 이 순서는 어떤 경우에도 뒤집을 수 없음. "
+    "★★(승인번호 cross-match로 동일환자 확정)는 환자 특정이 끝난 확정 단서이므로 반드시 1순위. "
+    "★(차이값 정확매칭/gap 근사일치)는 ★★ 다음 2순위. "
+    "★ 없는 일반 항목은 참고용 3순위. "
+    "동일 등급 내에서는 금액 크기·gap 일치도로 정렬."
 )
 
 AI_USER = """3개 파일 채널 합계 대사:
 
 {data}
 
-[우선순위 규칙]
-- "★ 차이값 정확매칭 페어": gap과 수학적으로 정확히 일치 → 반드시 TOP1 (환자명 명시)
-- 출처에 ★ 있음: gap과 근사 일치하는 유력 후보 → ★ 없는 항목보다 위에 배치
-- 출처에 ★ 없음: 참고용 후보
+[태그 우선순위 절대규칙 — 위반 금지]
+1순위: ★★ (승인번호확정) — 환자가 이미 특정된 확정 단서. 무조건 최상단.
+2순위: ★         — gap과 수학적/근사 일치하는 유력 후보. ★★ 아래, 일반 위.
+3순위: 태그 없음 — 참고용. 절대 ★/★★ 위로 올리지 말 것.
+※ 위 순서는 금액·환자명·채널과 무관하게 항상 유지.
 
-900토큰 이내, 다음 형식만 출력:
+1100토큰 이내, 다음 형식만 출력:
 
 ### 채널별 차이 진단
 각 차이가 0이 아닌 채널마다 ↓
 - **{{채널}}**: 한솔-차트=?원 / 한솔-일마=?원 / 일마-차트=?원
   - 가장 유력한 원인: (예: "한솔 PG에 X원 결제건 누락" / "차트에서 카드↔현금 오기재")
-  - 의심 후보 TOP10 (출처/환자/금액/조치) — ★ 항목을 반드시 최상위에 배치
+  - 의심 후보 TOP10 (출처/환자/금액/조치) — 반드시 ★★ → ★ → 일반 순서로 나열
 
 ### 결론 (1문장)
 어느 파일의 어느 거래(환자명 포함)를 수정해야 합계가 맞을지."""
@@ -2193,6 +2205,16 @@ else:
                         )
 
                 sus_df = pd.DataFrame(sus)
+                # ★★ → ★ → 일반 우선순위로 정렬 (절대규칙)
+                def _prio(src):
+                    s = str(src)
+                    if "★★" in s:
+                        return 0
+                    if "★" in s:
+                        return 1
+                    return 2
+                sus_df["_prio"] = sus_df["출처"].apply(_prio)
+                sus_df = sus_df.sort_values("_prio", kind="stable").drop(columns=["_prio"]).reset_index(drop=True)
                 sus_df["금액"] = sus_df["금액"].apply(lambda v: f"{int(v):+,}")
                 # 환자명 컬럼 통합 (환자 / 환자(추정) 둘 중 하나)
                 if "환자" not in sus_df.columns and "환자(추정)" in sus_df.columns:
