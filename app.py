@@ -1856,17 +1856,27 @@ def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_cha
             pd.DataFrame({"상태": ["일마 미매칭 없음"]}).to_excel(w, sheet_name="3_P2_일마미매칭", index=False)
 
         # 시트4: 합계
-        rows = [
-            ["카드", totals["h_card"], totals["d_card"], totals["p_card"],
-             totals["p_card"]-totals["h_card"], totals["h_card"]-totals["d_card"]],
-            ["현금+이체", totals["h_cash"], totals["d_cashxfer"], totals["p_cashxfer"],
-             totals["p_cashxfer"]-totals["h_cash"], totals["h_cash"]-totals["d_cashxfer"]],
-            ["플랫폼", 0, totals["d_plat"], totals["p_plat"],
-             totals["p_plat"]-totals["d_plat"], 0],
-        ]
-        pd.DataFrame(rows, columns=["구분", "한솔", "일마", "차트",
-                                     "차트-한솔(P1)", "한솔-일마(P2)"]).to_excel(
-            w, sheet_name="4_합계", index=False)
+        has_h = totals.get("_has_hansol", True)
+        if has_h:
+            rows = [
+                ["카드", totals["h_card"], totals["d_card"], totals["p_card"],
+                 totals["p_card"]-totals["h_card"], totals["h_card"]-totals["d_card"]],
+                ["현금+이체", totals["h_cash"], totals["d_cashxfer"], totals["p_cashxfer"],
+                 totals["p_cashxfer"]-totals["h_cash"], totals["h_cash"]-totals["d_cashxfer"]],
+                ["플랫폼", 0, totals["d_plat"], totals["p_plat"],
+                 totals["p_plat"]-totals["d_plat"], 0],
+            ]
+            pd.DataFrame(rows, columns=["구분", "한솔", "일마", "차트",
+                                         "차트-한솔(P1)", "한솔-일마(P2)"]).to_excel(
+                w, sheet_name="4_합계", index=False)
+        else:
+            rows = [
+                ["카드", totals["d_card"], totals["p_card"], totals["p_card"]-totals["d_card"]],
+                ["현금+이체", totals["d_cashxfer"], totals["p_cashxfer"], totals["p_cashxfer"]-totals["d_cashxfer"]],
+                ["플랫폼", totals["d_plat"], totals["p_plat"], totals["p_plat"]-totals["d_plat"]],
+            ]
+            pd.DataFrame(rows, columns=["구분", "일마", "차트", "차트-일마"]).to_excel(
+                w, sheet_name="4_합계", index=False)
     buf.seek(0)
     return buf.getvalue()
 
