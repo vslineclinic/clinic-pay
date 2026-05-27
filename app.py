@@ -1709,9 +1709,9 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
+def build_ai_text(channel_df, suspects_by_channel, max_chars=1600):
     """채널 합계 대사 + 채널별 의심후보 TOP10 전달.
-    구분자는 파이프(|) 사용 — 숫자 천단위 콤마와 충돌 방지."""
+    구분자는 파이프(|) 사용 — 숫자는 천단위 콤마로 가독성 강화."""
     def _f(v):
         if v is None:
             return "-"
@@ -1720,7 +1720,7 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
                 return "-"
         except Exception:
             pass
-        return str(int(v))  # 토큰 절약: 콤마 제거
+        return f"{int(v):,}"
 
     L = []
     L.append("채널|한솔|일마|차트|한솔-차트|한솔-일마|일마-차트")
@@ -1740,7 +1740,7 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
             except Exception:
                 pass
             if int(v) != 0:
-                diffs.append(f"{col}={int(v):+d}")
+                diffs.append(f"{col}={int(v):+,}")
         if diffs:
             nonzero_channels.append((r["채널"], diffs))
 
@@ -1761,7 +1761,7 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
                     for s in star2_sus[:10]:
                         clue = str(s.get("단서", ""))[:70].replace("|", " ")
                         nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
-                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
+                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+,}|{clue}")
                 remaining = max(0, 10 - len(star2_sus[:10]))
                 if star1_sus and remaining > 0:
                     L.append("[★ 유력후보 (2순위)]")
@@ -1769,7 +1769,7 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
                     for s in star1_sus[:remaining]:
                         clue = str(s.get("단서", ""))[:70].replace("|", " ")
                         nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
-                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
+                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+,}|{clue}")
                     remaining = max(0, remaining - len(star1_sus[:remaining]))
                 if plain_sus and remaining > 0:
                     L.append("[참고후보 (3순위)]")
@@ -1777,7 +1777,7 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1200):
                     for s in plain_sus[:remaining]:
                         clue = str(s.get("단서", ""))[:70].replace("|", " ")
                         nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
-                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+d}|{clue}")
+                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+,}|{clue}")
 
     text = "\n".join(L)
     if len(text) > max_chars:
@@ -2032,7 +2032,7 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
 # UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-st.title("📊 병원 정산 차이 추적기")
+st.title("📊 BW 컨설팅 AI 정산 분석 시스템")
 st.caption("★ 결제채널별 파일 합계 차이를 먼저 산출 → 차이를 설명할 후보 거래 추적 | 일마+차트 2개 또는 한솔+일마+차트 3개 분석 가능")
 
 if "done" not in st.session_state:
@@ -2145,15 +2145,51 @@ else:
         k2.metric("⚠️ 차이있는 채널-쌍", nonzero_count, delta_color="inverse")
 
     title_suffix = "3개 파일" if has_hansol else "일마↔차트 2개 파일"
-    st.markdown(f"### ★ 채널별 합계 대사 ({title_suffix})")
+    st.markdown(f"### ★ 교차분석 합계 ({title_suffix})")
     caption_suffix = "한솔·일마·차트" if has_hansol else "일마·차트"
-    st.caption(f"각 채널의 {caption_suffix} 합계를 비교 — **0이 아닌 차이값이 있으면 그 채널을 우선 추적**")
-    disp_df = channel_df.copy()
-    for c in disp_df.columns:
-        if c == "채널":
-            continue
-        disp_df[c] = disp_df[c].apply(lambda v: "-" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{int(v):,}")
-    st.dataframe(disp_df, width="stretch", hide_index=True)
+    st.caption(
+        f"각 채널의 {caption_suffix} 합계를 비교 — **차트 기준으로 일마·한솔이 같으면 🟦 파랑, 다르면 🟥 빨강**"
+    )
+
+    def _fmt_amt(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "-"
+        try:
+            return f"{int(v):,}"
+        except Exception:
+            return "-"
+
+    def _style_chart_compare(row):
+        styles = [""] * len(row)
+        cols = row.index.tolist()
+        chart_v = row.get("차트")
+        try:
+            chart_int = int(chart_v) if chart_v is not None and not (isinstance(chart_v, float) and pd.isna(chart_v)) else None
+        except Exception:
+            chart_int = None
+        for i, c in enumerate(cols):
+            if c not in ("일마", "한솔"):
+                continue
+            v = row[c]
+            if v is None or (isinstance(v, float) and pd.isna(v)) or chart_int is None:
+                continue
+            try:
+                same = int(v) == chart_int
+            except Exception:
+                continue
+            if same:
+                styles[i] = "background-color: #cfe7ff; color: #003366; font-weight: 700"
+            else:
+                styles[i] = "background-color: #ffcccc; color: #8b0000; font-weight: 700"
+        return styles
+
+    fmt_cols = {c: _fmt_amt for c in channel_df.columns if c != "채널"}
+    styler = (
+        channel_df.style
+        .format(fmt_cols)
+        .apply(_style_chart_compare, axis=1)
+    )
+    st.dataframe(styler, width="stretch", hide_index=True)
 
     if nonzero_count == 0:
         st.success("✅ 모든 채널 합계 일치 — 추가 분석 불필요")
