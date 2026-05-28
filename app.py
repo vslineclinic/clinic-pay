@@ -8,7 +8,9 @@
 원칙:
   - 채널 합계 차이 → 의심 후보(소수) → AI 한 줄 진단 흐름
   - 1:1 매칭은 후보 식별 도구로만 사용 (메인 산출물 아님)
-  - AI 입력 ≤ ~600자 / 출력 ≤ 800토큰 / 무료 한도(2.5-flash-lite 기준) 내
+  - AI 입력: 차트번호·승인번호로 3개 파일을 join한 통합 raw 구조 (≤ ~8KB / ~3K토큰)
+    → AI가 단순 비교가 아닌 cross-file 추적 분석 수행
+  - 출력 ≤ 900토큰 / Gemini 무료 한도(2.5-flash-lite: 250K TPM) 내
 """
 
 import importlib
@@ -1705,13 +1707,38 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# AI 분석 텍스트 (채널 중심 ~600자 / ~250토큰)
+# AI 분석 텍스트 (3-way 통합 데이터 ~6~8KB / ~2~3K토큰)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_text(channel_df, suspects_by_channel, max_chars=1600):
-    """채널 합계 대사 + 채널별 의심후보 TOP10 전달.
-    구분자는 파이프(|) 사용 — 숫자는 천단위 콤마로 가독성 강화."""
+def _safe_int(v, default=0):
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
+                  p1_full, h_um, d_um, suspects_by_channel,
+                  totals=None, max_chars=8000):
+    """3개 파일(한솔/일마/차트)을 차트번호·승인번호 join으로 유기적 연결한 통합 raw 구조.
+    AI가 사전요약을 rephrase하는게 아니라 cross-file 추적분석을 수행할 수 있게 한다.
+
+    섹션 구성:
+      [META]              — 파일별 건수·총액 (방향감각)
+      [채널대사]           — 채널×파일 합계·차이 (분석 진입점)
+      [★★승인번호확정]    — 한솔↔차트 승인번호 매핑 + 금액불일치 (코드추출 확정단서)
+      [차트번호3way통합]   — 한 환자의 차트/일마/한솔 채널별 금액을 한 줄로 (오기재 패턴추적)
+      [한솔PG-only]        — PG미매칭 + 동일금액 일마환자 hint (누락추정)
+      [일마front-only]     — front미매칭 카드 (PG에 없음 = 결제수단 오기재 의심)
+      [차트환불/일마환불]   — 합계에 영향 주는 음수 행
+
+    구분자 파이프(|). 숫자 천단위 콤마. 차이가 0이면 META+채널대사만 반환.
+    """
+    has_hansol = hansol is not None and not hansol.empty
+
     def _f(v):
         if v is None:
             return "-"
@@ -1723,97 +1750,311 @@ def build_ai_text(channel_df, suspects_by_channel, max_chars=1600):
         return f"{int(v):,}"
 
     L = []
-    L.append("채널|한솔|일마|차트|한솔-차트|한솔-일마|일마-차트")
-    for _, r in channel_df.iterrows():
-        L.append(f"{r['채널']}|{_f(r['한솔'])}|{_f(r['일마'])}|{_f(r['차트'])}|{_f(r['한솔-차트'])}|{_f(r['한솔-일마'])}|{_f(r['일마-차트'])}")
 
-    nonzero_channels = []
+    # ── [META] ──────────────────────────────────────
+    L.append("[META]")
+    if has_hansol:
+        h_ok = hansol[hansol["tx_status"] == "정상"]
+        h_can = hansol[hansol["tx_status"] == "취소"]
+        h_um_n = len(h_um) if h_um is not None and not h_um.empty else 0
+        h_um_sum = int(h_um["금액"].sum()) if h_um_n else 0
+        L.append(
+            f"한솔: 정상={len(h_ok)}건/{int(h_ok['금액'].sum()):,}원 · "
+            f"취소={len(h_can)}건/{int(h_can['금액'].sum()):,}원 · "
+            f"PG미매칭={h_um_n}건/{h_um_sum:,}원"
+        )
+    d_um_n = len(d_um) if d_um is not None and not d_um.empty else 0
+    d_um_sum = int(d_um["카드"].sum()) if d_um_n else 0
+    d_ref_n = len(daily_refund) if daily_refund is not None and not daily_refund.empty else 0
+    d_ref_sum = int(daily_refund["총액"].sum()) if d_ref_n and "총액" in daily_refund.columns else 0
+    L.append(f"일마: 총{len(daily)}건 · 카드미매칭={d_um_n}건/{d_um_sum:,}원 · 환불행={d_ref_n}건/{d_ref_sum:,}원")
+    if "분류" in patient.columns:
+        p_cnt = patient["분류"].value_counts().to_dict()
+        p_can_n = int(patient["is_취소"].sum()) if "is_취소" in patient.columns else 0
+        L.append(
+            f"차트: 카드={p_cnt.get('카드',0)} 현금={p_cnt.get('현금',0)} "
+            f"이체={p_cnt.get('이체',0)} 플랫폼={p_cnt.get('플랫폼',0)} (취소행={p_can_n})"
+        )
+
+    # ── [채널대사] ──────────────────────────────────
+    L.append("\n[채널대사]")
+    L.append("채널|한솔|일마|차트|한-차|한-일|일-차")
     for _, r in channel_df.iterrows():
-        diffs = []
-        for col in ["한솔-차트", "한솔-일마", "일마-차트"]:
-            v = r[col]
-            if v is None:
-                continue
+        L.append(
+            f"{r['채널']}|{_f(r['한솔'])}|{_f(r['일마'])}|{_f(r['차트'])}|"
+            f"{_f(r['한솔-차트'])}|{_f(r['한솔-일마'])}|{_f(r['일마-차트'])}"
+        )
+
+    # 차이 zero 단축
+    diff_cols = ["한솔-차트", "한솔-일마", "일마-차트"] if has_hansol else ["일마-차트"]
+    has_nonzero = False
+    for _, r in channel_df.iterrows():
+        for c in diff_cols:
+            v = r[c]
             try:
-                if pd.isna(v):
-                    continue
+                if v is not None and not pd.isna(v) and int(v) != 0:
+                    has_nonzero = True
+                    break
             except Exception:
                 pass
-            if int(v) != 0:
-                diffs.append(f"{col}={int(v):+,}")
-        if diffs:
-            nonzero_channels.append((r["채널"], diffs))
+        if has_nonzero:
+            break
+    if not has_nonzero:
+        L.append("\n[결과] 모든채널 일치 — 추가분석 불필요")
+        return "\n".join(L)[:max_chars]
 
-    if not nonzero_channels:
-        L.append("\n[결과] 모든채널 일치")
-    else:
-        for ch, diffs in nonzero_channels:
-            L.append(f"\n[{ch}] {' / '.join(diffs)}")
-            sus = suspects_by_channel.get(ch, [])
-            if sus:
-                # ★★ → ★ → 일반 우선순위로 정렬 (절대규칙)
-                star2_sus = [s for s in sus if "★★" in str(s.get("출처", ""))]
-                star1_sus = [s for s in sus if "★★" not in str(s.get("출처", "")) and "★" in str(s.get("출처", ""))]
-                plain_sus = [s for s in sus if "★" not in str(s.get("출처", ""))]
-                if star2_sus:
-                    L.append("[★★ 승인번호확정-최우선 (절대 1순위)]")
-                    L.append("출처|환자|금액|단서")
-                    for s in star2_sus[:10]:
-                        clue = str(s.get("단서", ""))[:70].replace("|", " ")
-                        nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
-                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+,}|{clue}")
-                remaining = max(0, 10 - len(star2_sus[:10]))
-                if star1_sus and remaining > 0:
-                    L.append("[★ 유력후보 (2순위)]")
-                    L.append("출처|환자|금액|단서")
-                    for s in star1_sus[:remaining]:
-                        clue = str(s.get("단서", ""))[:70].replace("|", " ")
-                        nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
-                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+,}|{clue}")
-                    remaining = max(0, remaining - len(star1_sus[:remaining]))
-                if plain_sus and remaining > 0:
-                    L.append("[참고후보 (3순위)]")
-                    L.append("출처|환자|금액|단서")
-                    for s in plain_sus[:remaining]:
-                        clue = str(s.get("단서", ""))[:70].replace("|", " ")
-                        nm = str(s.get("환자", s.get("환자(추정)", ""))).replace("|", " ")[:14]
-                        L.append(f"{s['출처']}|{nm}|{int(s['금액']):+,}|{clue}")
+    # ── 차트번호 → 이름 맵 ────────────────────────
+    name_map = {}
+    if not daily.empty and "성명" in daily.columns:
+        for _, row in daily[["차트번호", "성명"]].drop_duplicates("차트번호").iterrows():
+            ch = clean_no(row["차트번호"])
+            nm = str(row["성명"]).strip()
+            if ch and nm and nm != "nan":
+                name_map[ch] = nm
+    if not patient.empty and "이름" in patient.columns:
+        for _, row in patient[["차트번호", "이름"]].drop_duplicates("차트번호").iterrows():
+            ch = clean_no(row["차트번호"])
+            nm = str(row["이름"]).strip()
+            if ch and nm and nm != "nan" and ch not in name_map:
+                name_map[ch] = nm
+
+    # ── [★★ 승인번호확정매칭] ────────────────────
+    star2_all = []
+    seen_key = set()
+    for ch_sus in suspects_by_channel.values():
+        for s in ch_sus:
+            if "★★" not in str(s.get("출처", "")):
+                continue
+            key = (str(s.get("환자", "")), int(s.get("금액", 0)))
+            if key in seen_key:
+                continue
+            seen_key.add(key)
+            star2_all.append(s)
+    if star2_all:
+        # gap일치 → 일반 ★★ 순으로
+        star2_all.sort(key=lambda x: (0 if "gap일치" in str(x["출처"]) else 1, -abs(int(x["금액"]))))
+        L.append("\n[★★ 승인번호확정매칭 — 한솔↔차트 동일환자·금액불일치 (1순위)]")
+        L.append("환자|차이금액|단서")
+        for s in star2_all[:10]:
+            nm = str(s.get("환자", ""))[:14].replace("|", " ")
+            clue = str(s.get("단서", ""))[:90].replace("|", " ")
+            L.append(f"{nm}|{int(s['금액']):+,}|{clue}")
+
+    # ── [차트번호 3-way 통합] ─────────────────────
+    # 차트(분류별) / 일마(채널별) / 한솔(매칭카드합) per 차트번호
+    p_pivot = {}
+    if not patient.empty and "분류" in patient.columns:
+        for _, r in patient.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            cat = str(r.get("분류", ""))
+            amt = _safe_int(r.get("금액", 0))
+            d = p_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+            if cat in d:
+                d[cat] += amt
+
+    d_pivot = {}
+    if not daily.empty:
+        for _, r in daily.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            d = d_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+            d["카드"] += _safe_int(r.get("카드", 0))
+            d["현금"] += _safe_int(r.get("현금", 0))
+            d["이체"] += _safe_int(r.get("이체", 0))
+            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+
+    h_card_by_ch = {}
+    if p1_full is not None and not p1_full.empty:
+        for _, r in p1_full.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            h_card_by_ch[ch] = (_safe_int(r.get("한솔카드", 0)), _safe_int(r.get("한솔건수", 0)))
+
+    p_appr_by_ch = {}
+    if not patient.empty and "승인번호목록" in patient.columns:
+        for ch_g, grp in patient.groupby("차트번호"):
+            ch = clean_no(ch_g)
+            if not ch:
+                continue
+            appr = set()
+            for lst in grp["승인번호목록"]:
+                if isinstance(lst, list):
+                    for a in lst:
+                        s = str(a)
+                        if len(s) >= 5:
+                            appr.add(s[-8:])
+            if appr:
+                p_appr_by_ch[ch] = sorted(appr)[:2]
+
+    all_charts = set(p_pivot.keys()) | set(d_pivot.keys()) | set(h_card_by_ch.keys())
+    cross_rows = []
+    for ch in all_charts:
+        p = p_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+        d = d_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+        h_amt, h_cnt = h_card_by_ch.get(ch, (0, 0))
+        diffs = []
+        if has_hansol and h_amt != d["카드"]:
+            diffs.append(f"한솔카드{h_amt:,}≠일마카드{d['카드']:,}")
+        if d["카드"] != p["카드"]:
+            diffs.append(f"일마카드{d['카드']:,}≠차트카드{p['카드']:,}")
+        if d["현금"] != p["현금"]:
+            diffs.append(f"현금{d['현금']:,}≠차트{p['현금']:,}")
+        if d["이체"] != p["이체"]:
+            diffs.append(f"이체{d['이체']:,}≠차트{p['이체']:,}")
+        if d["플랫폼"] != p["플랫폼"]:
+            diffs.append(f"플랫폼{d['플랫폼']:,}≠차트{p['플랫폼']:,}")
+        if not diffs:
+            continue
+        gap_size = (
+            (abs(h_amt - d["카드"]) if has_hansol else 0)
+            + abs(d["카드"] - p["카드"]) + abs(d["현금"] - p["현금"])
+            + abs(d["이체"] - p["이체"]) + abs(d["플랫폼"] - p["플랫폼"])
+        )
+        cross_rows.append((gap_size, ch, p, d, h_amt, h_cnt, diffs))
+
+    cross_rows.sort(key=lambda x: -x[0])
+    if cross_rows:
+        L.append("\n[차트번호별 3-way 통합 — 차이있는 환자, gap큰순 TOP25]")
+        if has_hansol:
+            L.append("차트#|이름|차트(카/현/이/플)|일마(카/현/이/플)|한솔카드(건)|차트승인말미|차이요약")
+        else:
+            L.append("차트#|이름|차트(카/현/이/플)|일마(카/현/이/플)|차트승인말미|차이요약")
+        for _, ch, p, d, h_amt, h_cnt, diffs in cross_rows[:25]:
+            nm = name_map.get(ch, "")[:10].replace("|", " ")
+            p_str = f"{p['카드']:,}/{p['현금']:,}/{p['이체']:,}/{p['플랫폼']:,}"
+            d_str = f"{d['카드']:,}/{d['현금']:,}/{d['이체']:,}/{d['플랫폼']:,}"
+            appr = ",".join(p_appr_by_ch.get(ch, [])) or "-"
+            diff_str = " · ".join(diffs)[:90]
+            if has_hansol:
+                L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_amt:,}({h_cnt})|{appr}|{diff_str}")
+            else:
+                L.append(f"{ch}|{nm}|{p_str}|{d_str}|{appr}|{diff_str}")
+
+    # ── 채널 gap 산출 (PG-only/front-only 정렬용) ──
+    gap_card = 0
+    if totals:
+        h_c = totals.get("h_card")
+        if h_c is not None:
+            gap_card = h_c - totals.get("d_card", 0)
+            if gap_card == 0:
+                gap_card = h_c - totals.get("p_card", 0)
+        if gap_card == 0:
+            gap_card = totals.get("d_card", 0) - totals.get("p_card", 0)
+
+    def _rank(amt):
+        a = abs(int(amt))
+        g = abs(int(gap_card))
+        return (abs(a - g), -a) if g else (-a, 0)
+
+    # ── [한솔 PG-only] ───────────────────────────
+    if has_hansol and h_um is not None and not h_um.empty:
+        d_amt_to_names = {}
+        if not daily.empty:
+            for _, row in daily.iterrows():
+                amt = _safe_int(row.get("카드", 0))
+                nm = str(row.get("성명", "")).strip()
+                if amt > 0 and nm and nm != "nan":
+                    d_amt_to_names.setdefault(amt, [])
+                    if nm not in d_amt_to_names[amt]:
+                        d_amt_to_names[amt].append(nm)
+
+        L.append("\n[한솔 PG-only 카드미매칭 — gap근접순 TOP15]")
+        L.append("시각|금액|카드사|말미|승인번호|동일금액일마환자")
+        h_sorted = sorted(h_um.to_dict("records"), key=lambda r: _rank(r.get("금액", 0)))
+        for r in h_sorted[:15]:
+            t = str(r.get("시간표시", ""))[:8]
+            amt = _safe_int(r.get("금액", 0))
+            cs = str(r.get("카드사", ""))[:5]
+            cn = str(r.get("카드번호", ""))
+            tail = cn[-4:] if cn and cn != "nan" else ""
+            ap = str(r.get("승인번호", ""))[-8:]
+            cands = d_amt_to_names.get(amt, [])
+            cand_str = ("·".join(cands[:2]) + "?") if cands else "-"
+            L.append(f"{t}|{amt:,}|{cs}|*{tail}|{ap}|{cand_str}")
+
+    # ── [일마 front-only] ────────────────────────
+    if d_um is not None and not d_um.empty:
+        L.append("\n[일마 front-only 카드미매칭 — gap근접순 TOP15]")
+        L.append("차트#|이름|금액|내원순서")
+        d_sorted = sorted(d_um.to_dict("records"), key=lambda r: _rank(r.get("카드", 0)))
+        for r in d_sorted[:15]:
+            ch = clean_no(r.get("차트번호", ""))
+            nm = str(r.get("성명", ""))[:10]
+            amt = _safe_int(r.get("카드", 0))
+            ord_v = _safe_int(r.get("내원순서", 0))
+            L.append(f"{ch}|{nm}|{amt:,}|{ord_v}")
+
+    # ── [차트환불/취소] ──────────────────────────
+    if not patient.empty and "is_취소" in patient.columns:
+        p_can = patient[patient["is_취소"]]
+        if not p_can.empty:
+            L.append("\n[차트환불/취소 — 합계에 영향]")
+            L.append("차트#|이름|분류|금액")
+            for _, r in p_can.head(10).iterrows():
+                ch = clean_no(r.get("차트번호", ""))
+                nm = str(r.get("이름", ""))[:10]
+                cat = str(r.get("분류", ""))
+                amt = _safe_int(r.get("금액", 0))
+                L.append(f"{ch}|{nm}|{cat}|{amt:+,}")
+
+    # ── [일마환불/취소 행] ───────────────────────
+    if daily_refund is not None and not daily_refund.empty:
+        L.append("\n[일마환불/취소 행]")
+        L.append("차트#|성명|카드|현금|이체|플랫폼")
+        for _, r in daily_refund.head(10).iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            nm = str(r.get("성명", ""))[:10]
+            L.append(
+                f"{ch}|{nm}|{_safe_int(r.get('카드',0)):,}|"
+                f"{_safe_int(r.get('현금',0)):,}|{_safe_int(r.get('이체',0)):,}|"
+                f"{_safe_int(r.get('플랫폼합',0)):,}"
+            )
 
     text = "\n".join(L)
     if len(text) > max_chars:
-        text = text[:max_chars] + "\n(축소)"
+        text = text[:max_chars] + "\n…(축약)"
     return text
 
 
 AI_SYSTEM = (
-    "병원 정산 분석관. 한솔(PG)·일마(프론트)·차트(EMR) 채널합계 차이 원인 진단. "
-    "[태그 우선순위 절대규칙] ★★ > ★ > 일반. 이 순서는 어떤 경우에도 뒤집을 수 없음. "
-    "★★(승인번호 cross-match로 동일환자 확정)는 환자 특정이 끝난 확정 단서이므로 반드시 1순위. "
-    "★(차이값 정확매칭/gap 근사일치)는 ★★ 다음 2순위. "
-    "★ 없는 일반 항목은 참고용 3순위. "
-    "동일 등급 내에서는 금액 크기·gap 일치도로 정렬."
+    "병원 정산 분석관. 입력은 한솔(PG)·일마(프론트)·차트(EMR) 3개 파일을 "
+    "차트번호·승인번호로 join한 raw cross-file 구조다. "
+    "사전 요약이 아니라 추적 단서이므로, 직접 추론하여 어느 파일의 어느 거래(환자명·차트번호·금액)가 "
+    "잘못됐는지 특정하라. "
+    "[우선순위 절대규칙] ★★(승인번호로 동일환자 확정) > ★(금액·gap 매칭) > 일반. "
+    "이 순서는 어떤 경우에도 뒤집을 수 없으며, 동일등급 내에서는 금액크기·gap일치도로 정렬."
 )
 
-AI_USER = """3개 파일 채널 합계 대사:
+AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호로 통합):
 
 {data}
 
-[태그 우선순위 절대규칙 — 위반 금지]
-1순위: ★★ (승인번호확정) — 환자가 이미 특정된 확정 단서. 무조건 최상단.
-2순위: ★         — gap과 수학적/근사 일치하는 유력 후보. ★★ 아래, 일반 위.
-3순위: 태그 없음 — 참고용. 절대 ★/★★ 위로 올리지 말 것.
-※ 위 순서는 금액·환자명·채널과 무관하게 항상 유지.
+[분석 지침 — 위 데이터는 사전요약이 아닌 raw 통합구조다]
+1) [채널대사]에서 차이≠0 채널을 진단대상으로 식별
+2) [★★승인번호확정매칭]은 PG↔EMR 승인번호로 환자가 이미 확정된 단서 — 절대 1순위 수정대상
+3) [차트번호별 3-way 통합]에서 환자별 결제수단 오기재 패턴 추적:
+   · 차트(28000/0/0/0) · 일마(0/28000/0/0) → 카드↔현금 오기재 (한 환자가 채널을 바꿔 적힘)
+   · 차트(56000/...) · 일마(28000/...) · 한솔카드(28000) → 차트 중복기재 의심
+   · 차트(0/0/0/0) · 일마(50000/0/0/0) → 차트에 결제건 누락
+4) [한솔 PG-only]의 '동일금액일마환자' hint로 누락된 환자 추정
+5) [일마 front-only]는 PG승인내역이 없음 → 결제수단 오기재 또는 미수납 가능성
+6) [환불/취소] 행은 합계차이 원인일 수 있음 — 채널대사와 부호 검증
 
-1100토큰 이내, 다음 형식만 출력:
+[출력 형식 — 1100토큰 이내]
 
 ### 채널별 차이 진단
-각 차이가 0이 아닌 채널마다 ↓
+차이≠0인 채널마다:
 - **{{채널}}**: 한솔-차트=?원 / 한솔-일마=?원 / 일마-차트=?원
-  - 가장 유력한 원인: (예: "한솔 PG에 X원 결제건 누락" / "차트에서 카드↔현금 오기재")
-  - 의심 후보 TOP10 (출처/환자/금액/조치) — 반드시 ★★ → ★ → 일반 순서로 나열
+  - 원인 추정: (환자명·차트번호·금액 구체 인용)
+  - 수정대상 TOP5 (★★ → ★ → 일반 순서 절대 유지):
+    1. 환자명(차트#): "X파일의 Y원을 Z원으로 수정" / "X파일에 Y원 결제건 추가" 식으로 명확히
 
-### 결론 (1문장)
-어느 파일의 어느 거래(환자명 포함)를 수정해야 합계가 맞을지."""
+### 결론 (1~2문장)
+어느 파일의 어느 환자(차트#·금액)를 어떻게 수정하면 모든 채널 합계가 맞는지."""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1821,7 +2062,83 @@ AI_USER = """3개 파일 채널 합계 대사:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_channel=None):
+def build_3way_table(hansol, daily, patient, p1_full):
+    """차트번호 단위로 차트(분류별)·일마(채널별)·한솔(매칭카드합)을 한 행으로 통합.
+    엑셀/AI 두 곳에서 공통으로 사용."""
+    has_hansol = hansol is not None and not hansol.empty
+
+    name_map = {}
+    if not daily.empty and "성명" in daily.columns:
+        for _, row in daily[["차트번호", "성명"]].drop_duplicates("차트번호").iterrows():
+            ch = clean_no(row["차트번호"])
+            nm = str(row["성명"]).strip()
+            if ch and nm and nm != "nan":
+                name_map[ch] = nm
+    if not patient.empty and "이름" in patient.columns:
+        for _, row in patient[["차트번호", "이름"]].drop_duplicates("차트번호").iterrows():
+            ch = clean_no(row["차트번호"])
+            nm = str(row["이름"]).strip()
+            if ch and nm and nm != "nan" and ch not in name_map:
+                name_map[ch] = nm
+
+    p_pivot = {}
+    if not patient.empty and "분류" in patient.columns:
+        for _, r in patient.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            cat = str(r.get("분류", ""))
+            amt = _safe_int(r.get("금액", 0))
+            d = p_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+            if cat in d:
+                d[cat] += amt
+
+    d_pivot = {}
+    if not daily.empty:
+        for _, r in daily.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            d = d_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+            d["카드"] += _safe_int(r.get("카드", 0))
+            d["현금"] += _safe_int(r.get("현금", 0))
+            d["이체"] += _safe_int(r.get("이체", 0))
+            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+
+    h_card_by_ch = {}
+    if p1_full is not None and not p1_full.empty:
+        for _, r in p1_full.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            h_card_by_ch[ch] = (_safe_int(r.get("한솔카드", 0)), _safe_int(r.get("한솔건수", 0)))
+
+    rows = []
+    all_charts = set(p_pivot.keys()) | set(d_pivot.keys()) | set(h_card_by_ch.keys())
+    for ch in sorted(all_charts):
+        p = p_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+        d = d_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
+        h_amt, h_cnt = h_card_by_ch.get(ch, (0, 0))
+        row = {
+            "차트번호": ch,
+            "이름": name_map.get(ch, ""),
+            "차트카드": p["카드"], "차트현금": p["현금"], "차트이체": p["이체"], "차트플랫폼": p["플랫폼"],
+            "일마카드": d["카드"], "일마현금": d["현금"], "일마이체": d["이체"], "일마플랫폼": d["플랫폼"],
+        }
+        if has_hansol:
+            row["한솔카드"] = h_amt
+            row["한솔건수"] = h_cnt
+            row["한-일카드차"] = h_amt - d["카드"]
+        row["일-차카드차"] = d["카드"] - p["카드"]
+        row["일-차현금차"] = d["현금"] - p["현금"]
+        row["일-차이체차"] = d["이체"] - p["이체"]
+        row["일-차플랫폼차"] = d["플랫폼"] - p["플랫폼"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_channel=None,
+                   hansol=None, daily=None, patient=None, p1_full=None):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         # 시트0: 채널 합계 대사 (★메인)
@@ -1832,6 +2149,18 @@ def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_cha
                     continue
                 ch_out[c] = ch_out[c].apply(lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else int(v))
             ch_out.to_excel(w, sheet_name="0_채널대사", index=False)
+
+        # 시트0a: 차트번호 3-way 통합 (차트/일마/한솔 한 행)
+        if daily is not None and patient is not None:
+            tw = build_3way_table(hansol if hansol is not None else pd.DataFrame(),
+                                  daily, patient, p1_full)
+            if not tw.empty:
+                # 차이 있는 행 우선으로 정렬 (절대 차이 합 큰순)
+                diff_cols_ex = [c for c in tw.columns if c.endswith("차")]
+                if diff_cols_ex:
+                    tw["_abs"] = tw[diff_cols_ex].abs().sum(axis=1)
+                    tw = tw.sort_values("_abs", ascending=False).drop(columns=["_abs"])
+                tw.to_excel(w, sheet_name="0_3way통합", index=False)
 
         # 시트0b: 의심 후보 (채널별 통합)
         if suspects_by_channel:
@@ -2082,6 +2411,7 @@ if "done" not in st.session_state:
                 ss["done"] = True
                 ss["has_hansol"] = has_hansol
                 ss["hansol"], ss["daily"], ss["patient"] = hansol, daily, patient
+                ss["daily_refund"] = daily_refund
                 ss["match_df"], ss["matched_h"], ss["matched_dc"] = match_df, matched_h, matched_dc
                 ss["p1_full"], ss["p1_diff"] = p1_full, p1_diff
                 ss["h_um"], ss["d_um"] = h_um, d_um
@@ -2096,6 +2426,7 @@ else:
     ss = st.session_state
     has_hansol = ss.get("has_hansol", True)
     hansol, daily, patient = ss["hansol"], ss["daily"], ss["patient"]
+    daily_refund = ss.get("daily_refund", pd.DataFrame())
     match_df, matched_h = ss["match_df"], ss["matched_h"]
     p1_full, p1_diff = ss["p1_full"], ss["p1_diff"]
     h_um, d_um = ss["h_um"], ss["d_um"]
@@ -2327,7 +2658,10 @@ else:
                 st.info("비교할 데이터가 없습니다.")
 
     with tab3:
-        ai_text = build_ai_text(channel_df, suspects_by_channel)
+        ai_text = build_ai_text(
+            hansol, daily, daily_refund, patient, channel_df,
+            p1_full, h_um, d_um, suspects_by_channel, totals=totals,
+        )
         st.session_state["_ai_data"] = ai_text
 
         col_a, col_b = st.columns([2, 1])
@@ -2355,12 +2689,15 @@ else:
             height=70,
         )
 
-        est_in = int(len(ai_text) / 2.5) + 150
+        est_in = int(len(ai_text) / 2.5) + 250
         est_total = est_in + 900
-        col = "🟢" if est_total < 3000 else "🟡" if est_total < 5000 else "🔴"
+        col = "🟢" if est_total < 6000 else "🟡" if est_total < 12000 else "🔴"
         rpd = GEMINI_MODELS[model_choice]["rpd"]
         rpm = GEMINI_MODELS[model_choice]["rpm"]
-        st.caption(f"{col} 데이터 {len(ai_text):,}자 / 토큰 ~{est_in}입력+~900출력 = ~{est_total} | 선택모델 무료한도 RPM{rpm}·RPD{rpd} (한도 시 다른 무료 모델로 자동 폴백)")
+        st.caption(
+            f"{col} 통합데이터 {len(ai_text):,}자 / 토큰 ~{est_in}입력+~900출력 = ~{est_total} | "
+            f"선택모델 무료한도 RPM{rpm}·RPD{rpd}·TPM250K (한도 시 다른 무료 모델로 자동 폴백)"
+        )
 
         with st.expander("📄 전송 데이터 미리보기"):
             st.code(ai_text, language="text")
@@ -2399,11 +2736,14 @@ else:
 
         st.markdown("---")
         with st.expander("📥 (대안) 통합 엑셀 다운로드 — 다른 AI/수작업용"):
-            excel = build_ai_excel(p1_diff, h_um, d_um, totals, channel_df, suspects_by_channel)
+            excel = build_ai_excel(
+                p1_diff, h_um, d_um, totals, channel_df, suspects_by_channel,
+                hansol=hansol, daily=daily, patient=patient, p1_full=p1_full,
+            )
             st.download_button(
-                "통합 엑셀 다운로드 (5시트)",
+                "통합 엑셀 다운로드 (6시트)",
                 data=excel,
                 file_name=f"정산차이_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.caption("시트: 0_채널대사(★) / 0_의심후보(★) / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭")
+            st.caption("시트: 0_채널대사(★) / 0_3way통합(★) / 0_의심후보 / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭")
