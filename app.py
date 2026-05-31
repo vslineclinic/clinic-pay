@@ -2485,6 +2485,15 @@ if "done" not in st.session_state:
                     st.error("일일마감 파싱 실패")
                     st.stop()
 
+                # 한솔 파일을 올렸는데 유효 거래를 못 읽으면, 조용히 2-파일 모드로
+                # 넘어가지 말고 사용자에게 한솔이 분석에서 빠졌음을 명확히 알린다.
+                if f_h is not None and hansol.empty:
+                    st.warning(
+                        "⚠️ 한솔페이 파일을 업로드했지만 유효한 거래내역을 읽지 못했습니다. "
+                        "한솔을 제외하고 일마↔차트 2개 파일로만 분석을 진행합니다. "
+                        "(파일이 비어 있거나, 조회기간에 거래가 없거나, 예상과 다른 형식일 수 있습니다.)"
+                    )
+
                 has_hansol = not hansol.empty
                 if has_hansol:
                     match_df, matched_h, matched_dc = run_matching(hansol, daily, patient)
@@ -2515,7 +2524,16 @@ if "done" not in st.session_state:
                 ss["suspects_by_channel"] = suspects_by_channel
             st.rerun()
     else:
-        st.info("일일마감·차트마감 파일을 업로드하세요 (한솔페이는 선택).")
+        # 필수 파일(일일마감·차트마감)이 빠지면 '분석 시작' 버튼이 통째로 사라져,
+        # 한솔만(또는 한솔+일마만) 올린 사용자가 "올려도 아무 일도 안 일어난다"고
+        # 느끼는 문제 방지. 버튼은 항상 노출하되 비활성으로 두고, 어떤 파일이
+        # 더 필요한지(한솔은 선택) 명시적으로 안내한다.
+        st.button("🚀 분석 시작", type="primary", width="stretch", disabled=True)
+        _missing = [n for n, f in [("일일마감", f_d), ("차트마감", f_p)] if f is None]
+        st.info(
+            f"분석을 시작하려면 {' · '.join(_missing)} 파일이 더 필요합니다. "
+            "(한솔페이는 선택 항목이며, 한솔만으로는 분석할 수 없습니다.)"
+        )
 
 else:
     ss = st.session_state
