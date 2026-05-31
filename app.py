@@ -957,7 +957,6 @@ def run_matching(hansol, daily, patient):
     # P5b - 복합결제 매칭: 1인이 카드+현금/이체로 결제한 경우
     # 일마에 카드+현금 또는 카드+이체가 모두 있는 환자의 현금/이체 부분을 한솔 현금영수증과 매칭
     for _, dr in daily.iterrows():
-        card_amt = dr.get("카드", 0)
         cash_amt = dr.get("현금", 0)
         xfer_amt = dr.get("이체", 0)
         # 카드가 이미 매칭된 환자의 현금/이체 부분을 추가 매칭
@@ -1435,6 +1434,38 @@ def _rank_key(amt, channel_gap):
     return (abs(a - g), -a)
 
 
+def _chart_method_pivots(patient, daily):
+    """차트번호별 결제수단(카드/현금/이체/플랫폼) 금액을 차트·일마 각각 pivot으로 구축.
+
+    빈 차트번호('')는 제외. 분류가 파일마다 다른 경우(예: 차트=현금·일마=카드)도
+    누락 없이 비교하기 위해, 결제수단 교집합이 아닌 전 차트번호 합집합 기준으로 사용한다.
+    find_channel_suspects / build_ai_text / build_3way_table 공용.
+    반환: (p_pivot, d_pivot) — 각 {차트번호: {"카드","현금","이체","플랫폼"}}
+    """
+    empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
+    pp, dp = {}, {}
+    if patient is not None and not patient.empty and "분류" in patient.columns:
+        for _, r in patient.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            cat = str(r.get("분류", ""))
+            d = pp.setdefault(ch, dict(empty))
+            if cat in d:
+                d[cat] += _safe_int(r.get("금액", 0))
+    if daily is not None and not daily.empty:
+        for _, r in daily.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            d = dp.setdefault(ch, dict(empty))
+            d["카드"] += _safe_int(r.get("카드", 0))
+            d["현금"] += _safe_int(r.get("현금", 0))
+            d["이체"] += _safe_int(r.get("이체", 0))
+            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+    return pp, dp
+
+
 def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12):
     """채널 차이를 설명할 후보 거래 추출 (multiset diff + 승인번호 cross-match 기반).
 
@@ -1443,7 +1474,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
       ★★ 동일환자 확정         — 승인번호로 환자 확정 + 한솔-일마 금액 불일치
       ★ 차이값 정확매칭 페어   — counter diff 기반 금액 페어가 gap과 수학적으로 일치
       한솔에만 존재★/일마에만 존재★ — gap 근접 금액
-      차트↔일마 분류차이       — 참고
+      차트↔일마 카드차이★      — 전 결제수단 pivot 비교로 누락·결제수단 오기재 포착(gap근접 시 ★)
     """
     from collections import Counter
     suspects = []
@@ -1642,63 +1673,79 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                     star2.sort(key=lambda x: (0 if "gap일치" in x["출처"] else 1, -abs(x["금액"])))
                     suspects = star2 + suspects
 
-        # 차트(환자집계) vs 일마 카드 분류 차이 (참고) — 한솔 유무 무관
+        # 차트 vs 일마 카드금액 차이 — 전 결제수단 pivot 기반(분류 무관, 한솔 유무 무관)
+        # 교집합이 아닌 합집합을 사용해 "차트=현금·일마=카드" 같은 결제수단 오기재까지 포착
         if not patient.empty and not daily.empty and "분류" in patient.columns:
-            p_card = patient[patient["분류"] == "카드"].groupby("차트번호")["금액"].sum()
-            d_by_chart = daily.groupby("차트번호")["카드"].sum()
-            common = (set(p_card.index) & set(d_by_chart.index)) - {""}
+            pp, dp = _chart_method_pivots(patient, daily)
+            empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
             mismatches = []
-            for ch in common:
-                pv, dv = int(p_card.get(ch, 0)), int(d_by_chart.get(ch, 0))
-                if pv != dv:
-                    mismatches.append((ch, pv, dv))
-            # 차트↔일마 차이도 channel gap 근접도 우선
-            mismatches.sort(key=lambda x: _rank_key(x[2] - x[1], gap))
-            for ch, pv, dv in mismatches[:top_n]:
+            for ch in (set(pp) | set(dp)):
+                p = pp.get(ch, empty)
+                d = dp.get(ch, empty)
+                if d["카드"] == p["카드"]:
+                    continue
+                mismatches.append((ch, p, d, d["카드"] - p["카드"]))
+            # 채널 gap 근접도 우선 정렬
+            mismatches.sort(key=lambda x: _rank_key(x[3], gap))
+            for ch, p, d, diff in mismatches[:top_n]:
+                near = abs(abs(diff) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
+                # 카드 차이분이 어느 파일·어느 결제수단으로 옮겨졌는지(오기재) 자동 탐지
+                moved = ""
+                for m in ("현금", "이체", "플랫폼"):
+                    if diff != 0 and (p[m] - d[m]) == diff:
+                        side = "차트" if p[m] > d[m] else "일마"
+                        moved = f" → {side}가 {m}({max(p[m], d[m]):,})로 기재(결제수단 오기재 의심)"
+                        break
                 suspects.append({
-                    "출처": "차트↔일마 분류차이",
+                    "출처": "차트↔일마 카드차이★" if near else "차트↔일마 카드차이",
                     "환자": name_map.get(str(ch).strip(), ""),
-                    "금액": dv - pv,
-                    "단서": f"차트{ch} (차트={pv:,} / 일마={dv:,})",
-                    "조치": "결제수단(카드↔현금↔이체) 오기재 가능성",
+                    "금액": diff,
+                    "단서": (
+                        f"차트{ch} 차트(카{p['카드']:,}/현{p['현금']:,}/이{p['이체']:,}) "
+                        f"vs 일마(카{d['카드']:,}/현{d['현금']:,}/이{d['이체']:,}){moved}"
+                    ),
+                    "조치": "결제수단(카드↔현금↔이체) 오기재 또는 카드결제 누락/중복 확인",
                 })
 
     elif channel == "현금+이체":
         if not patient.empty and not daily.empty:
-            p_cx = patient[patient.get("분류", "").isin(["현금", "이체"])].groupby("차트번호")["금액"].sum()
-            d_cx = daily.groupby("차트번호").apply(lambda x: int(x["현금"].sum() + x["이체"].sum()))
-            common = set(p_cx.index) & set(d_cx.index)
+            pp, dp = _chart_method_pivots(patient, daily)
+            empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
             mismatches = []
-            for ch in common:
-                pv, dv = int(p_cx.get(ch, 0)), int(d_cx.get(ch, 0))
+            for ch in (set(pp) | set(dp)):
+                p = pp.get(ch, empty)
+                d = dp.get(ch, empty)
+                pv, dv = p["현금"] + p["이체"], d["현금"] + d["이체"]
                 if pv != dv:
-                    mismatches.append((ch, pv, dv, abs(pv - dv)))
-            mismatches.sort(key=lambda x: -x[3])
-            for ch, pv, dv, _ in mismatches[:top_n]:
+                    mismatches.append((ch, p, d, dv - pv))
+            mismatches.sort(key=lambda x: -abs(x[3]))
+            for ch, p, d, diff in mismatches[:top_n]:
                 suspects.append({
-                    "출처": "차트↔일마 분류차이",
+                    "출처": "차트↔일마 현금/이체차이",
                     "환자": name_map.get(str(ch).strip(), ""),
-                    "금액": dv - pv,
-                    "단서": f"차트{ch} / 차트현금+이체={pv:,} 일마={dv:,}",
+                    "금액": diff,
+                    "단서": (
+                        f"차트{ch} 차트(현{p['현금']:,}/이{p['이체']:,}/카{p['카드']:,}) "
+                        f"vs 일마(현{d['현금']:,}/이{d['이체']:,}/카{d['카드']:,})"
+                    ),
                     "조치": "현금↔이체↔카드 오기재 확인",
                 })
 
     elif channel == "플랫폼":
         if not patient.empty and not daily.empty:
-            p_pl = patient[patient.get("분류", "") == "플랫폼"].groupby("차트번호")["금액"].sum()
-            d_pl = daily.groupby("차트번호")["플랫폼합"].sum()
-            common = set(p_pl.index) & set(d_pl.index) | set(p_pl.index) | set(d_pl.index)
+            pp, dp = _chart_method_pivots(patient, daily)
             mismatches = []
-            for ch in common:
-                pv, dv = int(p_pl.get(ch, 0)), int(d_pl.get(ch, 0))
+            for ch in (set(pp) | set(dp)):
+                pv = pp.get(ch, {}).get("플랫폼", 0)
+                dv = dp.get(ch, {}).get("플랫폼", 0)
                 if pv != dv:
-                    mismatches.append((ch, pv, dv, abs(pv - dv)))
-            mismatches.sort(key=lambda x: -x[3])
-            for ch, pv, dv, _ in mismatches[:top_n]:
+                    mismatches.append((ch, pv, dv, dv - pv))
+            mismatches.sort(key=lambda x: -abs(x[3]))
+            for ch, pv, dv, diff in mismatches[:top_n]:
                 suspects.append({
                     "출처": "차트↔일마 플랫폼차이",
                     "환자": name_map.get(str(ch).strip(), ""),
-                    "금액": dv - pv,
+                    "금액": diff,
                     "단서": f"차트{ch} / 차트플랫폼={pv:,} 일마={dv:,}",
                     "조치": "플랫폼 종류/금액 오기재 확인",
                 })
@@ -1842,29 +1889,8 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
 
     # ── [차트번호 3-way 통합] ─────────────────────
     # 차트(분류별) / 일마(채널별) / 한솔(매칭카드합) per 차트번호
-    p_pivot = {}
-    if not patient.empty and "분류" in patient.columns:
-        for _, r in patient.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            cat = str(r.get("분류", ""))
-            amt = _safe_int(r.get("금액", 0))
-            d = p_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            if cat in d:
-                d[cat] += amt
-
-    d_pivot = {}
-    if not daily.empty:
-        for _, r in daily.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            d = d_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            d["카드"] += _safe_int(r.get("카드", 0))
-            d["현금"] += _safe_int(r.get("현금", 0))
-            d["이체"] += _safe_int(r.get("이체", 0))
-            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+    # find_channel_suspects와 동일한 pivot 로직을 공유해 UI·AI·엑셀 수치를 일치시킴
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
 
     h_card_by_ch = {}
     if p1_full is not None and not p1_full.empty:
@@ -2031,6 +2057,8 @@ AI_SYSTEM = (
     "[R5] 부호 약속: '한-차=+10,000'은 한솔이 차트보다 10,000원 많음 = 차트누락 or 한솔과다. "
     "'일-차=-5,000'은 일마가 차트보다 5,000원 적음 = 일마누락 or 차트과다.\n"
     "[R6] 한솔=일마=A · 차트=B(A≠B) → 차트 단독 오류로 단정 (PG승인+프론트수납이 모두 A이므로 진실=A).\n"
+    "[R6b] 한솔이 없으면(2파일 분석) 다수결 불가 → 차트(EMR 청구원장)를 잠정 기준으로 제시하되 "
+    "'일마·차트 중 한 곳 오기재'로 표기하고 원본 확인 권고 (단정 금지).\n"
     "[R7] 동일금액이 다른 결제수단 칼럼에 분산되면 결제수단 오기재 (예: 차트카드=X · 일마현금=X).\n"
     "[R8] 한솔PG-only의 '동일금액일마환자' hint가 있으면 그 환자의 일마 결제수단 오기재로 강하게 의심.\n"
     "[R9] '확인 바랍니다' 같은 일반론 금지. 반드시 '어느 파일·어느 환자·어느 금액을 무엇으로 수정' 형식의 실행 가능한 명령으로 출력."
@@ -2073,7 +2101,7 @@ STEP6. 산술 상쇄 검증 (R2 — 출력 직전 필수)
   · 제안한 수정들의 채널별 net 변화량을 합산해 채널대사 차이값과 정확히 일치하는지 확인.
   · 불일치 → 남은 차이만큼 추가후보 탐색 (한솔PG-only / 일마front-only / 환불행 재확인).
 
-[출력 형식 — 1100토큰 이내, 마크다운]
+[출력 형식 — 800토큰 이내(반드시 끝까지 완결), 마크다운]
 
 ### 채널별 차이 진단
 차이≠0 채널마다 ↓
@@ -2112,29 +2140,7 @@ def build_3way_table(hansol, daily, patient, p1_full):
             if ch and nm and nm != "nan" and ch not in name_map:
                 name_map[ch] = nm
 
-    p_pivot = {}
-    if not patient.empty and "분류" in patient.columns:
-        for _, r in patient.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            cat = str(r.get("분류", ""))
-            amt = _safe_int(r.get("금액", 0))
-            d = p_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            if cat in d:
-                d[cat] += amt
-
-    d_pivot = {}
-    if not daily.empty:
-        for _, r in daily.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            d = d_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            d["카드"] += _safe_int(r.get("카드", 0))
-            d["현금"] += _safe_int(r.get("현금", 0))
-            d["이체"] += _safe_int(r.get("이체", 0))
-            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
 
     h_card_by_ch = {}
     if p1_full is not None and not p1_full.empty:
@@ -2574,7 +2580,8 @@ else:
         else:
             st.markdown(
                 "**일마↔차트 채널별 차이** — 한솔페이 없이 2개 파일만 비교한 결과입니다.  \n"
-                "🟡 **차트↔일마 분류차이** = 차트번호별로 결제수단 불일치 환자"
+                "🟠 **차트↔일마 카드차이★** = 차트번호별 카드금액 불일치 (gap 근접 시 ★, 결제수단 오기재 단서 포함)  \n"
+                "🟡 그 외 = 현금/이체·플랫폼 결제수단 불일치 환자"
             )
         any_diff = False
         for _, r in channel_df.iterrows():
