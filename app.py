@@ -402,11 +402,13 @@ def parse_daily(raw):
             r_data = refund_raw.iloc[r_hdr + 1:].copy()
             r_data.columns = [str(c).strip().replace("\n", "") for c in refund_raw.iloc[r_hdr]]
             r_data = r_data.reset_index(drop=True)
-            # 빈 행 제거
+            # 빈 행 + 합계/총계 행 제거 (환자 이름은 숫자뿐일 수 없음 → 숫자만이면 합계행)
             if "성명" in r_data.columns:
-                r_data = r_data[r_data["성명"].notna() & (r_data["성명"].astype(str).str.strip() != "")]
+                nm_r = r_data["성명"].astype(str).str.strip()
+                is_num_name = nm_r.str.match(r"^[\d,\.\s\-]+$") & (nm_r != "")
+                r_data = r_data[r_data["성명"].notna() & (nm_r != "") & ~is_num_name]
             if "차트번호" in r_data.columns:
-                r_data = r_data[r_data["차트번호"].notna() & (r_data["차트번호"].astype(str).str.strip() != "")]
+                r_data = r_data[r_data["차트번호"].apply(lambda x: len(clean_no(x)) >= 3)]
             r_data = r_data.reset_index(drop=True)
 
             if not r_data.empty:
@@ -431,7 +433,10 @@ def parse_daily(raw):
 
     # --- 메인 데이터 필터링 ---
     if "성명" in df.columns:
-        df = df[df["성명"].notna() & ~df["성명"].astype(str).str.contains("합계|소계", na=False)]
+        nm_m = df["성명"].astype(str).str.strip()
+        # 합계/소계/총계 행 제외: '합계'·'소계' 텍스트 또는 성명이 숫자뿐인 행(=합계행)
+        is_num_name = nm_m.str.match(r"^[\d,\.\s\-]+$") & (nm_m != "")
+        df = df[df["성명"].notna() & ~nm_m.str.contains("합계|소계", na=False) & ~is_num_name]
     # 차트번호가 비어있고 성명도 비어있는 총합계 행 제거
     if "차트번호" in df.columns:
         chart_valid = df["차트번호"].apply(lambda x: str(clean_no(x)).strip() != "")
@@ -1439,11 +1444,17 @@ def _chart_method_pivots(patient, daily):
 
     빈 차트번호('')는 제외. 분류가 파일마다 다른 경우(예: 차트=현금·일마=카드)도
     누락 없이 비교하기 위해, 결제수단 교집합이 아닌 전 차트번호 합집합 기준으로 사용한다.
+
+    일마(일일마감)에 차트번호 컬럼이 없는 export 형식(성명만 존재)도 있으므로,
+    일마 행에 차트번호가 없으면 성명 → 차트(EMR) 이름맵으로 차트번호를 보강 링크한다.
+    (동명이인 등 이름이 여러 차트에 매핑되면 모호하므로 링크하지 않고 건너뜀 → 허위 불일치 방지)
+
     find_channel_suspects / build_ai_text / build_3way_table 공용.
     반환: (p_pivot, d_pivot) — 각 {차트번호: {"카드","현금","이체","플랫폼"}}
     """
     empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
     pp, dp = {}, {}
+    name2chart = {}  # 이름 → {차트번호} (유일할 때만 일마 링크 키로 사용)
     if patient is not None and not patient.empty and "분류" in patient.columns:
         for _, r in patient.iterrows():
             ch = clean_no(r.get("차트번호", ""))
@@ -1453,9 +1464,18 @@ def _chart_method_pivots(patient, daily):
             d = pp.setdefault(ch, dict(empty))
             if cat in d:
                 d[cat] += _safe_int(r.get("금액", 0))
+            nm = clean_name(r.get("이름", ""))
+            if nm:
+                name2chart.setdefault(nm, set()).add(ch)
+    # 이름이 단 하나의 차트번호에만 대응할 때만 일마 보강 링크에 사용
+    name2chart_unique = {nm: next(iter(s)) for nm, s in name2chart.items() if len(s) == 1}
+
     if daily is not None and not daily.empty:
         for _, r in daily.iterrows():
             ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                # 일마에 차트번호가 없으면 성명으로 차트(EMR) 링크 시도
+                ch = name2chart_unique.get(clean_name(r.get("성명", "")), "")
             if not ch:
                 continue
             d = dp.setdefault(ch, dict(empty))
@@ -1464,6 +1484,52 @@ def _chart_method_pivots(patient, daily):
             d["이체"] += _safe_int(r.get("이체", 0))
             d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
     return pp, dp
+
+
+def _hansol_card_by_chart(hansol, patient):
+    """승인번호를 다리로 한솔(PG) 카드금액을 차트번호에 귀속한다.
+
+    일마(일일마감)·한솔에 차트번호가 없어도 한솔 승인번호 ↔ 차트(EMR) 결제메모 승인번호로
+    직접 연결한다. 승인번호가 정확히 한 차트에만 대응할 때만 귀속(공동결제·미링크는 제외)해
+    허위 차이를 방지한다.
+    반환: {차트번호: (한솔카드합, 건수)} — 링크 불가 차트는 미포함(=한솔금액 unknown).
+    """
+    if (hansol is None or hansol.empty or patient is None or patient.empty
+            or "분류" not in patient.columns or "승인번호목록" not in patient.columns
+            or "tx_status" not in hansol.columns):
+        return {}
+
+    def _ak(a):
+        aa = clean_no(a)
+        return aa[-8:] if len(aa) >= 8 else aa
+
+    appr_charts: dict = {}  # 승인번호(8자리) → {차트번호}
+    for _, pr in patient[patient["분류"] == "카드"].iterrows():
+        ch = clean_no(pr.get("차트번호", ""))
+        if not ch:
+            continue
+        al = pr.get("승인번호목록", [])
+        if not isinstance(al, list):
+            continue
+        for a in al:
+            if len(clean_no(a)) >= 4:
+                appr_charts.setdefault(_ak(a), set()).add(ch)
+
+    h_ok = hansol[hansol["tx_status"] == "정상"]
+    h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
+    acc: dict = {}  # 차트번호 → [금액합, 건수]
+    for _, hr in h_card.iterrows():
+        a = clean_no(hr.get("승인번호", ""))
+        if len(a) < 4:
+            continue
+        charts = appr_charts.get(_ak(a))
+        if not charts or len(charts) != 1:  # 미링크 또는 공동결제(2차트 이상) → 제외
+            continue
+        ch = next(iter(charts))
+        e = acc.setdefault(ch, [0, 0])
+        e[0] += int(hr["금액"])
+        e[1] += 1
+    return {ch: (v[0], v[1]) for ch, v in acc.items()}
 
 
 def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12):
@@ -1589,86 +1655,77 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                                 "조치": f"일마 {d_amt:,}원({d_names}) 결제수단 오기재 또는 한솔 {h_amt:,}원 부분취소 의심 — 즉시 확인",
                             })
 
-            # ★★ 승인번호 cross-match (한솔 있을 때만)
+            # ★★ 승인번호 cross-match: 승인번호별 [한솔 카드합] vs [차트 카드합] 비교 (한솔 있을 때만)
+            # 분할기재(한 결제가 차트 여러 줄)·공동결제(한 카드결제가 여러 환자)로 흩어져도
+            # 승인번호 단위 합계로 비교하므로 허위 불일치가 생기지 않는다. (일마 차트번호 유무 무관)
             if not patient.empty and "승인번호목록" in patient.columns and "분류" in patient.columns:
                 p_card_rows = patient[patient["분류"] == "카드"]
-                p_ch_total: dict = {}
-                p_ch_name: dict = {}
-                for _, pr in p_card_rows.iterrows():
-                    ch = clean_no(pr.get("차트번호", ""))
-                    nm = str(pr.get("이름", "")).strip()
-                    amt = int(pr.get("금액", 0))
-                    if ch:
-                        p_ch_total[ch] = p_ch_total.get(ch, 0) + amt
-                        if nm and ch not in p_ch_name:
-                            p_ch_name[ch] = nm
 
-                appr_patient_map: dict = {}
+                def _ak(a):
+                    aa = clean_no(a)
+                    return aa[-8:] if len(aa) >= 8 else aa
+
+                # 차트: 승인번호(8자리 suffix) → 카드합·이름·차트 집합
+                c_appr: dict = {}
+                ambiguous: set = set()
                 for _, pr in p_card_rows.iterrows():
                     ch = clean_no(pr.get("차트번호", ""))
-                    nm = p_ch_name.get(ch, str(pr.get("이름", "")).strip())
-                    amt = int(pr.get("금액", 0))
+                    nm = clean_name(pr.get("이름", "")) or ch
+                    amt = _safe_int(pr.get("금액", 0))
                     appr_list = pr.get("승인번호목록", [])
-                    if not isinstance(appr_list, list):
+                    keys = ({_ak(a) for a in appr_list if len(clean_no(a)) >= 4}
+                            if isinstance(appr_list, list) else set())
+                    if len(keys) > 1:
+                        # 한 행에 승인번호가 여러 개면 금액 귀속이 모호 → 비교 제외(허위방지)
+                        ambiguous |= keys
                         continue
-                    for a in appr_list:
-                        aa = clean_no(a)
-                        if len(aa) < 4:
-                            continue
-                        keys = [aa]
-                        if len(aa) > 8:
-                            keys.append(aa[-8:])
-                        for key in keys:
-                            existing = appr_patient_map.setdefault(key, [])
-                            if not any(x[0] == ch for x in existing):
-                                existing.append((ch, nm, amt))
+                    for key in keys:
+                        e = c_appr.setdefault(key, {"amt": 0, "names": set(), "charts": set()})
+                        e["amt"] += amt
+                        if nm:
+                            e["names"].add(nm)
+                        if ch:
+                            e["charts"].add(ch)
 
-                d_ch_card: dict = {}
-                if not daily.empty and "카드" in daily.columns:
-                    for ch_g, grp in daily[daily["카드"] > 0].groupby("차트번호"):
-                        d_ch_card[clean_no(str(ch_g))] = int(grp["카드"].sum())
+                # 한솔: 승인번호(8자리 suffix) → 카드합 + 대표행(단서용)
+                h_appr: dict = {}
+                for _, hr in h_card.iterrows():
+                    a = clean_no(hr.get("승인번호", ""))
+                    if len(a) < 4:
+                        continue
+                    e = h_appr.setdefault(_ak(a), {"amt": 0, "row": hr})
+                    e["amt"] += int(hr["금액"])
 
                 star2: list = []
-                seen_pair: set = set()
-                for _, hr in h_card.iterrows():
-                    appr = clean_no(hr.get("승인번호", ""))
-                    if not appr or len(appr) < 4:
+                for key in set(h_appr) & set(c_appr):
+                    if key in ambiguous:
                         continue
-                    h_amt = int(hr["금액"])
-                    hits: list = list(appr_patient_map.get(appr, []))
-                    if not hits and len(appr) > 8:
-                        hits = list(appr_patient_map.get(appr[-8:], []))
-                    for (ch, nm, chart_row_amt) in hits:
-                        suffix = appr[-8:] if len(appr) >= 8 else appr
-                        pair_key = (suffix, ch)
-                        if pair_key in seen_pair:
-                            continue
-                        d_amt = d_ch_card.get(ch, 0)
-                        cmp_amt = d_amt if d_amt > 0 else chart_row_amt
-                        if h_amt == cmp_amt:
-                            seen_pair.add(pair_key)
-                            continue
-                        seen_pair.add(pair_key)
-                        diff = h_amt - cmp_amt
-                        gap_match = gap != 0 and diff == gap
-                        cn = str(hr.get("카드번호", ""))
-                        cn_tail = cn[-5:] if cn and cn != "nan" else ""
-                        t = str(hr.get("시간표시", ""))
-                        co = str(hr.get("카드사", ""))[:6]
-                        amt_detail = f"한솔 {h_amt:,} vs 일마 {d_amt:,}" if d_amt > 0 else f"한솔 {h_amt:,} vs 차트 {chart_row_amt:,}"
-                        if d_amt > 0 and d_amt != chart_row_amt:
-                            amt_detail += f"(차트 {chart_row_amt:,})"
-                        tag = "★★ 동일환자 확정(gap일치)" if gap_match else "★★ 동일환자 확정"
-                        star2.append({
-                            "출처": tag,
-                            "환자": nm or ch,
-                            "금액": diff,
-                            "단서": f"승인{suffix} {t} 말미{cn_tail} {co} | {amt_detail}",
-                            "조치": (
-                                f"{'★gap완전일치 → ' if gap_match else ''}"
-                                f"환자 {nm}({ch}) 한솔·일마 카드금액 불일치 — 즉시 수정"
-                            ),
-                        })
+                    h_total, c_total = h_appr[key]["amt"], c_appr[key]["amt"]
+                    if h_total == c_total:
+                        continue
+                    diff = h_total - c_total
+                    gap_match = gap != 0 and diff == gap
+                    hr = h_appr[key]["row"]
+                    cn = str(hr.get("카드번호", ""))
+                    cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                    t = str(hr.get("시간표시", ""))
+                    co = str(hr.get("카드사", ""))[:6]
+                    names = "·".join(sorted(c_appr[key]["names"])[:3])
+                    charts = ",".join(sorted(c_appr[key]["charts"]))
+                    tag = "★★ 동일환자 확정(gap일치)" if gap_match else "★★ 동일환자 확정"
+                    star2.append({
+                        "출처": tag,
+                        "환자": names or charts,
+                        "금액": diff,
+                        "단서": (
+                            f"승인{key} {t} 말미{cn_tail} {co} | "
+                            f"한솔 {h_total:,} vs 차트 {c_total:,}" + (f" (차트{charts})" if charts else "")
+                        ),
+                        "조치": (
+                            f"{'★gap완전일치 → ' if gap_match else ''}"
+                            f"환자 {names}(차트{charts}) 한솔·차트 카드금액 불일치 — 즉시 수정"
+                        ),
+                    })
                 if star2:
                     star2.sort(key=lambda x: (0 if "gap일치" in x["출처"] else 1, -abs(x["금액"])))
                     suspects = star2 + suspects
@@ -1892,8 +1949,9 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
     # find_channel_suspects와 동일한 pivot 로직을 공유해 UI·AI·엑셀 수치를 일치시킴
     p_pivot, d_pivot = _chart_method_pivots(patient, daily)
 
-    h_card_by_ch = {}
-    if p1_full is not None and not p1_full.empty:
+    # 한솔 카드금액은 승인번호 다리로 차트에 귀속(일마 차트번호 유무 무관). 미링크 차트는 unknown.
+    h_card_by_ch = _hansol_card_by_chart(hansol, patient)
+    if not h_card_by_ch and p1_full is not None and not p1_full.empty:
         for _, r in p1_full.iterrows():
             ch = clean_no(r.get("차트번호", ""))
             if not ch:
@@ -1921,10 +1979,9 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
     for ch in all_charts:
         p = p_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
         d = d_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-        h_amt, h_cnt = h_card_by_ch.get(ch, (0, 0))
+        h_amt, h_cnt = h_card_by_ch.get(ch, (None, 0))  # None = 한솔 미링크(unknown), 참고열로만 표시
+        # 차이는 일마↔차트 비교만 사용(신뢰도 높음). 한솔↔차트 비교는 ★★ 승인번호 섹션이 담당.
         diffs = []
-        if has_hansol and h_amt != d["카드"]:
-            diffs.append(f"한솔카드{h_amt:,}≠일마카드{d['카드']:,}")
         if d["카드"] != p["카드"]:
             diffs.append(f"일마카드{d['카드']:,}≠차트카드{p['카드']:,}")
         if d["현금"] != p["현금"]:
@@ -1936,8 +1993,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
         if not diffs:
             continue
         gap_size = (
-            (abs(h_amt - d["카드"]) if has_hansol else 0)
-            + abs(d["카드"] - p["카드"]) + abs(d["현금"] - p["현금"])
+            abs(d["카드"] - p["카드"]) + abs(d["현금"] - p["현금"])
             + abs(d["이체"] - p["이체"]) + abs(d["플랫폼"] - p["플랫폼"])
         )
         cross_rows.append((gap_size, ch, p, d, h_amt, h_cnt, diffs))
@@ -1956,7 +2012,8 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             appr = ",".join(p_appr_by_ch.get(ch, [])) or "-"
             diff_str = " · ".join(diffs)[:90]
             if has_hansol:
-                L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_amt:,}({h_cnt})|{appr}|{diff_str}")
+                h_str = f"{h_amt:,}({h_cnt})" if h_amt is not None else "-"
+                L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_str}|{appr}|{diff_str}")
             else:
                 L.append(f"{ch}|{nm}|{p_str}|{d_str}|{appr}|{diff_str}")
 
@@ -2142,8 +2199,9 @@ def build_3way_table(hansol, daily, patient, p1_full):
 
     p_pivot, d_pivot = _chart_method_pivots(patient, daily)
 
-    h_card_by_ch = {}
-    if p1_full is not None and not p1_full.empty:
+    # 한솔 카드금액은 승인번호 다리로 차트에 귀속(일마 차트번호 유무 무관). 미링크는 unknown.
+    h_card_by_ch = _hansol_card_by_chart(hansol, patient)
+    if not h_card_by_ch and p1_full is not None and not p1_full.empty:
         for _, r in p1_full.iterrows():
             ch = clean_no(r.get("차트번호", ""))
             if not ch:
@@ -2155,7 +2213,7 @@ def build_3way_table(hansol, daily, patient, p1_full):
     for ch in sorted(all_charts):
         p = p_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
         d = d_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-        h_amt, h_cnt = h_card_by_ch.get(ch, (0, 0))
+        h_amt, h_cnt = h_card_by_ch.get(ch, (None, 0))
         row = {
             "차트번호": ch,
             "이름": name_map.get(ch, ""),
@@ -2163,9 +2221,9 @@ def build_3way_table(hansol, daily, patient, p1_full):
             "일마카드": d["카드"], "일마현금": d["현금"], "일마이체": d["이체"], "일마플랫폼": d["플랫폼"],
         }
         if has_hansol:
-            row["한솔카드"] = h_amt
+            row["한솔카드"] = h_amt if h_amt is not None else ""
             row["한솔건수"] = h_cnt
-            row["한-일카드차"] = h_amt - d["카드"]
+            row["한-차카드차"] = (h_amt - p["카드"]) if h_amt is not None else 0
         row["일-차카드차"] = d["카드"] - p["카드"]
         row["일-차현금차"] = d["현금"] - p["현금"]
         row["일-차이체차"] = d["이체"] - p["이체"]
