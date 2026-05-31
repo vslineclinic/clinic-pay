@@ -402,11 +402,13 @@ def parse_daily(raw):
             r_data = refund_raw.iloc[r_hdr + 1:].copy()
             r_data.columns = [str(c).strip().replace("\n", "") for c in refund_raw.iloc[r_hdr]]
             r_data = r_data.reset_index(drop=True)
-            # 빈 행 제거
+            # 빈 행 + 합계/총계 행 제거 (환자 이름은 숫자뿐일 수 없음 → 숫자만이면 합계행)
             if "성명" in r_data.columns:
-                r_data = r_data[r_data["성명"].notna() & (r_data["성명"].astype(str).str.strip() != "")]
+                nm_r = r_data["성명"].astype(str).str.strip()
+                is_num_name = nm_r.str.match(r"^[\d,\.\s\-]+$") & (nm_r != "")
+                r_data = r_data[r_data["성명"].notna() & (nm_r != "") & ~is_num_name]
             if "차트번호" in r_data.columns:
-                r_data = r_data[r_data["차트번호"].notna() & (r_data["차트번호"].astype(str).str.strip() != "")]
+                r_data = r_data[r_data["차트번호"].apply(lambda x: len(clean_no(x)) >= 3)]
             r_data = r_data.reset_index(drop=True)
 
             if not r_data.empty:
@@ -431,7 +433,10 @@ def parse_daily(raw):
 
     # --- 메인 데이터 필터링 ---
     if "성명" in df.columns:
-        df = df[df["성명"].notna() & ~df["성명"].astype(str).str.contains("합계|소계", na=False)]
+        nm_m = df["성명"].astype(str).str.strip()
+        # 합계/소계/총계 행 제외: '합계'·'소계' 텍스트 또는 성명이 숫자뿐인 행(=합계행)
+        is_num_name = nm_m.str.match(r"^[\d,\.\s\-]+$") & (nm_m != "")
+        df = df[df["성명"].notna() & ~nm_m.str.contains("합계|소계", na=False) & ~is_num_name]
     # 차트번호가 비어있고 성명도 비어있는 총합계 행 제거
     if "차트번호" in df.columns:
         chart_valid = df["차트번호"].apply(lambda x: str(clean_no(x)).strip() != "")
@@ -957,7 +962,6 @@ def run_matching(hansol, daily, patient):
     # P5b - 복합결제 매칭: 1인이 카드+현금/이체로 결제한 경우
     # 일마에 카드+현금 또는 카드+이체가 모두 있는 환자의 현금/이체 부분을 한솔 현금영수증과 매칭
     for _, dr in daily.iterrows():
-        card_amt = dr.get("카드", 0)
         cash_amt = dr.get("현금", 0)
         xfer_amt = dr.get("이체", 0)
         # 카드가 이미 매칭된 환자의 현금/이체 부분을 추가 매칭
@@ -1435,6 +1439,99 @@ def _rank_key(amt, channel_gap):
     return (abs(a - g), -a)
 
 
+def _chart_method_pivots(patient, daily):
+    """차트번호별 결제수단(카드/현금/이체/플랫폼) 금액을 차트·일마 각각 pivot으로 구축.
+
+    빈 차트번호('')는 제외. 분류가 파일마다 다른 경우(예: 차트=현금·일마=카드)도
+    누락 없이 비교하기 위해, 결제수단 교집합이 아닌 전 차트번호 합집합 기준으로 사용한다.
+
+    일마(일일마감)에 차트번호 컬럼이 없는 export 형식(성명만 존재)도 있으므로,
+    일마 행에 차트번호가 없으면 성명 → 차트(EMR) 이름맵으로 차트번호를 보강 링크한다.
+    (동명이인 등 이름이 여러 차트에 매핑되면 모호하므로 링크하지 않고 건너뜀 → 허위 불일치 방지)
+
+    find_channel_suspects / build_ai_text / build_3way_table 공용.
+    반환: (p_pivot, d_pivot) — 각 {차트번호: {"카드","현금","이체","플랫폼"}}
+    """
+    empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
+    pp, dp = {}, {}
+    name2chart = {}  # 이름 → {차트번호} (유일할 때만 일마 링크 키로 사용)
+    if patient is not None and not patient.empty and "분류" in patient.columns:
+        for _, r in patient.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                continue
+            cat = str(r.get("분류", ""))
+            d = pp.setdefault(ch, dict(empty))
+            if cat in d:
+                d[cat] += _safe_int(r.get("금액", 0))
+            nm = clean_name(r.get("이름", ""))
+            if nm:
+                name2chart.setdefault(nm, set()).add(ch)
+    # 이름이 단 하나의 차트번호에만 대응할 때만 일마 보강 링크에 사용
+    name2chart_unique = {nm: next(iter(s)) for nm, s in name2chart.items() if len(s) == 1}
+
+    if daily is not None and not daily.empty:
+        for _, r in daily.iterrows():
+            ch = clean_no(r.get("차트번호", ""))
+            if not ch:
+                # 일마에 차트번호가 없으면 성명으로 차트(EMR) 링크 시도
+                ch = name2chart_unique.get(clean_name(r.get("성명", "")), "")
+            if not ch:
+                continue
+            d = dp.setdefault(ch, dict(empty))
+            d["카드"] += _safe_int(r.get("카드", 0))
+            d["현금"] += _safe_int(r.get("현금", 0))
+            d["이체"] += _safe_int(r.get("이체", 0))
+            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+    return pp, dp
+
+
+def _hansol_card_by_chart(hansol, patient):
+    """승인번호를 다리로 한솔(PG) 카드금액을 차트번호에 귀속한다.
+
+    일마(일일마감)·한솔에 차트번호가 없어도 한솔 승인번호 ↔ 차트(EMR) 결제메모 승인번호로
+    직접 연결한다. 승인번호가 정확히 한 차트에만 대응할 때만 귀속(공동결제·미링크는 제외)해
+    허위 차이를 방지한다.
+    반환: {차트번호: (한솔카드합, 건수)} — 링크 불가 차트는 미포함(=한솔금액 unknown).
+    """
+    if (hansol is None or hansol.empty or patient is None or patient.empty
+            or "분류" not in patient.columns or "승인번호목록" not in patient.columns
+            or "tx_status" not in hansol.columns):
+        return {}
+
+    def _ak(a):
+        aa = clean_no(a)
+        return aa[-8:] if len(aa) >= 8 else aa
+
+    appr_charts: dict = {}  # 승인번호(8자리) → {차트번호}
+    for _, pr in patient[patient["분류"] == "카드"].iterrows():
+        ch = clean_no(pr.get("차트번호", ""))
+        if not ch:
+            continue
+        al = pr.get("승인번호목록", [])
+        if not isinstance(al, list):
+            continue
+        for a in al:
+            if len(clean_no(a)) >= 4:
+                appr_charts.setdefault(_ak(a), set()).add(ch)
+
+    h_ok = hansol[hansol["tx_status"] == "정상"]
+    h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
+    acc: dict = {}  # 차트번호 → [금액합, 건수]
+    for _, hr in h_card.iterrows():
+        a = clean_no(hr.get("승인번호", ""))
+        if len(a) < 4:
+            continue
+        charts = appr_charts.get(_ak(a))
+        if not charts or len(charts) != 1:  # 미링크 또는 공동결제(2차트 이상) → 제외
+            continue
+        ch = next(iter(charts))
+        e = acc.setdefault(ch, [0, 0])
+        e[0] += int(hr["금액"])
+        e[1] += 1
+    return {ch: (v[0], v[1]) for ch, v in acc.items()}
+
+
 def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12):
     """채널 차이를 설명할 후보 거래 추출 (multiset diff + 승인번호 cross-match 기반).
 
@@ -1443,7 +1540,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
       ★★ 동일환자 확정         — 승인번호로 환자 확정 + 한솔-일마 금액 불일치
       ★ 차이값 정확매칭 페어   — counter diff 기반 금액 페어가 gap과 수학적으로 일치
       한솔에만 존재★/일마에만 존재★ — gap 근접 금액
-      차트↔일마 분류차이       — 참고
+      차트↔일마 카드차이★      — 전 결제수단 pivot 비교로 누락·결제수단 오기재 포착(gap근접 시 ★)
     """
     from collections import Counter
     suspects = []
@@ -1558,147 +1655,154 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                                 "조치": f"일마 {d_amt:,}원({d_names}) 결제수단 오기재 또는 한솔 {h_amt:,}원 부분취소 의심 — 즉시 확인",
                             })
 
-            # ★★ 승인번호 cross-match (한솔 있을 때만)
+            # ★★ 승인번호 cross-match: 승인번호별 [한솔 카드합] vs [차트 카드합] 비교 (한솔 있을 때만)
+            # 분할기재(한 결제가 차트 여러 줄)·공동결제(한 카드결제가 여러 환자)로 흩어져도
+            # 승인번호 단위 합계로 비교하므로 허위 불일치가 생기지 않는다. (일마 차트번호 유무 무관)
             if not patient.empty and "승인번호목록" in patient.columns and "분류" in patient.columns:
                 p_card_rows = patient[patient["분류"] == "카드"]
-                p_ch_total: dict = {}
-                p_ch_name: dict = {}
-                for _, pr in p_card_rows.iterrows():
-                    ch = clean_no(pr.get("차트번호", ""))
-                    nm = str(pr.get("이름", "")).strip()
-                    amt = int(pr.get("금액", 0))
-                    if ch:
-                        p_ch_total[ch] = p_ch_total.get(ch, 0) + amt
-                        if nm and ch not in p_ch_name:
-                            p_ch_name[ch] = nm
 
-                appr_patient_map: dict = {}
+                def _ak(a):
+                    aa = clean_no(a)
+                    return aa[-8:] if len(aa) >= 8 else aa
+
+                # 차트: 승인번호(8자리 suffix) → 카드합·이름·차트 집합
+                c_appr: dict = {}
+                ambiguous: set = set()
                 for _, pr in p_card_rows.iterrows():
                     ch = clean_no(pr.get("차트번호", ""))
-                    nm = p_ch_name.get(ch, str(pr.get("이름", "")).strip())
-                    amt = int(pr.get("금액", 0))
+                    nm = clean_name(pr.get("이름", "")) or ch
+                    amt = _safe_int(pr.get("금액", 0))
                     appr_list = pr.get("승인번호목록", [])
-                    if not isinstance(appr_list, list):
+                    keys = ({_ak(a) for a in appr_list if len(clean_no(a)) >= 4}
+                            if isinstance(appr_list, list) else set())
+                    if len(keys) > 1:
+                        # 한 행에 승인번호가 여러 개면 금액 귀속이 모호 → 비교 제외(허위방지)
+                        ambiguous |= keys
                         continue
-                    for a in appr_list:
-                        aa = clean_no(a)
-                        if len(aa) < 4:
-                            continue
-                        keys = [aa]
-                        if len(aa) > 8:
-                            keys.append(aa[-8:])
-                        for key in keys:
-                            existing = appr_patient_map.setdefault(key, [])
-                            if not any(x[0] == ch for x in existing):
-                                existing.append((ch, nm, amt))
+                    for key in keys:
+                        e = c_appr.setdefault(key, {"amt": 0, "names": set(), "charts": set()})
+                        e["amt"] += amt
+                        if nm:
+                            e["names"].add(nm)
+                        if ch:
+                            e["charts"].add(ch)
 
-                d_ch_card: dict = {}
-                if not daily.empty and "카드" in daily.columns:
-                    for ch_g, grp in daily[daily["카드"] > 0].groupby("차트번호"):
-                        d_ch_card[clean_no(str(ch_g))] = int(grp["카드"].sum())
+                # 한솔: 승인번호(8자리 suffix) → 카드합 + 대표행(단서용)
+                h_appr: dict = {}
+                for _, hr in h_card.iterrows():
+                    a = clean_no(hr.get("승인번호", ""))
+                    if len(a) < 4:
+                        continue
+                    e = h_appr.setdefault(_ak(a), {"amt": 0, "row": hr})
+                    e["amt"] += int(hr["금액"])
 
                 star2: list = []
-                seen_pair: set = set()
-                for _, hr in h_card.iterrows():
-                    appr = clean_no(hr.get("승인번호", ""))
-                    if not appr or len(appr) < 4:
+                for key in set(h_appr) & set(c_appr):
+                    if key in ambiguous:
                         continue
-                    h_amt = int(hr["금액"])
-                    hits: list = list(appr_patient_map.get(appr, []))
-                    if not hits and len(appr) > 8:
-                        hits = list(appr_patient_map.get(appr[-8:], []))
-                    for (ch, nm, chart_row_amt) in hits:
-                        suffix = appr[-8:] if len(appr) >= 8 else appr
-                        pair_key = (suffix, ch)
-                        if pair_key in seen_pair:
-                            continue
-                        d_amt = d_ch_card.get(ch, 0)
-                        cmp_amt = d_amt if d_amt > 0 else chart_row_amt
-                        if h_amt == cmp_amt:
-                            seen_pair.add(pair_key)
-                            continue
-                        seen_pair.add(pair_key)
-                        diff = h_amt - cmp_amt
-                        gap_match = gap != 0 and diff == gap
-                        cn = str(hr.get("카드번호", ""))
-                        cn_tail = cn[-5:] if cn and cn != "nan" else ""
-                        t = str(hr.get("시간표시", ""))
-                        co = str(hr.get("카드사", ""))[:6]
-                        amt_detail = f"한솔 {h_amt:,} vs 일마 {d_amt:,}" if d_amt > 0 else f"한솔 {h_amt:,} vs 차트 {chart_row_amt:,}"
-                        if d_amt > 0 and d_amt != chart_row_amt:
-                            amt_detail += f"(차트 {chart_row_amt:,})"
-                        tag = "★★ 동일환자 확정(gap일치)" if gap_match else "★★ 동일환자 확정"
-                        star2.append({
-                            "출처": tag,
-                            "환자": nm or ch,
-                            "금액": diff,
-                            "단서": f"승인{suffix} {t} 말미{cn_tail} {co} | {amt_detail}",
-                            "조치": (
-                                f"{'★gap완전일치 → ' if gap_match else ''}"
-                                f"환자 {nm}({ch}) 한솔·일마 카드금액 불일치 — 즉시 수정"
-                            ),
-                        })
+                    h_total, c_total = h_appr[key]["amt"], c_appr[key]["amt"]
+                    if h_total == c_total:
+                        continue
+                    diff = h_total - c_total
+                    gap_match = gap != 0 and diff == gap
+                    hr = h_appr[key]["row"]
+                    cn = str(hr.get("카드번호", ""))
+                    cn_tail = cn[-5:] if cn and cn != "nan" else ""
+                    t = str(hr.get("시간표시", ""))
+                    co = str(hr.get("카드사", ""))[:6]
+                    names = "·".join(sorted(c_appr[key]["names"])[:3])
+                    charts = ",".join(sorted(c_appr[key]["charts"]))
+                    tag = "★★ 동일환자 확정(gap일치)" if gap_match else "★★ 동일환자 확정"
+                    star2.append({
+                        "출처": tag,
+                        "환자": names or charts,
+                        "금액": diff,
+                        "단서": (
+                            f"승인{key} {t} 말미{cn_tail} {co} | "
+                            f"한솔 {h_total:,} vs 차트 {c_total:,}" + (f" (차트{charts})" if charts else "")
+                        ),
+                        "조치": (
+                            f"{'★gap완전일치 → ' if gap_match else ''}"
+                            f"환자 {names}(차트{charts}) 한솔·차트 카드금액 불일치 — 즉시 수정"
+                        ),
+                    })
                 if star2:
                     star2.sort(key=lambda x: (0 if "gap일치" in x["출처"] else 1, -abs(x["금액"])))
                     suspects = star2 + suspects
 
-        # 차트(환자집계) vs 일마 카드 분류 차이 (참고) — 한솔 유무 무관
+        # 차트 vs 일마 카드금액 차이 — 전 결제수단 pivot 기반(분류 무관, 한솔 유무 무관)
+        # 교집합이 아닌 합집합을 사용해 "차트=현금·일마=카드" 같은 결제수단 오기재까지 포착
         if not patient.empty and not daily.empty and "분류" in patient.columns:
-            p_card = patient[patient["분류"] == "카드"].groupby("차트번호")["금액"].sum()
-            d_by_chart = daily.groupby("차트번호")["카드"].sum()
-            common = (set(p_card.index) & set(d_by_chart.index)) - {""}
+            pp, dp = _chart_method_pivots(patient, daily)
+            empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
             mismatches = []
-            for ch in common:
-                pv, dv = int(p_card.get(ch, 0)), int(d_by_chart.get(ch, 0))
-                if pv != dv:
-                    mismatches.append((ch, pv, dv))
-            # 차트↔일마 차이도 channel gap 근접도 우선
-            mismatches.sort(key=lambda x: _rank_key(x[2] - x[1], gap))
-            for ch, pv, dv in mismatches[:top_n]:
+            for ch in (set(pp) | set(dp)):
+                p = pp.get(ch, empty)
+                d = dp.get(ch, empty)
+                if d["카드"] == p["카드"]:
+                    continue
+                mismatches.append((ch, p, d, d["카드"] - p["카드"]))
+            # 채널 gap 근접도 우선 정렬
+            mismatches.sort(key=lambda x: _rank_key(x[3], gap))
+            for ch, p, d, diff in mismatches[:top_n]:
+                near = abs(abs(diff) - abs(gap)) <= max(1000, abs(gap) * 0.05) if gap else False
+                # 카드 차이분이 어느 파일·어느 결제수단으로 옮겨졌는지(오기재) 자동 탐지
+                moved = ""
+                for m in ("현금", "이체", "플랫폼"):
+                    if diff != 0 and (p[m] - d[m]) == diff:
+                        side = "차트" if p[m] > d[m] else "일마"
+                        moved = f" → {side}가 {m}({max(p[m], d[m]):,})로 기재(결제수단 오기재 의심)"
+                        break
                 suspects.append({
-                    "출처": "차트↔일마 분류차이",
+                    "출처": "차트↔일마 카드차이★" if near else "차트↔일마 카드차이",
                     "환자": name_map.get(str(ch).strip(), ""),
-                    "금액": dv - pv,
-                    "단서": f"차트{ch} (차트={pv:,} / 일마={dv:,})",
-                    "조치": "결제수단(카드↔현금↔이체) 오기재 가능성",
+                    "금액": diff,
+                    "단서": (
+                        f"차트{ch} 차트(카{p['카드']:,}/현{p['현금']:,}/이{p['이체']:,}) "
+                        f"vs 일마(카{d['카드']:,}/현{d['현금']:,}/이{d['이체']:,}){moved}"
+                    ),
+                    "조치": "결제수단(카드↔현금↔이체) 오기재 또는 카드결제 누락/중복 확인",
                 })
 
     elif channel == "현금+이체":
         if not patient.empty and not daily.empty:
-            p_cx = patient[patient.get("분류", "").isin(["현금", "이체"])].groupby("차트번호")["금액"].sum()
-            d_cx = daily.groupby("차트번호").apply(lambda x: int(x["현금"].sum() + x["이체"].sum()))
-            common = set(p_cx.index) & set(d_cx.index)
+            pp, dp = _chart_method_pivots(patient, daily)
+            empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
             mismatches = []
-            for ch in common:
-                pv, dv = int(p_cx.get(ch, 0)), int(d_cx.get(ch, 0))
+            for ch in (set(pp) | set(dp)):
+                p = pp.get(ch, empty)
+                d = dp.get(ch, empty)
+                pv, dv = p["현금"] + p["이체"], d["현금"] + d["이체"]
                 if pv != dv:
-                    mismatches.append((ch, pv, dv, abs(pv - dv)))
-            mismatches.sort(key=lambda x: -x[3])
-            for ch, pv, dv, _ in mismatches[:top_n]:
+                    mismatches.append((ch, p, d, dv - pv))
+            mismatches.sort(key=lambda x: -abs(x[3]))
+            for ch, p, d, diff in mismatches[:top_n]:
                 suspects.append({
-                    "출처": "차트↔일마 분류차이",
+                    "출처": "차트↔일마 현금/이체차이",
                     "환자": name_map.get(str(ch).strip(), ""),
-                    "금액": dv - pv,
-                    "단서": f"차트{ch} / 차트현금+이체={pv:,} 일마={dv:,}",
+                    "금액": diff,
+                    "단서": (
+                        f"차트{ch} 차트(현{p['현금']:,}/이{p['이체']:,}/카{p['카드']:,}) "
+                        f"vs 일마(현{d['현금']:,}/이{d['이체']:,}/카{d['카드']:,})"
+                    ),
                     "조치": "현금↔이체↔카드 오기재 확인",
                 })
 
     elif channel == "플랫폼":
         if not patient.empty and not daily.empty:
-            p_pl = patient[patient.get("분류", "") == "플랫폼"].groupby("차트번호")["금액"].sum()
-            d_pl = daily.groupby("차트번호")["플랫폼합"].sum()
-            common = set(p_pl.index) & set(d_pl.index) | set(p_pl.index) | set(d_pl.index)
+            pp, dp = _chart_method_pivots(patient, daily)
             mismatches = []
-            for ch in common:
-                pv, dv = int(p_pl.get(ch, 0)), int(d_pl.get(ch, 0))
+            for ch in (set(pp) | set(dp)):
+                pv = pp.get(ch, {}).get("플랫폼", 0)
+                dv = dp.get(ch, {}).get("플랫폼", 0)
                 if pv != dv:
-                    mismatches.append((ch, pv, dv, abs(pv - dv)))
-            mismatches.sort(key=lambda x: -x[3])
-            for ch, pv, dv, _ in mismatches[:top_n]:
+                    mismatches.append((ch, pv, dv, dv - pv))
+            mismatches.sort(key=lambda x: -abs(x[3]))
+            for ch, pv, dv, diff in mismatches[:top_n]:
                 suspects.append({
                     "출처": "차트↔일마 플랫폼차이",
                     "환자": name_map.get(str(ch).strip(), ""),
-                    "금액": dv - pv,
+                    "금액": diff,
                     "단서": f"차트{ch} / 차트플랫폼={pv:,} 일마={dv:,}",
                     "조치": "플랫폼 종류/금액 오기재 확인",
                 })
@@ -1842,32 +1946,12 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
 
     # ── [차트번호 3-way 통합] ─────────────────────
     # 차트(분류별) / 일마(채널별) / 한솔(매칭카드합) per 차트번호
-    p_pivot = {}
-    if not patient.empty and "분류" in patient.columns:
-        for _, r in patient.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            cat = str(r.get("분류", ""))
-            amt = _safe_int(r.get("금액", 0))
-            d = p_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            if cat in d:
-                d[cat] += amt
+    # find_channel_suspects와 동일한 pivot 로직을 공유해 UI·AI·엑셀 수치를 일치시킴
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
 
-    d_pivot = {}
-    if not daily.empty:
-        for _, r in daily.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            d = d_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            d["카드"] += _safe_int(r.get("카드", 0))
-            d["현금"] += _safe_int(r.get("현금", 0))
-            d["이체"] += _safe_int(r.get("이체", 0))
-            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
-
-    h_card_by_ch = {}
-    if p1_full is not None and not p1_full.empty:
+    # 한솔 카드금액은 승인번호 다리로 차트에 귀속(일마 차트번호 유무 무관). 미링크 차트는 unknown.
+    h_card_by_ch = _hansol_card_by_chart(hansol, patient)
+    if not h_card_by_ch and p1_full is not None and not p1_full.empty:
         for _, r in p1_full.iterrows():
             ch = clean_no(r.get("차트번호", ""))
             if not ch:
@@ -1895,10 +1979,9 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
     for ch in all_charts:
         p = p_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
         d = d_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-        h_amt, h_cnt = h_card_by_ch.get(ch, (0, 0))
+        h_amt, h_cnt = h_card_by_ch.get(ch, (None, 0))  # None = 한솔 미링크(unknown), 참고열로만 표시
+        # 차이는 일마↔차트 비교만 사용(신뢰도 높음). 한솔↔차트 비교는 ★★ 승인번호 섹션이 담당.
         diffs = []
-        if has_hansol and h_amt != d["카드"]:
-            diffs.append(f"한솔카드{h_amt:,}≠일마카드{d['카드']:,}")
         if d["카드"] != p["카드"]:
             diffs.append(f"일마카드{d['카드']:,}≠차트카드{p['카드']:,}")
         if d["현금"] != p["현금"]:
@@ -1910,8 +1993,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
         if not diffs:
             continue
         gap_size = (
-            (abs(h_amt - d["카드"]) if has_hansol else 0)
-            + abs(d["카드"] - p["카드"]) + abs(d["현금"] - p["현금"])
+            abs(d["카드"] - p["카드"]) + abs(d["현금"] - p["현금"])
             + abs(d["이체"] - p["이체"]) + abs(d["플랫폼"] - p["플랫폼"])
         )
         cross_rows.append((gap_size, ch, p, d, h_amt, h_cnt, diffs))
@@ -1930,7 +2012,8 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             appr = ",".join(p_appr_by_ch.get(ch, [])) or "-"
             diff_str = " · ".join(diffs)[:90]
             if has_hansol:
-                L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_amt:,}({h_cnt})|{appr}|{diff_str}")
+                h_str = f"{h_amt:,}({h_cnt})" if h_amt is not None else "-"
+                L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_str}|{appr}|{diff_str}")
             else:
                 L.append(f"{ch}|{nm}|{p_str}|{d_str}|{appr}|{diff_str}")
 
@@ -2031,6 +2114,8 @@ AI_SYSTEM = (
     "[R5] 부호 약속: '한-차=+10,000'은 한솔이 차트보다 10,000원 많음 = 차트누락 or 한솔과다. "
     "'일-차=-5,000'은 일마가 차트보다 5,000원 적음 = 일마누락 or 차트과다.\n"
     "[R6] 한솔=일마=A · 차트=B(A≠B) → 차트 단독 오류로 단정 (PG승인+프론트수납이 모두 A이므로 진실=A).\n"
+    "[R6b] 한솔이 없으면(2파일 분석) 다수결 불가 → 차트(EMR 청구원장)를 잠정 기준으로 제시하되 "
+    "'일마·차트 중 한 곳 오기재'로 표기하고 원본 확인 권고 (단정 금지).\n"
     "[R7] 동일금액이 다른 결제수단 칼럼에 분산되면 결제수단 오기재 (예: 차트카드=X · 일마현금=X).\n"
     "[R8] 한솔PG-only의 '동일금액일마환자' hint가 있으면 그 환자의 일마 결제수단 오기재로 강하게 의심.\n"
     "[R9] '확인 바랍니다' 같은 일반론 금지. 반드시 '어느 파일·어느 환자·어느 금액을 무엇으로 수정' 형식의 실행 가능한 명령으로 출력."
@@ -2073,7 +2158,7 @@ STEP6. 산술 상쇄 검증 (R2 — 출력 직전 필수)
   · 제안한 수정들의 채널별 net 변화량을 합산해 채널대사 차이값과 정확히 일치하는지 확인.
   · 불일치 → 남은 차이만큼 추가후보 탐색 (한솔PG-only / 일마front-only / 환불행 재확인).
 
-[출력 형식 — 1100토큰 이내, 마크다운]
+[출력 형식 — 800토큰 이내(반드시 끝까지 완결), 마크다운]
 
 ### 채널별 차이 진단
 차이≠0 채널마다 ↓
@@ -2112,32 +2197,11 @@ def build_3way_table(hansol, daily, patient, p1_full):
             if ch and nm and nm != "nan" and ch not in name_map:
                 name_map[ch] = nm
 
-    p_pivot = {}
-    if not patient.empty and "분류" in patient.columns:
-        for _, r in patient.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            cat = str(r.get("분류", ""))
-            amt = _safe_int(r.get("금액", 0))
-            d = p_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            if cat in d:
-                d[cat] += amt
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
 
-    d_pivot = {}
-    if not daily.empty:
-        for _, r in daily.iterrows():
-            ch = clean_no(r.get("차트번호", ""))
-            if not ch:
-                continue
-            d = d_pivot.setdefault(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-            d["카드"] += _safe_int(r.get("카드", 0))
-            d["현금"] += _safe_int(r.get("현금", 0))
-            d["이체"] += _safe_int(r.get("이체", 0))
-            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
-
-    h_card_by_ch = {}
-    if p1_full is not None and not p1_full.empty:
+    # 한솔 카드금액은 승인번호 다리로 차트에 귀속(일마 차트번호 유무 무관). 미링크는 unknown.
+    h_card_by_ch = _hansol_card_by_chart(hansol, patient)
+    if not h_card_by_ch and p1_full is not None and not p1_full.empty:
         for _, r in p1_full.iterrows():
             ch = clean_no(r.get("차트번호", ""))
             if not ch:
@@ -2149,7 +2213,7 @@ def build_3way_table(hansol, daily, patient, p1_full):
     for ch in sorted(all_charts):
         p = p_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
         d = d_pivot.get(ch, {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0})
-        h_amt, h_cnt = h_card_by_ch.get(ch, (0, 0))
+        h_amt, h_cnt = h_card_by_ch.get(ch, (None, 0))
         row = {
             "차트번호": ch,
             "이름": name_map.get(ch, ""),
@@ -2157,9 +2221,9 @@ def build_3way_table(hansol, daily, patient, p1_full):
             "일마카드": d["카드"], "일마현금": d["현금"], "일마이체": d["이체"], "일마플랫폼": d["플랫폼"],
         }
         if has_hansol:
-            row["한솔카드"] = h_amt
+            row["한솔카드"] = h_amt if h_amt is not None else ""
             row["한솔건수"] = h_cnt
-            row["한-일카드차"] = h_amt - d["카드"]
+            row["한-차카드차"] = (h_amt - p["카드"]) if h_amt is not None else 0
         row["일-차카드차"] = d["카드"] - p["카드"]
         row["일-차현금차"] = d["현금"] - p["현금"]
         row["일-차이체차"] = d["이체"] - p["이체"]
@@ -2574,7 +2638,8 @@ else:
         else:
             st.markdown(
                 "**일마↔차트 채널별 차이** — 한솔페이 없이 2개 파일만 비교한 결과입니다.  \n"
-                "🟡 **차트↔일마 분류차이** = 차트번호별로 결제수단 불일치 환자"
+                "🟠 **차트↔일마 카드차이★** = 차트번호별 카드금액 불일치 (gap 근접 시 ★, 결제수단 오기재 단서 포함)  \n"
+                "🟡 그 외 = 현금/이체·플랫폼 결제수단 불일치 환자"
             )
         any_diff = False
         for _, r in channel_df.iterrows():
