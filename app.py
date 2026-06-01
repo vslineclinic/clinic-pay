@@ -1889,7 +1889,9 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             f"{_f(r['한솔-차트'])}|{_f(r['한솔-일마'])}|{_f(r['일마-차트'])}"
         )
 
-    # 차이 zero 단축
+    # 차이 zero 단축 — 단, 채널 합계가 맞아도 환자별 금액이 +/-로 상쇄돼 숨은 불일치가
+    # 있을 수 있으므로(상쇄쌍 누락 방지), 채널차이뿐 아니라 환자별(차트번호별) 일마↔차트
+    # 불일치 유무까지 확인한 뒤 종료를 결정한다.
     diff_cols = ["한솔-차트", "한솔-일마", "일마-차트"] if has_hansol else ["일마-차트"]
     has_nonzero = False
     for _, r in channel_df.iterrows():
@@ -1903,9 +1905,26 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                 pass
         if has_nonzero:
             break
-    if not has_nonzero:
-        L.append("\n[결과] 모든채널 일치 — 추가분석 불필요")
+
+    # 환자별(차트번호별) 일마↔차트 금액 불일치 존재 여부 (채널 합계엔 상쇄돼 안 보일 수 있음).
+    # 아래 [3-way 통합] 섹션과 동일한 pivot을 한 번만 만들어 재사용한다.
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
+    _empty_m = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
+    has_patient_diff = False
+    for ch in (set(p_pivot) | set(d_pivot)):
+        p = p_pivot.get(ch, _empty_m)
+        d = d_pivot.get(ch, _empty_m)
+        if (d["카드"] != p["카드"] or d["현금"] != p["현금"]
+                or d["이체"] != p["이체"] or d["플랫폼"] != p["플랫폼"]):
+            has_patient_diff = True
+            break
+
+    if not has_nonzero and not has_patient_diff:
+        L.append("\n[결과] 모든채널·환자 합계 일치 — 추가분석 불필요")
         return "\n".join(L)[:max_chars]
+    if not has_nonzero and has_patient_diff:
+        L.append("\n[주의] 채널 합계는 일치하나 환자별 금액 불일치가 +/-로 상쇄되어 숨어있음 "
+                 "— 아래 [차트번호별 3-way 통합]에서 환자별 개별 검토 필요")
 
     # ── 차트번호 → 이름 맵 ────────────────────────
     name_map = {}
@@ -1946,8 +1965,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
 
     # ── [차트번호 3-way 통합] ─────────────────────
     # 차트(분류별) / 일마(채널별) / 한솔(매칭카드합) per 차트번호
-    # find_channel_suspects와 동일한 pivot 로직을 공유해 UI·AI·엑셀 수치를 일치시킴
-    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
+    # p_pivot·d_pivot은 위 단축 판정에서 이미 만든 것을 재사용 (find_channel_suspects와 동일 로직 → UI·AI·엑셀 수치 일치)
 
     # 한솔 카드금액은 승인번호 다리로 차트에 귀속(일마 차트번호 유무 무관). 미링크 차트는 unknown.
     h_card_by_ch = _hansol_card_by_chart(hansol, patient)
@@ -2106,19 +2124,28 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
 AI_SYSTEM = (
     "병원 정산 분석관. 입력은 한솔(PG카드승인내역)·일마(프론트 일일마감)·차트(EMR 환자별집계) "
     "3개 파일을 차트번호·승인번호로 join한 raw cross-file 구조다. "
-    "출력은 추측이 아닌 데이터 기반 추적이어야 하며 다음 규칙을 절대 위반하지 말 것:\n"
+    "너의 역할은 '차트에서 무엇을 빼라/얼마로 고쳐라'를 단정하는 것이 아니라, "
+    "'어느 환자에서 어느 채널에 얼마만큼 차이가 나는지'를 데이터로 정확히 짚고 "
+    "'그 환자의 원본 데이터(차트/일마/한솔)를 먼저 검토하라'고 안내하는 것이다. "
+    "다음 규칙을 절대 위반하지 말 것:\n"
     "[R1] 환자명·차트번호·금액·승인번호는 반드시 입력에 실제 존재하는 값만 인용 (창작·반올림·근사 금지).\n"
-    "[R2] 모든 수정 제안은 해당 채널 차이값을 산술적으로 정확히 상쇄해야 한다 (마지막에 검증).\n"
+    "[R2] 모든 차이는 환자(차트번호) 단위로 끝까지 추적한다. 채널 합계차이를 큰 환자 한 명으로 "
+    "'설명 완료'했다고 나머지 환자별 불일치를 버리지 말 것. 서로 +/-로 상쇄되어 채널 합계엔 "
+    "안 보이는 환자쌍·소액 불일치도 각각 독립된 검토대상으로 반드시 나열한다.\n"
     "[R3] 우선순위 절대규칙: ★★(승인번호 동일환자 확정) > ★(금액·gap 매칭) > 일반. 절대 뒤집을 수 없음.\n"
     "[R4] 동일등급 내 정렬: 금액 큰순 → gap일치도 높은 순.\n"
     "[R5] 부호 약속: '한-차=+10,000'은 한솔이 차트보다 10,000원 많음 = 차트누락 or 한솔과다. "
     "'일-차=-5,000'은 일마가 차트보다 5,000원 적음 = 일마누락 or 차트과다.\n"
-    "[R6] 한솔=일마=A · 차트=B(A≠B) → 차트 단독 오류로 단정 (PG승인+프론트수납이 모두 A이므로 진실=A).\n"
-    "[R6b] 한솔이 없으면(2파일 분석) 다수결 불가 → 차트(EMR 청구원장)를 잠정 기준으로 제시하되 "
-    "'일마·차트 중 한 곳 오기재'로 표기하고 원본 확인 권고 (단정 금지).\n"
-    "[R7] 동일금액이 다른 결제수단 칼럼에 분산되면 결제수단 오기재 (예: 차트카드=X · 일마현금=X).\n"
-    "[R8] 한솔PG-only의 '동일금액일마환자' hint가 있으면 그 환자의 일마 결제수단 오기재로 강하게 의심.\n"
-    "[R9] '확인 바랍니다' 같은 일반론 금지. 반드시 '어느 파일·어느 환자·어느 금액을 무엇으로 수정' 형식의 실행 가능한 명령으로 출력."
+    "[R6] 한솔=일마=A · 차트=B(A≠B) → 차트가 틀렸을 가능성이 높다 (PG승인+프론트수납이 모두 A). "
+    "단 '차트를 A로 고쳐라'라고 단정하지 말고 '차트의 해당 환자 결제내역을 먼저 검토하라'고 권고.\n"
+    "[R6b] 한솔이 없으면(2파일 분석) 다수결 불가 → 어느 쪽이 맞는지 단정 금지. "
+    "'일마·차트 중 한 곳 오기재 가능성'으로 표기하고 양쪽 원본 검토를 권고.\n"
+    "[R7] 동일금액이 다른 결제수단 칼럼에 분산되면 결제수단 오기재 가능성 "
+    "(예: 차트카드=X · 일마현금=X) — 해당 환자 결제수단 검토 권고.\n"
+    "[R8] 한솔PG-only의 '동일금액일마환자' hint가 있으면 그 환자의 일마 결제수단 오기재 가능성 — 검토 권고.\n"
+    "[R9] '확인 바랍니다' 식 막연한 일반론 금지. 반드시 '어느 환자(차트#)·어느 채널·차이금액·추정원인'을 "
+    "구체적으로 짚되, 마지막 액션은 특정 금액으로 고치라는 명령이 아니라 "
+    "'그 환자의 원본 데이터를 검토하라'는 권고 형식으로 출력."
 )
 
 AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호로 통합한 raw 구조):
@@ -2129,48 +2156,53 @@ AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호�
 
 STEP1. [채널대사] 차이값 확정
   · 채널별 한-차/한-일/일-차 차이를 정확히 메모 (부호 포함).
-  · 모든 차이=0이면 "✅ 모든 채널 합계 일치 — 분석 불필요" 한 줄로 즉시 종료.
+  · 채널 합계가 모두 0이어도, 데이터에 환자별(차트번호별) 금액 불일치가 하나라도 있으면 분석을 계속한다
+    (서로 +/-로 상쇄돼 합계엔 안 보이는 환자별 오류가 숨어있을 수 있음).
+  · 환자별 불일치가 전혀 없을 때만 "✅ 모든 채널·환자 합계 일치 — 검토 불필요" 한 줄로 종료.
 
 STEP2. [★★ 승인번호확정매칭] 1순위 처리 (절대 먼저)
   · 코드가 한솔승인번호 ↔ 차트승인번호목록 매칭으로 확정한 환자 = 환자 특정 完了.
-  · 단서의 '한솔 X vs 일마 Y' 표기 해석:
-      - 한솔=일마 일치(차트만 다름) → R6에 따라 차트를 한솔금액으로 수정.
-      - 한솔≠일마 → PG영수증이 진실 → 일마를 한솔금액으로 수정.
+  · 단서의 '한솔 X vs 일마 Y' 해석:
+      - 한솔=일마(차트만 다름) → R6 → 차트의 그 환자 결제내역 우선 검토 권고.
+      - 한솔≠일마 → PG영수증이 진실에 가까움 → 일마의 그 환자 내역 우선 검토 권고.
 
-STEP3. [차트번호별 3-way 통합]에서 5가지 패턴 코드로 분류
-  Pa(결제수단 오기재): 차트(X/0/0/0) · 일마(0/X/0/0) → "차트# {{ch}} 환자{{nm}}: 차트 결제수단을 카드→현금으로 수정"
-  Pb(카드↔이체 오기재): 차트(X/0/0/0) · 일마(0/0/X/0) → 차트 결제수단을 카드→이체로 수정
-  Pc(차트 중복기재):   차트(2X/...) · 일마(X/...) · 한솔(X) → "차트# {{ch}}의 X원 카드행 1개 삭제"
-  Pd(차트 누락):       차트(0/0/0/0) · 일마(X/Y/Z/W) → "차트# {{ch}}에 해당 결제건 추가"
-  Pe(차트 금액오류):   차트(X) · 일마=한솔=Y, X≠Y → R6 → 차트를 Y로 수정
-  · 위 5패턴 중 하나로 분류되지 않으면 '복합 — 수동확인' 으로 표기 (창작금지).
+STEP3. [차트번호별 3-way 통합]의 차이행을 환자 단위로 빠짐없이 검토
+  · 각 차이행의 추정 원인을 아래 패턴으로 분류해 '검토 방향'을 제시 (단정·금액확정 금지):
+    Pa(결제수단 오기재): 차트(X/0/0/0)·일마(0/X/0/0) → "카드↔현금 오기재 가능성 — 결제수단 검토"
+    Pb(카드↔이체 오기재): 차트(X/0/0/0)·일마(0/0/X/0) → "카드↔이체 오기재 가능성 — 검토"
+    Pc(차트 중복기재):   차트(2X)·일마(X)·한솔(X)  → "차트 중복기재 가능성 — 차트 결제행 검토"
+    Pd(차트 누락):       차트(0)·일마(X)          → "차트 누락 가능성 — 차트 결제건 검토"
+    Pe(차트 금액오류):   차트(X)·일마=한솔=Y(X≠Y) → R6 → "차트 금액오류 가능성 — 차트 금액 검토"
+  · 어느 패턴에도 안 맞으면 '복합 — 수동검토'로 표기 (창작금지).
+  · ★중요★ 채널 합계차이를 큰 환자 한 명으로 설명했어도 나머지 차이행을 생략하지 말 것.
+    +/-로 상쇄되는 환자쌍(예: A −27,500 · B +27,500, 합계 0)도 각각 검토대상으로 반드시 나열한다.
 
 STEP4. [한솔 PG-only] · [일마 front-only] cross-match
-  · 한솔PG-only 행의 '동일금액일마환자' hint 존재 → R8 → 그 환자 일마 결제수단을 카드로 정정.
-  · 한솔PG-only 금액 = 일마front-only 금액 페어 발견 → 환자 동일성 검증 후 매칭처리 권고.
-  · hint 없는 한솔PG-only → 일마·차트에 결제건 누락 → '추가' 권고.
-  · hint 없는 일마front-only → PG승인 없음 → 미수납 or 결제수단 오기재 (현금·이체 가능성).
+  · 한솔PG-only의 '동일금액일마환자' hint 존재 → R8 → 그 환자 일마 결제수단(현금/이체 오기재) 검토 권고.
+  · 한솔PG-only 금액 = 일마front-only 금액 페어 → 환자 동일성 검토 권고.
+  · hint 없는 한솔PG-only → 일마·차트 결제건 누락 가능성 검토.
+  · hint 없는 일마front-only → PG승인 없음 → 미수납 or 결제수단 오기재 가능성 검토.
 
-STEP5. [환불/취소] 행 부호 검증
+STEP5. [환불/취소] 행 부호 검토
   · 차트환불/일마환불 행이 채널대사에 정상 반영됐는지 확인 (음수 누락 시 차이 발생 가능).
 
-STEP6. 산술 상쇄 검증 (R2 — 출력 직전 필수)
-  · 제안한 수정들의 채널별 net 변화량을 합산해 채널대사 차이값과 정확히 일치하는지 확인.
-  · 불일치 → 남은 차이만큼 추가후보 탐색 (한솔PG-only / 일마front-only / 환불행 재확인).
+STEP6. 정합성 점검 (참고용 — 검토대상을 거르는 필터가 아님)
+  · 환자별 차이를 채널별로 합산해 채널대사 차이값과 맞는지 점검 → 합계차이를 주로 만든 '주요원인' 환자 식별.
+  · 단, 합계엔 안 잡히는 상쇄쌍·소액 불일치도 STEP3 목록에 모두 남길 것 (합계 일치는 생략 사유 아님).
 
 [출력 형식 — 800토큰 이내(반드시 끝까지 완결), 마크다운]
 
 ### 채널별 차이 진단
-차이≠0 채널마다 ↓
+차이 또는 환자별 불일치가 있는 채널마다 ↓
 - **{{채널}}**: 한-차=±?원 · 한-일=±?원 · 일-차=±?원
-  - **패턴**: `★★확정` 또는 `Pa/Pb/Pc/Pd/Pe` 또는 `복합-수동확인`
-  - **수정대상** (★★ → ★ → 일반 순 강제):
-    1. `★★/★/-` {{환자명}}(차트#{{ch}}): "{{파일}}의 {{현재금액}}을 {{목표금액}}으로 수정" 또는 "{{파일}}에 {{금액}} {{결제수단}} 결제건 추가" / "{{파일}}의 {{환자/금액}} 행 삭제"
+  - **검토대상** (★★ → ★ → 일반 순, 상쇄쌍·소액 포함 빠짐없이):
+    1. `★★/★/-` {{환자명}}(차트#{{ch}}) · {{채널}} {{차이금액}}원 · 추정원인 {{Pa~Pe/복합}} → **검토 권고**: {{어느 파일의 그 환자 어느 내역을 먼저 봐야 하는지}}
     2. …
-  - **상쇄검증**: 위 수정합산 = ±?원 → 채널차이값과 일치 ✓ (또는 부족분 ?원 → 추가후보 제시)
+  - **합계정합**: 주요원인 = {{환자/금액}} (합계차이 대부분 설명) · 상쇄쌍/소액 별도검토 = {{환자쌍/건수}}
 
 ### 결론 (1~2문장)
-어느 파일의 어느 환자(차트#·금액)를 어떻게 수정하면 전 채널 합계가 맞는지 — 환자명·차트#·금액 모두 인용."""
+어느 환자(차트#)의 어느 채널 금액을 어느 파일에서 먼저 검토해야 하는지 — 환자명·차트#·차이금액 인용.
+상쇄되어 합계엔 안 보이던 환자쌍도 함께 언급. 특정 금액으로 고치라 단정 말고 '검토 후 정정' 관점으로 안내."""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2568,16 +2600,30 @@ else:
         return int(v) != 0
 
     diff_cols = ["한솔-차트", "한솔-일마", "일마-차트"] if has_hansol else ["일마-차트"]
-    nonzero_count = sum(
-        1 for _, r in channel_df.iterrows()
-        for col in diff_cols
-        if _nonzero(r[col])
-    )
-    total_abs_gap = sum(
-        abs(int(r[col])) for _, r in channel_df.iterrows()
-        for col in diff_cols
-        if _nonzero(r[col])
-    )
+
+    # 채널 차이 합계·차이 채널 수는 '채널별 파일값의 최대-최소 폭(spread)'으로 센다.
+    # 한솔=차트인데 일마만 다르면 한솔-일마·일마-차트가 둘 다 잡혀 같은 원인이 2배로
+    # 합산되던 문제(예: 일마 198,000 차이 → 396,000으로 표시)를 막아, 한 채널의 불일치는
+    # 한 번만(가장 큰 파일간 격차) 집계한다.
+    def _channel_spread(row):
+        vals = []
+        for c in ("한솔", "일마", "차트"):
+            if c not in row.index:
+                continue
+            v = row[c]
+            if v is None:
+                continue
+            try:
+                if pd.isna(v):
+                    continue
+                vals.append(int(v))
+            except Exception:
+                continue
+        return (max(vals) - min(vals)) if len(vals) >= 2 else 0
+
+    channel_gaps = [_channel_spread(r) for _, r in channel_df.iterrows()]
+    total_abs_gap = sum(channel_gaps)
+    nonzero_count = sum(1 for g in channel_gaps if g != 0)
 
     if has_hansol:
         n_ok = len(hansol[hansol["tx_status"] == "정상"])
@@ -2586,17 +2632,17 @@ else:
         k1.metric("한솔 정상", n_ok)
         k2.metric("자동매칭", n_m, f"{n_m/n_ok*100:.0f}%" if n_ok else "0%")
         k3.metric("🔴 채널 차이 합계", f"{total_abs_gap:,}원", delta_color="inverse")
-        k4.metric("⚠️ 차이있는 채널-쌍", nonzero_count, delta_color="inverse")
+        k4.metric("⚠️ 차이있는 채널", nonzero_count, delta_color="inverse")
     else:
         k1, k2 = st.columns(2)
         k1.metric("🔴 채널 차이 합계 (일마↔차트)", f"{total_abs_gap:,}원", delta_color="inverse")
-        k2.metric("⚠️ 차이있는 채널-쌍", nonzero_count, delta_color="inverse")
+        k2.metric("⚠️ 차이있는 채널", nonzero_count, delta_color="inverse")
 
     title_suffix = "3개 파일" if has_hansol else "일마↔차트 2개 파일"
     st.markdown(f"### ★ 교차분석 합계 ({title_suffix})")
     caption_suffix = "한솔·일마·차트" if has_hansol else "일마·차트"
     st.caption(
-        f"각 채널의 {caption_suffix} 합계를 비교 — **차트 기준으로 일마·한솔이 같으면 🟦 파랑, 다르면 🟥 빨강**"
+        f"각 채널의 {caption_suffix} 합계를 비교 — **차트(비교기준)는 항상 🟦, 일마·한솔은 차트와 같으면 🟦 다르면 🟥**"
     )
 
     def _fmt_amt(v):
@@ -2607,6 +2653,9 @@ else:
         except Exception:
             return "-"
 
+    BLUE = "background-color: #cfe7ff; color: #003366; font-weight: 700"
+    RED = "background-color: #ffcccc; color: #8b0000; font-weight: 700"
+
     def _style_chart_compare(row):
         styles = [""] * len(row)
         cols = row.index.tolist()
@@ -2616,6 +2665,11 @@ else:
         except Exception:
             chart_int = None
         for i, c in enumerate(cols):
+            if c == "차트":
+                # 차트는 비교 기준이므로 값이 있으면 항상 파랑
+                if chart_int is not None:
+                    styles[i] = BLUE
+                continue
             if c not in ("일마", "한솔"):
                 continue
             v = row[c]
@@ -2625,10 +2679,7 @@ else:
                 same = int(v) == chart_int
             except Exception:
                 continue
-            if same:
-                styles[i] = "background-color: #cfe7ff; color: #003366; font-weight: 700"
-            else:
-                styles[i] = "background-color: #ffcccc; color: #8b0000; font-weight: 700"
+            styles[i] = BLUE if same else RED
         return styles
 
     fmt_cols = {c: _fmt_amt for c in channel_df.columns if c != "채널"}
