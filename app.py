@@ -51,6 +51,39 @@ def clean_name(x):
     return re.sub(r"[\s\-\*]", "", str(x)).strip()
 
 
+def _parse_clock(val):
+    """시간 문자열 → (분, 'HH:MM:SS').
+
+    'HH:MM[:SS]' 콜론형 · 'HHMMSS'/'HHMM' 숫자형 · 'YYYY-MM-DD HH:MM:SS' 날짜+시간
+    혼용을 모두 정확히 처리한다. (기존 zfill(6)+앞자리 슬라이스 방식은 날짜가 붙거나
+    초가 없는 'HH:MM' 형식에서 시각을 잘못 읽던 문제가 있었음)
+    """
+    if pd.isna(val):
+        return 0, ""
+    s = str(val).strip()
+    # 1) 콜론 형식 우선 — 날짜가 앞에 와도 마지막 시:분[:초] 매치를 시각으로 사용
+    matches = re.findall(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
+    if matches:
+        hh, mm, ss = matches[-1]
+        hh, mm, ss = int(hh), int(mm), int(ss) if ss else 0
+    else:
+        # 엑셀이 시간을 숫자로 저장한 '1430.0' 같은 형식은 소수부를 버리고 정수부만 사용
+        d = re.sub(r"\D", "", s.split(".")[0])
+        if not d:
+            return 0, ""
+        if len(d) > 6:        # 날짜+HHMMSS → 뒤 6자리만 시각
+            d = d[-6:]
+        if len(d) <= 4:       # HHMM → 초는 00
+            d = d.zfill(4) + "00"
+        else:                 # HHMMSS (5자리는 앞 0 보정)
+            d = d.zfill(6)
+        hh, mm, ss = int(d[:2]), int(d[2:4]), int(d[4:6])
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return 0, ""
+    ss = ss if 0 <= ss <= 59 else 0
+    return hh * 60 + mm, f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
 def _extract_card_company(pay_str):
     """결제수단 문자열에서 카드사명 추출 ('카드-삼성카드' → '삼성')"""
     if pd.isna(pay_str):
@@ -79,20 +112,6 @@ def card_company_match(a, b):
     if not na or not nb:
         return False
     return na == nb or na in nb or nb in na
-
-
-def similar_chart_no(a, b):
-    a, b = clean_no(a), clean_no(b)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    if abs(len(a) - len(b)) > 1:
-        return False
-    if len(a) == len(b):
-        return sum(c1 != c2 for c1, c2 in zip(a, b)) <= 1
-    lo, sh = (a, b) if len(a) > len(b) else (b, a)
-    return any(lo[:i] + lo[i + 1:] == sh for i in range(len(lo)))
 
 
 def _read_excel_auto(buf, **kwargs):
@@ -309,9 +328,9 @@ def parse_hansol(raw):
     df["시간표시"] = ""
     tcol = next((c for c in ["시간", "거래시간", "승인시간"] if c in df.columns), None)
     if tcol:
-        tstr = df[tcol].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
-        df["시간_분"] = tstr.str[:2].astype(int, errors="ignore") * 60 + tstr.str[2:4].astype(int, errors="ignore")
-        df["시간표시"] = tstr.str[:2] + ":" + tstr.str[2:4] + ":" + tstr.str[4:6]
+        parsed = df[tcol].apply(_parse_clock)
+        df["시간_분"] = parsed.apply(lambda x: x[0])
+        df["시간표시"] = parsed.apply(lambda x: x[1])
 
     # 거래상태 분류
     scol = next((c for c in ["거래상태", "상태"] if c in df.columns), None)
@@ -514,8 +533,9 @@ def parse_patient(raw):
         df = df[df["이름"].notna() & ~df["이름"].astype(str).str.contains("합계", na=False)]
     df = df.reset_index(drop=True)
 
-    df["차트번호"] = df["차트번호"].apply(clean_no)
-    df["이름"] = df["이름"].apply(clean_name)
+    # 차트번호/이름 컬럼이 없는 export 형식에서도 KeyError 없이 진행
+    df["차트번호"] = df["차트번호"].apply(clean_no) if "차트번호" in df.columns else ""
+    df["이름"] = df["이름"].apply(clean_name) if "이름" in df.columns else ""
 
     amt_cols = [c for c in ["비급여(과세총금액)", "비급여(비과세)"] if c in df.columns]
     copay_cols = [c for c in df.columns if ("본부금" in str(c) or "본인부담" in str(c)) and "환불" not in str(c)]
@@ -644,6 +664,48 @@ def parse_patient(raw):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 매칭 엔진
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _find_split_combo(items, target, rs, window):
+    """분할결제 후보 탐색: items 중 r개(rs 순서)의 금액 합이 target과 같고
+    시간 spread<=window 인 첫 조합을 반환(없으면 None).
+
+    itertools.combinations 전수탐색과 '완전히 동일한 조합'을 고르되, 금액 인덱스로
+    제3원소를 즉시 찾아 O(n^3)→O(n^2)로 가속한다(미매칭 다수 시 수십초~분 → 수초).
+    items: [[h_idx, 금액, 시간_분], ...] (모두 금액>0 가정). 반환: 선택된 행들의 리스트.
+    """
+    from collections import defaultdict
+    n = len(items)
+    by_amt = defaultdict(list)            # 금액 → 인덱스 오름차순 목록
+    for idx, it in enumerate(items):
+        by_amt[it[1]].append(idx)
+
+    def _spread_ok(idxs):
+        ts = [items[k][2] for k in idxs]
+        return (max(ts) - min(ts)) <= window
+
+    for r in rs:
+        if n < r:
+            continue
+        if r == 2:
+            for i in range(n):
+                for j in by_amt.get(target - items[i][1], ()):
+                    if j > i and _spread_ok((i, j)):
+                        return [items[i], items[j]]
+        elif r == 3:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    need = target - items[i][1] - items[j][1]
+                    if need <= 0:
+                        continue
+                    for k in by_amt.get(need, ()):
+                        if k > j and _spread_ok((i, j, k)):
+                            return [items[i], items[j], items[k]]
+        else:                              # 일반 r 안전망(현재 미사용)
+            for combo in combinations(range(n), r):
+                if sum(items[c][1] for c in combo) == target and _spread_ok(combo):
+                    return [items[c] for c in combo]
+    return None
 
 
 def run_matching(hansol, daily, patient):
@@ -846,21 +908,16 @@ def run_matching(hansol, daily, patient):
         if dr["d_idx"] in matched_dc:
             continue
         target = dr["카드"]
-        avail = h_card[~h_card["h_idx"].isin(matched_h)][["h_idx", "금액", "시간_분"]].values.tolist()
-        found = False
-        for r in [2, 3]:
-            if found or len(avail) < r:
-                break
-            for combo in combinations(range(len(avail)), r):
-                items = [avail[k] for k in combo]
-                if sum(it[1] for it in items) == target:
-                    times = [it[2] for it in items]
-                    spread = max(times) - min(times) if times else 999
-                    if spread <= 10:
-                        idxs = [int(it[0]) for it in items]
-                        add(f"P3_분할{r}건", "🟢HIGH" if spread <= 5 else "🟡MED", idxs, dr)
-                        found = True
-                        break
+        # 양수 금액만 존재하므로 target 초과 건은 어떤 합산조합에도 포함될 수 없음 →
+        # 미리 제외해 조합 탐색량을 줄인다 (매칭 결과는 동일).
+        avail = h_card[(~h_card["h_idx"].isin(matched_h)) & (h_card["금액"] <= target)][
+            ["h_idx", "금액", "시간_분"]].values.tolist()
+        combo = _find_split_combo(avail, target, [2, 3], 10)
+        if combo:
+            times = [it[2] for it in combo]
+            spread = max(times) - min(times)
+            idxs = [int(it[0]) for it in combo]
+            add(f"P3_분할{len(combo)}건", "🟢HIGH" if spread <= 5 else "🟡MED", idxs, dr)
 
     # P3b - 본부금 기반 분할결제 (차트 본부금 정보로 정밀 분할 탐지)
     for _, dr in d_card.iterrows():
@@ -1108,20 +1165,14 @@ def run_matching(hansol, daily, patient):
                 ]
                 if hc_by_card.empty:
                     continue
-                for r in [2, 3]:
-                    if dr["d_idx"] in matched_dc or len(hc_by_card) < r:
-                        break
-                    items_list = hc_by_card[["h_idx", "금액", "시간_분"]].values.tolist()
-                    for combo in combinations(range(len(items_list)), r):
-                        items = [items_list[k] for k in combo]
-                        if sum(it[1] for it in items) == target:
-                            times = [it[2] for it in items]
-                            spread = max(times) - min(times) if times else 999
-                            if spread <= 15:
-                                idxs = [int(it[0]) for it in items]
-                                conf = "🟢HIGH" if spread <= 5 else "🟡MED"
-                                add(f"P7_분할레퍼런스{r}건", conf, idxs, dr)
-                                break
+                items_list = hc_by_card[["h_idx", "금액", "시간_분"]].values.tolist()
+                combo = _find_split_combo(items_list, target, [2, 3], 15)
+                if combo:
+                    times = [it[2] for it in combo]
+                    spread = max(times) - min(times)
+                    idxs = [int(it[0]) for it in combo]
+                    conf = "🟢HIGH" if spread <= 5 else "🟡MED"
+                    add(f"P7_분할레퍼런스{len(combo)}건", conf, idxs, dr)
 
     # P8 - 차트 분할결제 보강: 차트 승인번호 힌트로 한솔 미매칭 카드건 추가 연결
     # 일마감이 1건으로 뭉쳐 있어도(차트는 2건 이상 분할) 같은 차트로 매칭 보완
@@ -1237,21 +1288,15 @@ def run_matching(hansol, daily, patient):
                     ]
                     if len(hc_by_card) < 2:
                         continue
-                    for r in [2, 3]:
-                        if dr["d_idx"] in matched_dc or len(hc_by_card) < r:
-                            break
-                        items_list = hc_by_card[["h_idx", "금액", "시간_분"]].values.tolist()
-                        for combo in combinations(range(len(items_list)), r):
-                            items = [items_list[k] for k in combo]
-                            if sum(it[1] for it in items) == target:
-                                times = [it[2] for it in items]
-                                spread = max(times) - min(times) if times else 999
-                                if spread <= 15:
-                                    idxs = [int(it[0]) for it in items]
-                                    conf = "🟢HIGH" if spread <= 5 else "🟡MED"
-                                    add(f"P9c_소급_분할{r}건", conf, idxs, dr,
-                                        note=f"소급재검토: 카드번호 {card_ref[-4:]} 분할")
-                                    break
+                    items_list = hc_by_card[["h_idx", "금액", "시간_분"]].values.tolist()
+                    combo = _find_split_combo(items_list, target, [2, 3], 15)
+                    if combo:
+                        times = [it[2] for it in combo]
+                        spread = max(times) - min(times)
+                        idxs = [int(it[0]) for it in combo]
+                        conf = "🟢HIGH" if spread <= 5 else "🟡MED"
+                        add(f"P9c_소급_분할{len(combo)}건", conf, idxs, dr,
+                            note=f"소급재검토: 카드번호 {card_ref[-4:]} 분할")
 
         # P9d: 미매칭 한솔건 소급 - 차트 승인번호가 없지만 카드번호가 다른 차트에 매칭된 경우
         for _, hr in h_card[~h_card["h_idx"].isin(matched_h)].iterrows():
@@ -2910,9 +2955,9 @@ else:
                 hansol=hansol, daily=daily, patient=patient, p1_full=p1_full,
             )
             st.download_button(
-                "통합 엑셀 다운로드 (6시트)",
+                "통합 엑셀 다운로드 (7시트)",
                 data=excel,
                 file_name=f"정산차이_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.caption("시트: 0_채널대사(★) / 0_3way통합(★) / 0_의심후보 / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭")
+            st.caption("시트: 0_채널대사(★) / 0_3way통합(★) / 0_의심후보 / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭 / 4_합계")
