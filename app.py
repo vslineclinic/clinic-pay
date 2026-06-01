@@ -2461,14 +2461,18 @@ st.caption("★ 결제채널별 파일 합계 차이를 먼저 산출 → 차이
 
 if "done" not in st.session_state:
     c1, c2, c3 = st.columns(3)
+    # 업로더에 type=[...] 확장자 필터를 두지 않는다. 모바일 브라우저(삼성 인터넷 등)는
+    # 이 필터를 HTML accept 속성으로 변환하는데, 일부 환경에서 .xls/.xlsx를 제대로
+    # 매칭하지 못해 "파일을 골라도 칸이 비어 있는" 증상이 발생한다.
+    # load_file()이 CSV/엑셀/HTML/암호화 형식을 모두 자동 판별하므로 필터는 불필요하다.
     with c1:
-        f_h = st.file_uploader("한솔페이 (선택)", type=["csv", "xlsx", "xls", "xlsb"], key="h")
+        f_h = st.file_uploader("한솔페이 (선택)", key="h", help="CSV·XLSX·XLS·XLSB")
         h_pw = st.text_input("비밀번호(선택)", type="password", key="h_pw")
     with c2:
-        f_d = st.file_uploader("일일마감", type=["csv", "xlsx", "xls", "xlsb"], key="d")
+        f_d = st.file_uploader("일일마감", key="d", help="CSV·XLSX·XLS·XLSB")
         d_pw = st.text_input("비밀번호(선택)", type="password", key="d_pw")
     with c3:
-        f_p = st.file_uploader("차트마감", type=["csv", "xlsx", "xls", "xlsb"], key="p")
+        f_p = st.file_uploader("차트마감", key="p", help="CSV·XLSX·XLS·XLSB")
         p_pw = st.text_input("비밀번호(선택)", type="password", key="p_pw")
 
     if f_d and f_p:
