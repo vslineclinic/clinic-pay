@@ -2600,16 +2600,30 @@ else:
         return int(v) != 0
 
     diff_cols = ["한솔-차트", "한솔-일마", "일마-차트"] if has_hansol else ["일마-차트"]
-    nonzero_count = sum(
-        1 for _, r in channel_df.iterrows()
-        for col in diff_cols
-        if _nonzero(r[col])
-    )
-    total_abs_gap = sum(
-        abs(int(r[col])) for _, r in channel_df.iterrows()
-        for col in diff_cols
-        if _nonzero(r[col])
-    )
+
+    # 채널 차이 합계·차이 채널 수는 '채널별 파일값의 최대-최소 폭(spread)'으로 센다.
+    # 한솔=차트인데 일마만 다르면 한솔-일마·일마-차트가 둘 다 잡혀 같은 원인이 2배로
+    # 합산되던 문제(예: 일마 198,000 차이 → 396,000으로 표시)를 막아, 한 채널의 불일치는
+    # 한 번만(가장 큰 파일간 격차) 집계한다.
+    def _channel_spread(row):
+        vals = []
+        for c in ("한솔", "일마", "차트"):
+            if c not in row.index:
+                continue
+            v = row[c]
+            if v is None:
+                continue
+            try:
+                if pd.isna(v):
+                    continue
+                vals.append(int(v))
+            except Exception:
+                continue
+        return (max(vals) - min(vals)) if len(vals) >= 2 else 0
+
+    channel_gaps = [_channel_spread(r) for _, r in channel_df.iterrows()]
+    total_abs_gap = sum(channel_gaps)
+    nonzero_count = sum(1 for g in channel_gaps if g != 0)
 
     if has_hansol:
         n_ok = len(hansol[hansol["tx_status"] == "정상"])
@@ -2618,17 +2632,17 @@ else:
         k1.metric("한솔 정상", n_ok)
         k2.metric("자동매칭", n_m, f"{n_m/n_ok*100:.0f}%" if n_ok else "0%")
         k3.metric("🔴 채널 차이 합계", f"{total_abs_gap:,}원", delta_color="inverse")
-        k4.metric("⚠️ 차이있는 채널-쌍", nonzero_count, delta_color="inverse")
+        k4.metric("⚠️ 차이있는 채널", nonzero_count, delta_color="inverse")
     else:
         k1, k2 = st.columns(2)
         k1.metric("🔴 채널 차이 합계 (일마↔차트)", f"{total_abs_gap:,}원", delta_color="inverse")
-        k2.metric("⚠️ 차이있는 채널-쌍", nonzero_count, delta_color="inverse")
+        k2.metric("⚠️ 차이있는 채널", nonzero_count, delta_color="inverse")
 
     title_suffix = "3개 파일" if has_hansol else "일마↔차트 2개 파일"
     st.markdown(f"### ★ 교차분석 합계 ({title_suffix})")
     caption_suffix = "한솔·일마·차트" if has_hansol else "일마·차트"
     st.caption(
-        f"각 채널의 {caption_suffix} 합계를 비교 — **차트 기준으로 일마·한솔이 같으면 🟦 파랑, 다르면 🟥 빨강**"
+        f"각 채널의 {caption_suffix} 합계를 비교 — **차트(비교기준)는 항상 🟦, 일마·한솔은 차트와 같으면 🟦 다르면 🟥**"
     )
 
     def _fmt_amt(v):
@@ -2639,6 +2653,9 @@ else:
         except Exception:
             return "-"
 
+    BLUE = "background-color: #cfe7ff; color: #003366; font-weight: 700"
+    RED = "background-color: #ffcccc; color: #8b0000; font-weight: 700"
+
     def _style_chart_compare(row):
         styles = [""] * len(row)
         cols = row.index.tolist()
@@ -2648,6 +2665,11 @@ else:
         except Exception:
             chart_int = None
         for i, c in enumerate(cols):
+            if c == "차트":
+                # 차트는 비교 기준이므로 값이 있으면 항상 파랑
+                if chart_int is not None:
+                    styles[i] = BLUE
+                continue
             if c not in ("일마", "한솔"):
                 continue
             v = row[c]
@@ -2657,10 +2679,7 @@ else:
                 same = int(v) == chart_int
             except Exception:
                 continue
-            if same:
-                styles[i] = "background-color: #cfe7ff; color: #003366; font-weight: 700"
-            else:
-                styles[i] = "background-color: #ffcccc; color: #8b0000; font-weight: 700"
+            styles[i] = BLUE if same else RED
         return styles
 
     fmt_cols = {c: _fmt_amt for c in channel_df.columns if c != "채널"}
