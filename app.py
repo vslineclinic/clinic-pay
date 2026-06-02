@@ -24,6 +24,47 @@ import streamlit as st
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 지점별 일일마감 구글시트 연동 설정
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 일일마감을 파일 업로드 대신 구글 스프레드시트에서 바로 읽어오기 위한 설정.
+#
+# [사전 준비]
+#   1) 각 지점의 일일마감 구글 스프레드시트를 열고 [공유] →
+#      "링크가 있는 모든 사용자"를 "뷰어"로 설정 (별도 인증키 불필요).
+#   2) 아래 CLINIC_DAILY_SHEETS 에 {지점명: 스프레드시트 URL(또는 ID)} 를 입력.
+#   3) 각 스프레드시트의 워크시트(탭) 이름은 날짜여야 함 (기본 형식: 26.06.02).
+#
+# URL을 코드(깃)에 남기기 싫으면, Streamlit Secrets 의 [clinic_daily_sheets]
+# 섹션에 동일하게 적으면 그 값이 우선 적용된다. 예) .streamlit/secrets.toml
+#   [clinic_daily_sheets]
+#   "강남점" = "https://docs.google.com/spreadsheets/d/XXXX/edit"
+#   "분당점" = "https://docs.google.com/spreadsheets/d/YYYY/edit"
+
+# 시트 탭(워크시트) 이름의 날짜 형식. 예) 2026-06-02 → "26.06.02"
+DAILY_SHEET_DATE_FMT = "%y.%m.%d"
+
+# 지점명 → 스프레드시트 URL(또는 ID). 사용하는 지점만 채우면 된다(빈 값은 목록에서 숨김).
+CLINIC_DAILY_SHEETS = {
+    "지점1": "",   # 예: "https://docs.google.com/spreadsheets/d/1AbC.../edit"
+    "지점2": "",
+    "지점3": "",
+    "지점4": "",
+}
+
+
+def get_clinic_daily_sheets():
+    """지점→스프레드시트 매핑을 반환. Streamlit Secrets에 설정이 있으면 우선 적용."""
+    try:
+        if "clinic_daily_sheets" in st.secrets:
+            sec = dict(st.secrets["clinic_daily_sheets"])
+            if sec:
+                return sec
+    except Exception:
+        pass
+    return dict(CLINIC_DAILY_SHEETS)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 유틸리티
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -280,6 +321,124 @@ def load_file(f, password=None, default_password="vsline99!!"):
         raise ValueError(f"암호화된 파일입니다. 올바른 비밀번호를 입력해 주세요. ({last_error})")
     else:
         raise ValueError(f"지원하지 않는 파일 형식입니다. 엑셀(.xlsx, .xls, .xlsb) 또는 CSV 파일을 업로드해 주세요. ({last_error})")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 구글시트 연동 (일일마감)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _extract_sheet_id(url_or_id):
+    """구글 스프레드시트 URL 또는 ID 문자열에서 스프레드시트 ID를 추출."""
+    if not url_or_id:
+        return None
+    s = str(url_or_id).strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    # URL이 아니라 ID만 들어온 경우 (구글 ID는 보통 영숫자/_/- 로 20자 이상)
+    if re.fullmatch(r"[a-zA-Z0-9_-]{20,}", s):
+        return s
+    return None
+
+
+def _fetch_url_bytes(url, timeout=20):
+    """URL 본문을 bytes로 가져온다. 접근/네트워크 오류는 명확한 예외로 변환."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; clinic-pay)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise PermissionError(
+                "구글시트 접근 권한이 없습니다. 스프레드시트 공유를 "
+                "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
+            ) from e
+        if e.code == 404:
+            raise LookupError("스프레드시트를 찾을 수 없습니다. URL을 확인하세요.") from e
+        raise
+    except urllib.error.URLError as e:
+        raise ConnectionError(
+            f"네트워크 오류로 구글시트를 불러오지 못했습니다: {getattr(e, 'reason', e)}"
+        ) from e
+
+
+def _parse_gviz_csv(raw_bytes, sheet_name=""):
+    """구글 gviz CSV 응답(bytes) → raw DataFrame(header=None).
+
+    parse_daily가 헤더 행을 동적 탐지하므로, 엑셀 업로드 경로와 동일하게
+    header=None(원본 그리드) 형태로 돌려준다. 시트 미존재/권한 오류 응답은
+    사람이 읽을 수 있는 예외로 변환한다.
+    """
+    head = raw_bytes[:2048].decode("utf-8", errors="ignore").lstrip()
+    low = head.lower()
+    # gviz 오류 봉투: /*O_o*/ google.visualization.Query.setResponse({... "status":"error" ...})
+    if low.startswith("/*o_o*/") or "setresponse" in low:
+        msg = ""
+        m = re.search(r'"message"\s*:\s*"([^"]*)"', head)
+        if m:
+            msg = m.group(1)
+        if "invalid_query" in low or "sheet" in low or "not found" in low:
+            raise LookupError(
+                f"구글시트에서 '{sheet_name}' 탭을 찾을 수 없습니다. 날짜 탭 이름을 확인하세요."
+                + (f" ({msg})" if msg else "")
+            )
+        raise PermissionError(
+            "구글시트 조회 오류. 공유 설정 또는 시트 이름을 확인하세요."
+            + (f" ({msg})" if msg else "")
+        )
+    # 로그인/권한 안내 HTML 페이지가 돌아온 경우
+    if low.startswith("<!doctype") or low.startswith("<html") or "<html" in low[:200]:
+        raise PermissionError(
+            "구글시트에 접근할 수 없습니다. 스프레드시트 공유를 "
+            "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
+        )
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try:
+            text = raw_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("구글시트 CSV 응답을 디코딩하지 못했습니다.")
+    # 일일마감 시트는 헤더 위에 제목 행이 있어 행마다 열 수가 다를 수 있다(ragged).
+    # pd.read_csv는 첫 행 기준 열 수를 강제해 깨지므로, csv로 직접 읽어 최대 열 수에
+    # 맞춰 패딩한 직사각형 그리드(header=None 형태)로 만든다. 엑셀 업로드 경로와 동일.
+    import csv as _csv
+
+    rows = list(_csv.reader(io.StringIO(text)))
+    width = max((len(r) for r in rows), default=0)
+    if width == 0:
+        raise ValueError("구글시트 응답이 비어 있습니다. 시트에 데이터가 있는지 확인하세요.")
+    grid = [r + [""] * (width - len(r)) for r in rows]
+    return pd.DataFrame(grid)
+
+
+def load_gsheet_daily(url_or_id, sheet_name, timeout=20):
+    """지점 스프레드시트 URL/ID + 날짜 탭 이름 → 일일마감 raw DataFrame.
+
+    구글 시트의 CSV export(gviz) 엔드포인트로 해당 이름의 워크시트만 읽어온다.
+    스프레드시트가 '링크가 있는 모든 사용자 - 뷰어'로 공유돼 있어야 한다.
+    """
+    sid = _extract_sheet_id(url_or_id)
+    if not sid:
+        raise ValueError(
+            "스프레드시트 URL/ID를 인식할 수 없습니다. 올바른 구글시트 링크인지 확인하세요."
+        )
+    from urllib.parse import quote
+
+    export_url = (
+        f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq"
+        f"?tqx=out:csv&headers=0&sheet={quote(sheet_name, safe='')}"
+    )
+    raw_bytes = _fetch_url_bytes(export_url, timeout=timeout)
+    return _parse_gviz_csv(raw_bytes, sheet_name=sheet_name)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2538,6 +2697,7 @@ def main():
     st.caption("★ 결제채널별 파일 합계 차이를 먼저 산출 → 차이를 설명할 후보 거래 추적 | 일마+차트 2개 또는 한솔+일마+차트 3개 분석 가능")
 
     if "done" not in st.session_state:
+        daily_sheets = get_clinic_daily_sheets()
         c1, c2, c3 = st.columns(3)
         # 업로더에 type=[...] 확장자 필터를 두지 않는다. 모바일 브라우저(삼성 인터넷 등)는
         # 이 필터를 HTML accept 속성으로 변환하는데, 일부 환경에서 .xls/.xlsx를 제대로
@@ -2547,21 +2707,52 @@ def main():
             f_h = st.file_uploader("한솔페이 (선택)", key="h", help="CSV·XLSX·XLS·XLSB")
             h_pw = st.text_input("비밀번호(선택)", type="password", key="h_pw")
         with c2:
-            f_d = st.file_uploader("일일마감", key="d", help="CSV·XLSX·XLS·XLSB")
-            d_pw = st.text_input("비밀번호(선택)", type="password", key="d_pw")
+            daily_mode = st.radio(
+                "일일마감 입력 방식",
+                ["파일 업로드", "구글시트 연동"],
+                horizontal=True,
+                key="daily_mode",
+            )
+            f_d, d_pw = None, ""
+            gs_branch, gs_sheet_tab = None, ""
+            if daily_mode == "파일 업로드":
+                f_d = st.file_uploader("일일마감", key="d", help="CSV·XLSX·XLS·XLSB")
+                d_pw = st.text_input("비밀번호(선택)", type="password", key="d_pw")
+            else:
+                _branches = [b for b, u in daily_sheets.items() if str(u).strip()]
+                if not _branches:
+                    st.warning(
+                        "등록된 지점 구글시트가 없습니다. app.py 상단의 "
+                        "CLINIC_DAILY_SHEETS(또는 Streamlit Secrets)에 지점·URL을 입력하세요."
+                    )
+                else:
+                    gs_branch = st.selectbox("지점 선택", _branches, key="gs_branch")
+                    gs_date = st.date_input("마감 날짜", key="gs_date")
+                    gs_sheet_tab = gs_date.strftime(DAILY_SHEET_DATE_FMT) if gs_date else ""
+                    st.caption(
+                        f"읽어올 시트 탭 이름: **{gs_sheet_tab}**  ·  지점: {gs_branch}"
+                    )
         with c3:
             f_p = st.file_uploader("차트마감", key="p", help="CSV·XLSX·XLS·XLSB")
             p_pw = st.text_input("비밀번호(선택)", type="password", key="p_pw")
 
-        if f_d and f_p:
+        daily_ready = (
+            f_d is not None if daily_mode == "파일 업로드"
+            else (gs_branch is not None and gs_sheet_tab != "")
+        )
+        if daily_ready and f_p:
             if st.button("🚀 분석 시작", type="primary", width="stretch"):
                 with st.spinner("분석 중..."):
                     try:
-                        daily, daily_refund = parse_daily(load_file(f_d, password=d_pw))
+                        if daily_mode == "구글시트 연동":
+                            daily_raw = load_gsheet_daily(daily_sheets[gs_branch], gs_sheet_tab)
+                        else:
+                            daily_raw = load_file(f_d, password=d_pw)
+                        daily, daily_refund = parse_daily(daily_raw)
                         patient = parse_patient(load_file(f_p, password=p_pw))
                         hansol = parse_hansol(load_file(f_h, password=h_pw)) if f_h else pd.DataFrame()
                     except Exception as e:
-                        st.error(f"파일 로딩 실패: {e}")
+                        st.error(f"데이터 로딩 실패: {e}")
                         st.stop()
                     if daily.empty:
                         st.error("일일마감 파싱 실패")
@@ -2611,9 +2802,13 @@ def main():
             # 느끼는 문제 방지. 버튼은 항상 노출하되 비활성으로 두고, 어떤 파일이
             # 더 필요한지(한솔은 선택) 명시적으로 안내한다.
             st.button("🚀 분석 시작", type="primary", width="stretch", disabled=True)
-            _missing = [n for n, f in [("일일마감", f_d), ("차트마감", f_p)] if f is None]
+            _missing = []
+            if not daily_ready:
+                _missing.append("일일마감")
+            if f_p is None:
+                _missing.append("차트마감")
             st.info(
-                f"분석을 시작하려면 {' · '.join(_missing)} 파일이 더 필요합니다. "
+                f"분석을 시작하려면 {' · '.join(_missing)} 데이터가 더 필요합니다. "
                 "(한솔페이는 선택 항목이며, 한솔만으로는 분석할 수 없습니다.)"
             )
 
