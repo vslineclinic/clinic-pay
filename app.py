@@ -2994,6 +2994,24 @@ def main():
     st.title("📊 BW 컨설팅 AI 정산 분석 시스템")
     st.caption("★ 결제채널별 파일 합계 차이를 먼저 산출 → 차이를 설명할 후보 거래 추적 | 일마+차트 2개 또는 한솔+일마+차트 3개 분석 가능")
 
+    with st.expander("📌 사용 안내", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("""
+### 📝 일일마감
+- **시트명 형식**: `26.06.01` (숫자 6자리, `.` 구분)
+- 각 날짜별 시트명을 정확히 입력해주세요
+- 표준 양식에 맞춰 작성된 자료를 권장합니다
+            """)
+        with col2:
+            st.markdown("""
+### 🔐 차트마감 (베가스)
+- **비밀번호**: 안내받은 비밀번호 필수 입력
+- 베가스 차트 저장 시 설정하는 비밀번호 사용
+- 비밀번호 미보유 시:
+  **BW컨설팅 | 이구만 상무 / 정용민 센터장** 문의
+            """)
+
     if "done" not in st.session_state:
         daily_sheets = get_clinic_daily_sheets()
         c1, c2, c3 = st.columns(3)
@@ -3031,8 +3049,13 @@ def main():
                         "탭 이름은 자동 매칭합니다 (26.06.02 / 06.02 / 6.2 …)."
                     )
         with c3:
-            f_p = st.file_uploader("차트마감", key="p", help="CSV·XLSX·XLS·XLSB")
-            p_pw = st.text_input("비밀번호(선택)", type="password", key="p_pw")
+            st.markdown("### 🔴 **차트마감 (필수)**")
+            st.warning(
+                "⚠️ **반드시 '수납' 파일만 선택하세요**\n\n"
+                "매출+수납이 아닌 **'수납으로 설정'** 하여 다운로드한 파일을 업로드해주세요."
+            )
+            f_p = st.file_uploader("파일 선택", key="p", help="CSV·XLSX·XLS·XLSB")
+            p_pw = st.text_input("비밀번호(선택)", type="password", key="p_pw", help="베가스에서 설정한 비밀번호")
 
         daily_ready = (
             f_d is not None if daily_mode == "파일 업로드"
