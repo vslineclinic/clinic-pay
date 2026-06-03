@@ -3049,8 +3049,13 @@ def main():
                         "탭 이름은 자동 매칭합니다 (26.06.02 / 06.02 / 6.2 …)."
                     )
         with c3:
-            f_p = st.file_uploader("차트마감", key="p", help="CSV·XLSX·XLS·XLSB")
-            p_pw = st.text_input("비밀번호(선택)", type="password", key="p_pw")
+            st.markdown("### 🔴 **차트마감 (필수)**")
+            st.warning(
+                "⚠️ **반드시 '수납' 파일만 선택하세요**\n\n"
+                "매출+수납이 아닌 **'수납으로 설정'** 하여 다운로드한 파일을 업로드해주세요."
+            )
+            f_p = st.file_uploader("파일 선택", key="p", help="CSV·XLSX·XLS·XLSB")
+            p_pw = st.text_input("비밀번호(선택)", type="password", key="p_pw", help="베가스에서 설정한 비밀번호")
 
         daily_ready = (
             f_d is not None if daily_mode == "파일 업로드"
