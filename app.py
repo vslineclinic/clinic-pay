@@ -636,6 +636,20 @@ def parse_hansol(raw):
     return df
 
 
+def _looks_like_chart_no(series):
+    """주어진 열이 '차트번호'처럼 보이는지(값의 70%+ 가 3~7자리 정수) 판정.
+
+    일부 지점 일일마감은 차트번호 열의 머리글 칸이 비어 있어 헤더명으로는 못 잡는다.
+    그 무라벨 열이 진짜 차트번호인지(순서·금액·이름 등이 아닌지) 값 패턴으로 확인한다.
+    """
+    v = series.astype(str).str.strip()
+    v = v[(v != "") & (v.str.lower() != "nan")]
+    if len(v) < 3:
+        return False
+    digitish = v.str.replace(r"[.\-\s]", "", regex=True).str.fullmatch(r"\d{3,7}")
+    return float(digitish.mean()) >= 0.7
+
+
 def parse_daily(raw):
     """일일마감 파싱: 동적 헤더, 결제수단별 금액, 환불/취소 내역 포함"""
     hdr = None
@@ -649,7 +663,17 @@ def parse_daily(raw):
         return pd.DataFrame(), pd.DataFrame()
 
     df = raw.iloc[hdr + 1:].copy()
-    df.columns = [str(c).strip().replace("\n", "") for c in raw.iloc[hdr]]
+    cols = [str(c).strip().replace("\n", "") for c in raw.iloc[hdr]]
+    # 무라벨 차트번호 열 복구: 여러 지점 시트가 '순서|구분|차트번호|성명' 구조인데
+    # 차트번호 열의 머리글 칸만 비어 있다. '차트번호' 헤더가 따로 없고 '구분' 바로
+    # 오른쪽 열이 무라벨이면서 숫자(3~7자리)면 그 열을 차트번호로 라벨링한다.
+    # ('이름/차트번호 중복여부' 같은 decoy 열은 머리글이 있으므로 영향 없음.)
+    if "차트번호" not in cols:
+        gpos = next((i for i, c in enumerate(cols) if c.replace(" ", "") == "구분"), None)
+        if (gpos is not None and gpos + 1 < len(cols) and cols[gpos + 1] == ""
+                and _looks_like_chart_no(raw.iloc[hdr + 1:, gpos + 1])):
+            cols[gpos + 1] = "차트번호"
+    df.columns = cols
     df = df.reset_index(drop=True)
 
     # --- 환불/취소 섹션 탐지 및 분리 ---

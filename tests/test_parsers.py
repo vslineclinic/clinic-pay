@@ -61,6 +61,45 @@ def test_parse_daily_refund_section(app):
     assert int(refund["카드"].sum()) == 10000
 
 
+def test_parse_daily_recovers_unlabeled_chart_column(app):
+    # 실제 지점 시트(인천/잠실/엔디어트/강남)는 '순서|구분|차트번호|성명' 구조인데
+    # 차트번호 열의 머리글 칸만 비어 있다 → '구분' 오른쪽 무라벨 숫자열을 차트번호로 복구.
+    daily = F.table_raw(
+        ["내원순서", "구분", "", "성명", "카드"],          # 3번째(차트번호) 머리글 비어 있음
+        [1, "신환", "66909", "진시인", 50000],
+        [2, "구환", "61302", "김소정", 30000],
+        [3, "구환", "65251", "류혜정", 20000],
+    )
+    d, _ = app.parse_daily(daily)
+    assert "차트번호" in d.columns
+    assert d["차트번호"].tolist() == ["66909", "61302", "65251"]
+
+
+def test_parse_daily_chart_recovery_ignores_decoy_column(app):
+    # '이름/차트번호 중복여부'(머리글 있는 decoy)를 차트번호로 오인하면 안 된다.
+    daily = F.table_raw(
+        ["내원순서", "구분", "", "성명", "카드", "이름/차트번호 중복여부"],
+        [1, "신환", "66909", "진시인", 50000, "정상"],
+        [2, "구환", "61302", "김소정", 30000, "중복"],
+        [3, "구환", "65251", "류혜정", 20000, "정상"],
+    )
+    d, _ = app.parse_daily(daily)
+    assert d["차트번호"].tolist() == ["66909", "61302", "65251"]   # decoy('정상'/'중복') 아님
+
+
+def test_parse_daily_chart_recovery_skips_nonnumeric_unlabeled(app):
+    # '구분' 오른쪽 무라벨 열이 숫자가 아니면(텍스트) 차트번호로 복구하지 않는다.
+    daily = F.table_raw(
+        ["내원순서", "구분", "", "성명", "카드"],
+        [1, "신환", "전화상담", "진시인", 50000],
+        [2, "구환", "워크인", "김소정", 30000],
+        [3, "구환", "재진", "류혜정", 20000],
+    )
+    d, _ = app.parse_daily(daily)
+    s = d["차트번호"].astype(str).str.strip()
+    assert ((s == "") | (s.str.lower() == "nan")).all()   # 복구 안 함 → 빈 값
+
+
 def test_parse_patient_payment_classification(app):
     _, _, patient = F.basic_three_files()
     p = app.parse_patient(patient)
