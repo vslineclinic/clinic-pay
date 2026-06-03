@@ -44,11 +44,13 @@ import streamlit as st
 DAILY_SHEET_DATE_FMT = "%y.%m.%d"
 
 # 지점명 → 스프레드시트 URL(또는 ID). 사용하는 지점만 채우면 된다(빈 값은 목록에서 숨김).
+# 탭 이름 형식은 지점·시기마다 달라도 자동 매칭한다(26.06.02 / 06.02 / 6.2 / 26.6.2 …).
+# ※ 정확한 분석을 위해 각 날짜 탭은 표준 양식(templates/일일마감_표준양식 참고)으로 입력할 것.
+#    표준 양식이 아닌 탭은 합계가 실제와 다를 수 있고, 앱에서 경고가 표시된다.
 CLINIC_DAILY_SHEETS = {
-    "지점1": "",   # 예: "https://docs.google.com/spreadsheets/d/1AbC.../edit"
-    "지점2": "",
-    "지점3": "",
-    "지점4": "",
+    "인천점": "https://docs.google.com/spreadsheets/d/1FJwllsTCVbmtorRr_0XcYMCQ49yym2aXHj8pdrP9inU/edit",
+    "잠실점": "https://docs.google.com/spreadsheets/d/18wHlyD85V-KrTortCt7u4JAbFOn08WJtJJGT1oAm5kA/edit",
+    "엔디어트": "https://docs.google.com/spreadsheets/d/1YdruwnAghZARwLALGD9rvbDZsnw4b4FKSt6l3_sLgd4/edit",
 }
 
 
@@ -368,36 +370,40 @@ def _fetch_url_bytes(url, timeout=20):
         ) from e
 
 
-def _parse_gviz_csv(raw_bytes, sheet_name=""):
-    """구글 gviz CSV 응답(bytes) → raw DataFrame(header=None).
+def _gviz_csv_url(sid, sheet_name):
+    """특정 워크시트(탭)를 CSV로 내보내는 gviz URL."""
+    from urllib.parse import quote
 
-    parse_daily가 헤더 행을 동적 탐지하므로, 엑셀 업로드 경로와 동일하게
-    header=None(원본 그리드) 형태로 돌려준다. 시트 미존재/권한 오류 응답은
-    사람이 읽을 수 있는 예외로 변환한다.
-    """
+    return (
+        f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq"
+        f"?tqx=out:csv&headers=0&sheet={quote(sheet_name, safe='')}"
+    )
+
+
+def _classify_gviz(raw_bytes):
+    """gviz 응답 종류 판별 → ('csv', None) | ('error', msg) | ('html', None) | ('empty', None)."""
     head = raw_bytes[:2048].decode("utf-8", errors="ignore").lstrip()
     low = head.lower()
     # gviz 오류 봉투: /*O_o*/ google.visualization.Query.setResponse({... "status":"error" ...})
     if low.startswith("/*o_o*/") or "setresponse" in low:
-        msg = ""
         m = re.search(r'"message"\s*:\s*"([^"]*)"', head)
-        if m:
-            msg = m.group(1)
-        if "invalid_query" in low or "sheet" in low or "not found" in low:
-            raise LookupError(
-                f"구글시트에서 '{sheet_name}' 탭을 찾을 수 없습니다. 날짜 탭 이름을 확인하세요."
-                + (f" ({msg})" if msg else "")
-            )
-        raise PermissionError(
-            "구글시트 조회 오류. 공유 설정 또는 시트 이름을 확인하세요."
-            + (f" ({msg})" if msg else "")
-        )
-    # 로그인/권한 안내 HTML 페이지가 돌아온 경우
+        return ("error", m.group(1) if m else "")
+    # 로그인/권한 안내 HTML 페이지
     if low.startswith("<!doctype") or low.startswith("<html") or "<html" in low[:200]:
-        raise PermissionError(
-            "구글시트에 접근할 수 없습니다. 스프레드시트 공유를 "
-            "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
-        )
+        return ("html", None)
+    if not raw_bytes.strip():
+        return ("empty", None)
+    return ("csv", None)
+
+
+def _gviz_csv_to_grid(raw_bytes):
+    """gviz CSV(bytes) → raw DataFrame(header=None).
+
+    일일마감 시트는 헤더 위 제목 행 때문에 행마다 열 수가 다를 수 있다(ragged).
+    pd.read_csv는 첫 행 기준 열 수를 강제해 깨지므로, csv로 직접 읽어 최대 열 수에
+    맞춰 패딩한 직사각형 그리드를 만든다. dtype=object로 고정해 엑셀 업로드 경로와
+    동일한 형태를 유지한다(일부 pandas의 PyArrow string 추론으로 인한 합산 오류 방지).
+    """
     text = None
     for enc in ("utf-8-sig", "utf-8", "cp949"):
         try:
@@ -407,9 +413,6 @@ def _parse_gviz_csv(raw_bytes, sheet_name=""):
             continue
     if text is None:
         raise ValueError("구글시트 CSV 응답을 디코딩하지 못했습니다.")
-    # 일일마감 시트는 헤더 위에 제목 행이 있어 행마다 열 수가 다를 수 있다(ragged).
-    # pd.read_csv는 첫 행 기준 열 수를 강제해 깨지므로, csv로 직접 읽어 최대 열 수에
-    # 맞춰 패딩한 직사각형 그리드(header=None 형태)로 만든다. 엑셀 업로드 경로와 동일.
     import csv as _csv
 
     rows = list(_csv.reader(io.StringIO(text)))
@@ -417,28 +420,125 @@ def _parse_gviz_csv(raw_bytes, sheet_name=""):
     if width == 0:
         raise ValueError("구글시트 응답이 비어 있습니다. 시트에 데이터가 있는지 확인하세요.")
     grid = [r + [""] * (width - len(r)) for r in rows]
-    return pd.DataFrame(grid)
+    return pd.DataFrame(grid, dtype=object)
 
 
-def load_gsheet_daily(url_or_id, sheet_name, timeout=20):
-    """지점 스프레드시트 URL/ID + 날짜 탭 이름 → 일일마감 raw DataFrame.
+def _parse_gviz_csv(raw_bytes, sheet_name=""):
+    """단일 gviz 응답(bytes) → raw DataFrame. 오류/HTML/빈 응답은 사람이 읽는 예외로 변환."""
+    kind, msg = _classify_gviz(raw_bytes)
+    if kind == "error":
+        low = (msg or "").lower()
+        if not msg or any(k in low for k in ("invalid_query", "sheet", "not found", "범위")):
+            raise LookupError(
+                f"구글시트에서 '{sheet_name}' 탭을 찾을 수 없습니다. 날짜 탭 이름을 확인하세요."
+                + (f" ({msg})" if msg else "")
+            )
+        raise PermissionError(
+            "구글시트 조회 오류. 공유 설정 또는 시트 이름을 확인하세요." + (f" ({msg})" if msg else "")
+        )
+    if kind == "html":
+        raise PermissionError(
+            "구글시트에 접근할 수 없습니다. 스프레드시트 공유를 "
+            "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
+        )
+    if kind == "empty":
+        raise ValueError("구글시트 응답이 비어 있습니다. 시트에 데이터가 있는지 확인하세요.")
+    return _gviz_csv_to_grid(raw_bytes)
 
-    구글 시트의 CSV export(gviz) 엔드포인트로 해당 이름의 워크시트만 읽어온다.
-    스프레드시트가 '링크가 있는 모든 사용자 - 뷰어'로 공유돼 있어야 한다.
+
+def _candidate_tab_names(d):
+    """날짜 d(date)에 대해 지점별로 쓰일 법한 탭 이름 후보를 우선순위대로 생성.
+
+    실측된 형식(지점·시기마다 다름):
+      26.06.02(인천·잠실 최근) / 06.02(엔디어트 최근) / 6.2(엔디어트 과거) /
+      26.6.2·2026.6.2(잠실 과거) / '26.06.02 일일마감'(인천 변형) / 6월2일.
+    실제 어느 탭이 존재하는지는 load_gsheet_daily가 폴백 비교로 가려낸다.
     """
+    y2, Y = d.strftime("%y"), d.strftime("%Y")
+    mm, dd = f"{d.month:02d}", f"{d.day:02d}"
+    m, dy = str(d.month), str(d.day)
+    cands = [
+        d.strftime(DAILY_SHEET_DATE_FMT),  # 26.06.02
+        f"{mm}.{dd}",                      # 06.02
+        f"{m}.{dy}",                       # 6.2
+        f"{y2}.{m}.{dy}",                  # 26.6.2
+        f"{Y}.{mm}.{dd}",                  # 2026.06.02
+        f"{Y}.{m}.{dy}",                   # 2026.6.2
+        f"{y2}.{mm}.{dd} 일일마감",         # 인천 '25.11.04 일일마감' 변형
+        f"{m}월{dy}일",                     # 6월2일
+    ]
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
+    """지점 스프레드시트 URL/ID + 날짜(date) → (raw DataFrame, 매칭된 탭 이름).
+
+    지점마다 탭 이름 형식이 달라 여러 후보를 순서대로 시도한다. gviz는 탭을 못 찾으면
+    오류 대신 '첫 시트'를 반환하므로, 존재할 수 없는 이름(sentinel)의 응답과 비교해
+    폴백(=해당 날짜 탭 없음)을 가려낸다 — 잘못된 시트를 조용히 읽는 사고를 막는다.
+    cache(dict)를 주면 지점별 폴백 시그니처·직전 성공 형식을 재사용해 호출 수를 줄인다.
+    """
+    import hashlib
+
     sid = _extract_sheet_id(url_or_id)
     if not sid:
         raise ValueError(
             "스프레드시트 URL/ID를 인식할 수 없습니다. 올바른 구글시트 링크인지 확인하세요."
         )
-    from urllib.parse import quote
+    if cache is None:
+        cache = {}
 
-    export_url = (
-        f"https://docs.google.com/spreadsheets/d/{sid}/gviz/tq"
-        f"?tqx=out:csv&headers=0&sheet={quote(sheet_name, safe='')}"
+    def _sig(b):
+        return hashlib.md5(b).hexdigest()
+
+    # 1) 폴백(첫 시트) 시그니처 확보 — 지점별 1회 (존재할 수 없는 이름으로 조회)
+    fb_key = f"fb::{sid}"
+    if fb_key in cache:
+        fb_sig = cache[fb_key]
+    else:
+        fb_sig = None
+        try:
+            sb = _fetch_url_bytes(_gviz_csv_url(sid, "__no_such_tab__zz_9z9z9z"), timeout)
+            if _classify_gviz(sb)[0] == "csv":
+                fb_sig = _sig(sb)
+        except Exception:
+            fb_sig = None
+        cache[fb_key] = fb_sig
+
+    # 2) 후보 형식 시도 (직전에 성공한 형식 인덱스를 먼저)
+    cands = _candidate_tab_names(picked_date)
+    order = list(range(len(cands)))
+    pref = cache.get(f"idx::{sid}")
+    if isinstance(pref, int) and 0 <= pref < len(cands):
+        order = [pref] + [i for i in order if i != pref]
+
+    for i in order:
+        name = cands[i]
+        # 권한/네트워크/404는 형식 문제가 아니므로 그대로 전달(다음 후보 무의미)
+        b = _fetch_url_bytes(_gviz_csv_url(sid, name), timeout)
+        kind = _classify_gviz(b)[0]
+        if kind == "html":
+            raise PermissionError(
+                "구글시트에 접근할 수 없습니다. 스프레드시트 공유를 "
+                "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
+            )
+        if kind != "csv":
+            continue
+        if fb_sig is not None and _sig(b) == fb_sig:
+            continue  # 폴백(첫 시트) → 이 이름의 탭은 존재하지 않음
+        cache[f"idx::{sid}"] = i
+        return _gviz_csv_to_grid(b), name
+
+    raise LookupError(
+        f"{picked_date.strftime('%Y-%m-%d')} 날짜의 시트 탭을 찾을 수 없습니다. "
+        f"시도한 이름: {' / '.join(cands)}. "
+        "해당 날짜 탭이 있는지, 탭 이름 형식이 맞는지 확인하세요."
     )
-    raw_bytes = _fetch_url_bytes(export_url, timeout=timeout)
-    return _parse_gviz_csv(raw_bytes, sheet_name=sheet_name)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -665,6 +765,30 @@ def parse_daily(raw):
 
     df["d_idx"] = range(len(df))
     return df, refund_df
+
+
+def daily_format_warning(daily):
+    """파싱된 일일마감이 표준 양식과 호환되는지 점검 → 경고문(또는 None).
+
+    지점마다 마감 양식이 달라(예: 차트번호가 없거나, '카드'가 '결제단말기'로,
+    '나만의닥터'가 '나만의 닥터'로 표기) 합계가 실제보다 적게 잡히거나 환자 매칭이
+    불가할 수 있다. 그런 신호를 감지해 사용자에게 알린다(분석은 막지 않음).
+    """
+    if daily is None or getattr(daily, "empty", True):
+        return None
+    no_chart = (
+        daily["차트번호"].astype(str).str.strip().eq("").all()
+        if "차트번호" in daily.columns else True
+    )
+    if no_chart:
+        return (
+            "이 일일마감에는 '차트번호'가 없어 차트마감과 환자 단위 매칭·추적이 불가합니다. "
+            "또한 카드 등 일부 결제수단이 다른 컬럼명(예: '결제단말기', '나만의 닥터')으로 "
+            "되어 있으면 합계가 실제보다 적게 잡힐 수 있습니다 — 지점 마감 양식이 표준과 "
+            "다른 경우입니다. 해당 날짜 탭을 표준 양식(templates/일일마감_표준양식)으로 "
+            "입력하면 정확히 분석됩니다. 그 전까지는 결과 수치를 원본과 대조해 확인하세요."
+        )
+    return None
 
 
 # 결제메모 플랫폼 키워드 → 플랫폼명 매핑
@@ -2714,7 +2838,7 @@ def main():
                 key="daily_mode",
             )
             f_d, d_pw = None, ""
-            gs_branch, gs_sheet_tab = None, ""
+            gs_branch, gs_date = None, None
             if daily_mode == "파일 업로드":
                 f_d = st.file_uploader("일일마감", key="d", help="CSV·XLSX·XLS·XLSB")
                 d_pw = st.text_input("비밀번호(선택)", type="password", key="d_pw")
@@ -2728,9 +2852,9 @@ def main():
                 else:
                     gs_branch = st.selectbox("지점 선택", _branches, key="gs_branch")
                     gs_date = st.date_input("마감 날짜", key="gs_date")
-                    gs_sheet_tab = gs_date.strftime(DAILY_SHEET_DATE_FMT) if gs_date else ""
                     st.caption(
-                        f"읽어올 시트 탭 이름: **{gs_sheet_tab}**  ·  지점: {gs_branch}"
+                        f"선택 날짜: **{gs_date:%Y-%m-%d}** · 지점: {gs_branch}  \n"
+                        "탭 이름은 자동 매칭합니다 (26.06.02 / 06.02 / 6.2 …)."
                     )
         with c3:
             f_p = st.file_uploader("차트마감", key="p", help="CSV·XLSX·XLS·XLSB")
@@ -2738,16 +2862,21 @@ def main():
 
         daily_ready = (
             f_d is not None if daily_mode == "파일 업로드"
-            else (gs_branch is not None and gs_sheet_tab != "")
+            else (gs_branch is not None and gs_date is not None)
         )
         if daily_ready and f_p:
             if st.button("🚀 분석 시작", type="primary", width="stretch"):
                 with st.spinner("분석 중..."):
                     try:
                         if daily_mode == "구글시트 연동":
-                            daily_raw = load_gsheet_daily(daily_sheets[gs_branch], gs_sheet_tab)
+                            _gs_cache = st.session_state.setdefault("_gs_cache", {})
+                            daily_raw, _tab = load_gsheet_daily(
+                                daily_sheets[gs_branch], gs_date, cache=_gs_cache
+                            )
+                            daily_source = f"구글시트 · {gs_branch} · '{_tab}' 탭"
                         else:
                             daily_raw = load_file(f_d, password=d_pw)
+                            daily_source = f"업로드 파일 · {f_d.name}"
                         daily, daily_refund = parse_daily(daily_raw)
                         patient = parse_patient(load_file(f_p, password=p_pw))
                         hansol = parse_hansol(load_file(f_h, password=h_pw)) if f_h else pd.DataFrame()
@@ -2757,6 +2886,10 @@ def main():
                     if daily.empty:
                         st.error("일일마감 파싱 실패")
                         st.stop()
+
+                    _compat = daily_format_warning(daily)
+                    if _compat:
+                        st.warning("⚠️ " + _compat)
 
                     # 한솔 파일을 올렸는데 유효 거래를 못 읽으면, 조용히 2-파일 모드로
                     # 넘어가지 말고 사용자에게 한솔이 분석에서 빠졌음을 명확히 알린다.
@@ -2786,6 +2919,7 @@ def main():
 
                     ss = st.session_state
                     ss["done"] = True
+                    ss["daily_source"] = daily_source
                     ss["has_hansol"] = has_hansol
                     ss["hansol"], ss["daily"], ss["patient"] = hansol, daily, patient
                     ss["daily_refund"] = daily_refund
@@ -2828,6 +2962,10 @@ def main():
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
+
+        _src = ss.get("daily_source")
+        if _src:
+            st.caption(f"📄 일일마감 원본: {_src}")
 
         # ── 채널 합계 차이 요약 (★메인) ──
         def _nonzero(v):
