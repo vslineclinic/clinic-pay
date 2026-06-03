@@ -168,6 +168,61 @@ def test_standard_template_csv_round_trips_through_parser(app):
     assert tot["d_cashxfer"] == 100000                      # 현금80000-환불30000+이체50000
 
 
+# ── 차트마감↔일일마감 교차검증 (타 지점/날짜 엿보기 방지) ──────────
+
+def _chart_df(charts):
+    import pandas as pd
+    return pd.DataFrame({"차트번호": [str(c) for c in charts]})
+
+
+def test_cross_check_pass_when_charts_overlap(app):
+    d = _chart_df([100, 101, 102, 103])
+    p = _chart_df([100, 101, 102, 103, 200, 201])   # 일마 ⊆ 차트 → 100%
+    ok, msg, info = app.cross_check_daily_patient(d, p)
+    assert ok and msg is None and info["rate"] == 1.0
+
+
+def test_cross_check_blocks_different_branch_or_date(app):
+    d = _chart_df([100, 101, 102, 103, 104])
+    p = _chart_df([900, 901, 902, 903, 904])        # 겹침 0 → 차단
+    ok, msg, _ = app.cross_check_daily_patient(d, p)
+    assert not ok and "다른 지점" in msg
+
+
+def test_cross_check_blocks_when_daily_has_no_chart_no(app):
+    d = _chart_df(["", "", ""])                      # 비표준(차트번호 없음)
+    p = _chart_df([100, 101, 102])
+    ok, msg, _ = app.cross_check_daily_patient(d, p)
+    assert not ok and "표준 양식" in msg
+
+
+def test_cross_check_blocks_when_patient_unreadable(app):
+    d = _chart_df([100, 101, 102])
+    p = _chart_df([])                                # 차트마감에서 차트번호 0
+    ok, msg, _ = app.cross_check_daily_patient(d, p)
+    assert not ok and "차트마감" in msg
+
+
+def test_cross_check_threshold_boundary_60pct(app):
+    # 기본 기준 0.6: 3/5=60% 통과, 2/5=40% 차단.
+    ok1, _, info1 = app.cross_check_daily_patient(
+        _chart_df([1, 2, 3, 4, 5]), _chart_df([1, 2, 3, 90, 91])
+    )
+    assert info1["rate"] == 0.6 and ok1
+    ok2, _, _ = app.cross_check_daily_patient(
+        _chart_df([1, 2, 3, 4, 5]), _chart_df([1, 2, 90, 91, 92])
+    )
+    assert not ok2
+
+
+def test_cross_check_respects_custom_min_rate(app):
+    # min_rate를 0.8로 올리면 60% 쌍도 차단.
+    ok, _, _ = app.cross_check_daily_patient(
+        _chart_df([1, 2, 3, 4, 5]), _chart_df([1, 2, 3, 90, 91]), min_rate=0.8
+    )
+    assert not ok
+
+
 def test_load_gsheet_daily_caches_fallback_signature(app, monkeypatch):
     # cache를 주면 폴백 시그니처를 재사용해 sentinel 호출을 매번 반복하지 않는다.
     fallback = "견본\n구분\n\n"
