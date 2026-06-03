@@ -100,6 +100,66 @@ def test_parse_daily_chart_recovery_skips_nonnumeric_unlabeled(app):
     assert ((s == "") | (s.str.lower() == "nan")).all()   # 복구 안 함 → 빈 값
 
 
+def test_parse_daily_recovers_pay_cols_from_summary_block(app):
+    # 인천형: 결제수단 열 머리글이 모두 비어 있고, 하단 '세로 요약블록'(채널명+합계)에만
+    # 라벨이 있다. 무라벨 금액열의 환자합계를 요약블록 합계와 대조해 카드/현금을 복원한다.
+    daily = F.table_raw(
+        ["내원순서", "구분", "", "성명", "", ""],      # 차트번호·카드(4)·현금(5) 머리글 공란
+        [1, "구환", "100", "김철수", 50000, 0],        # 카드 50000
+        [2, "신환", "200", "이영희", 30000, 0],        # 카드 30000
+        [3, "구환", "300", "박민수", 0, 20000],        # 현금 20000
+        ["", "", "", "", "", ""],
+        ["", "카드", "", "", "80000", ""],             # 요약블록: 카드 80,000
+        ["", "현금", "", "", "20000", ""],             # 요약블록: 현금 20,000
+        ["", "이체", "", "", "0", ""],                 # 요약블록: 이체 0(매칭 불가→스킵)
+    )
+    d, _ = app.parse_daily(daily)
+    assert int(d["카드"].sum()) == 80000
+    assert int(d["현금"].sum()) == 20000
+    assert int(d["총액"].sum()) == 100000
+
+
+def test_parse_daily_summary_recovery_handles_aliases(app):
+    # 엔디어트형: 요약블록이 약어/별칭('결제단말기'=카드, '강.언'=강남언니)을 쓰고, 금액열은
+    # 머리글이 비어 있다. 별칭을 표준 채널로 정규화해 합계 대조로 복원해야 한다.
+    daily = F.table_raw(
+        ["내원순서", "구분", "", "성명", "", ""],
+        [1, "구환", "100", "김철수", 50000, 0],        # 카드 50000
+        [2, "신환", "200", "이영희", 30000, 0],        # 카드 30000
+        [3, "구환", "300", "박민수", 0, 5000],         # 강남언니 5000
+        ["", "", "", "", "", ""],
+        ["", "결제단말기", "", "", "80000", ""],       # 카드 별칭
+        ["", "강.언", "", "", "5000", ""],             # 강남언니 약어
+        ["", "현금", "", "", "0", ""],
+    )
+    d, _ = app.parse_daily(daily)
+    assert int(d["카드"].sum()) == 80000
+    assert int(d["강남언니"].sum()) == 5000
+
+
+def test_channel_of_normalizes_aliases(app):
+    assert app._channel_of("결제단말기") == "카드"
+    assert app._channel_of("나만의 닥터") == "나만의닥터"     # 공백 무시
+    assert app._channel_of("강.언") == "강남언니"            # 점 무시
+    assert app._channel_of("여신") == "여신티켓"
+    assert app._channel_of("기타-지역화폐") == "기타지역화폐"  # 하이픈 무시
+    assert app._channel_of("성명") is None
+    assert app._channel_of("현금시재액") is None             # 부분일치 오인 금지
+
+
+def test_summary_recovery_inert_on_standard_form(app):
+    # 표준 양식(요약블록 없음, 머리글에만 채널)은 재라벨링이 작동하지 않아야 한다.
+    standard = F.table_raw(
+        ["내원순서", "차트번호", "성명", "카드", "현금", "이체"],
+        [1, "100", "김철수", 50000, 0, 0],
+        [2, "200", "이영희", 0, 30000, 0],
+    )
+    assert app._summary_channel_totals(standard, 0) == {}       # 요약블록 미검출
+    d, _ = app.parse_daily(standard)
+    assert int(d["카드"].sum()) == 50000
+    assert int(d["현금"].sum()) == 30000
+
+
 def test_parse_patient_payment_classification(app):
     _, _, patient = F.basic_three_files()
     p = app.parse_patient(patient)

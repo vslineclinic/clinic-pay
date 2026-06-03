@@ -650,6 +650,96 @@ def _looks_like_chart_no(series):
     return float(digitish.mean()) >= 0.7
 
 
+# 지점별 결제수단 표기(약어·띄어쓰기·별칭) → 표준 채널명.
+# 예: 결제단말기→카드, '나만의 닥터'→나만의닥터, 여신→여신티켓, '강.언'→강남언니.
+_PAY_ALIAS = {
+    "카드": "카드", "결제단말기": "카드", "단말기": "카드",
+    "현금": "현금", "이체": "이체",
+    "여신": "여신티켓", "여신티켓": "여신티켓", "여신앱": "여신티켓",
+    "강남언니": "강남언니", "강언": "강남언니",
+    "나만의닥터": "나만의닥터", "나닥": "나만의닥터",
+    "제로페이": "제로페이",
+    "기타지역화폐": "기타지역화폐", "지역화폐": "기타지역화폐",
+}
+
+
+def _channel_of(label):
+    """셀 텍스트를 표준 결제 채널명으로 정규화(약어·공백·하이픈·점 무시). 아니면 None."""
+    key = re.sub(r"\s", "", str(label)).replace("-", "").replace(".", "")
+    return _PAY_ALIAS.get(key)
+
+
+def _summary_channel_totals(raw, hdr):
+    """지점 일일마감 하단의 '세로 요약블록'(채널명 + 오른쪽 합계)에서 {채널: 합계} 추출.
+
+    지점마다 결제수단 열 머리글이 비거나(인천), 위치가 어긋나거나(엔디어트), 다른 이름
+    (결제단말기)이라 머리글만으로는 금액열을 못 찾는다. 반면 거의 모든 지점 시트는 하단에
+    채널별 합계를 세로로 적은 요약블록을 갖는다 — 이를 '정답'으로 삼아 금액열을 되찾는다.
+
+    한 열에 채널명이 3개 이상 세로로 쌓인 경우만 요약블록으로 인정한다(표준 양식의 머리글
+    행을 요약블록으로 오인하지 않도록). 합계는 라벨 오른쪽 '첫 비어있지 않은 셀'에서 읽어,
+    더 우측의 무관한 지표(총 내원객·현금시재액 등) 혼입을 막는다. 같은 채널이 여러 번
+    나오면(빈 복제블록 포함) 절댓값이 가장 큰 합계를 채택한다.
+    """
+    arr = raw.values
+    nrow, ncol = raw.shape
+    label_cols = [
+        j for j in range(ncol)
+        if sum(1 for i in range(nrow) if i != hdr and _channel_of(arr[i][j])) >= 3
+    ]
+    out = {}
+    for j in label_cols:
+        for i in range(nrow):
+            if i == hdr:
+                continue
+            ch = _channel_of(arr[i][j])
+            if not ch:
+                continue
+            tot = 0
+            for k in range(j + 1, ncol):
+                v = str(arr[i][k]).strip()
+                if v in ("", "nan"):
+                    continue
+                tot = clean_money(v)
+                break
+            if abs(tot) > abs(out.get(ch, 0)):
+                out[ch] = tot
+    return out
+
+
+def _relabel_pay_columns(df, summary_totals):
+    """결제수단 머리글이 비거나·어긋나거나·다른 이름인 비표준 일일마감에서, 각 금액열의
+    환자합계를 하단 요약블록 합계(summary_totals)와 정확히 대조해 표준 채널명으로
+    (재)라벨링한다. 요약블록이 없는 표준 양식에는 아무 영향이 없다.
+
+    합계가 큰 채널부터 '유일하게 일치하는' 열에 배정한다(소액 우연 충돌 방지). 차트번호·
+    성명 등 식별열은 후보에서 제외해 금액열만 손댄다. 합계가 0인 채널은 매칭 불가하므로
+    건너뛴다(해당 열이 비어 있어도 결과는 0으로 동일).
+    """
+    if not summary_totals:
+        return df
+    protect = {"차트번호", "성명", "구분", "내원순서", "HP뒷자리", "내원경로", "담당/결제"}
+    sums = {}
+    for j in range(df.shape[1]):
+        if str(df.columns[j]).strip() in protect:
+            continue
+        s = int(df.iloc[:, j].apply(clean_money).sum())
+        if s:
+            sums[j] = s
+    newcols = list(df.columns)
+    used = set()
+    for ch, t in sorted(summary_totals.items(), key=lambda kv: -abs(kv[1])):
+        if not t:
+            continue
+        hits = [j for j, s in sums.items() if j not in used and s == t]
+        if len(hits) == 1:
+            newcols[hits[0]] = ch
+            used.add(hits[0])
+    df = df.copy()
+    df.columns = newcols
+    return df
+
+
 def parse_daily(raw):
     """일일마감 파싱: 동적 헤더, 결제수단별 금액, 환불/취소 내역 포함"""
     hdr = None
@@ -768,10 +858,15 @@ def parse_daily(raw):
     df["내원순서"] = df.get("내원순서", pd.Series(dtype=float))
     df["내원순서"] = df["내원순서"].fillna(pd.Series(range(1, len(df) + 1))).astype(int)
 
+    # 비표준 지점 양식 대응: 결제수단 머리글이 비거나(인천)·위치가 어긋나거나(엔디어트)·
+    # 다른 이름(결제단말기)이어도, 하단 세로 요약블록의 채널 합계와 각 금액열의 환자합계를
+    # 대조해 표준 채널명으로 재라벨링한다. 표준 양식(요약블록 없음)에는 무영향.
+    df = _relabel_pay_columns(df, _summary_channel_totals(raw, hdr))
+
     pay_map = {
-        "카드": ["카드"], "현금": ["현금"], "이체": ["이체"],
+        "카드": ["카드", "결제단말기", "단말기"], "현금": ["현금"], "이체": ["이체"],
         "여신티켓": ["여신티켓", "여신"], "강남언니": ["강남언니"],
-        "나만의닥터": ["나만의닥터"], "제로페이": ["제로페이"],
+        "나만의닥터": ["나만의닥터", "나만의 닥터"], "제로페이": ["제로페이"],
         "기타지역화폐": ["기타-지역화폐", "기타지역화폐"],
     }
     for tgt, cands in pay_map.items():
@@ -2965,6 +3060,20 @@ def main():
                     if daily.empty:
                         st.error("일일마감 파싱 실패")
                         st.stop()
+
+                    # 결제수단을 한 건도 못 읽으면(지점 시트가 표준과 너무 다르거나, 하단
+                    # 채널 합계(요약블록)에 항목 라벨이 없어 금액열 자동 매핑에 실패) 조용히
+                    # 0원으로 진행하지 말고 명확히 경고한다.
+                    _pay_cols = [c for c in ["카드", "현금", "이체", "플랫폼합"] if c in daily.columns]
+                    if _pay_cols and sum(int(daily[c].sum()) for c in _pay_cols) == 0:
+                        st.warning(
+                            "⚠️ 일일마감에서 결제수단 금액을 한 건도 읽지 못했습니다(합계 0원). "
+                            "해당 지점 마감 시트의 결제수단(카드/현금/이체 등) 열에 머리글이 없거나, "
+                            "하단 채널 합계(요약블록)에 항목 라벨이 없어 자동 인식에 실패했을 수 "
+                            "있습니다. 결제수단 열 머리글 또는 하단 요약블록의 채널 라벨을 확인해 "
+                            "주세요(다른 지점 시트처럼 '카드/현금/이체…' 라벨이 한 열에 세로로 "
+                            "있으면 자동 인식됩니다)."
+                        )
 
                     # ── 교차검증: 차트마감↔일일마감이 같은 지점·날짜인지 확인 ──
                     # 양쪽 차트번호 일치율이 기준 미만이면(='block') 합계·통계를 일절
