@@ -178,49 +178,50 @@ def _chart_df(charts):
 def test_cross_check_pass_when_charts_overlap(app):
     d = _chart_df([100, 101, 102, 103])
     p = _chart_df([100, 101, 102, 103, 200, 201])   # 일마 ⊆ 차트 → 100%
-    ok, msg, info = app.cross_check_daily_patient(d, p)
-    assert ok and msg is None and info["rate"] == 1.0
+    status, msg, info = app.cross_check_daily_patient(d, p)
+    assert status == "ok" and msg is None and info["rate"] == 1.0
 
 
 def test_cross_check_blocks_different_branch_or_date(app):
     d = _chart_df([100, 101, 102, 103, 104])
     p = _chart_df([900, 901, 902, 903, 904])        # 겹침 0 → 차단
-    ok, msg, _ = app.cross_check_daily_patient(d, p)
-    assert not ok and "다른 지점" in msg
+    status, msg, _ = app.cross_check_daily_patient(d, p)
+    assert status == "block" and "다른 지점" in msg
 
 
-def test_cross_check_blocks_when_daily_has_no_chart_no(app):
-    d = _chart_df(["", "", ""])                      # 비표준(차트번호 없음)
+def test_cross_check_warns_when_daily_has_no_chart_no(app):
+    # 차트번호 없는 비표준 일일마감 → 차단이 아니라 경고 후 진행(전환기 편의).
+    d = _chart_df(["", "", ""])
     p = _chart_df([100, 101, 102])
-    ok, msg, _ = app.cross_check_daily_patient(d, p)
-    assert not ok and "표준 양식" in msg
+    status, msg, _ = app.cross_check_daily_patient(d, p)
+    assert status == "warn" and "표준 양식" in msg
 
 
-def test_cross_check_blocks_when_patient_unreadable(app):
+def test_cross_check_warns_when_patient_unreadable(app):
     d = _chart_df([100, 101, 102])
-    p = _chart_df([])                                # 차트마감에서 차트번호 0
-    ok, msg, _ = app.cross_check_daily_patient(d, p)
-    assert not ok and "차트마감" in msg
+    p = _chart_df([])                                # 차트마감에서 차트번호 0 → 경고
+    status, msg, _ = app.cross_check_daily_patient(d, p)
+    assert status == "warn" and "차트마감" in msg
 
 
 def test_cross_check_threshold_boundary_60pct(app):
     # 기본 기준 0.6: 3/5=60% 통과, 2/5=40% 차단.
-    ok1, _, info1 = app.cross_check_daily_patient(
+    status1, _, info1 = app.cross_check_daily_patient(
         _chart_df([1, 2, 3, 4, 5]), _chart_df([1, 2, 3, 90, 91])
     )
-    assert info1["rate"] == 0.6 and ok1
-    ok2, _, _ = app.cross_check_daily_patient(
+    assert info1["rate"] == 0.6 and status1 == "ok"
+    status2, _, _ = app.cross_check_daily_patient(
         _chart_df([1, 2, 3, 4, 5]), _chart_df([1, 2, 90, 91, 92])
     )
-    assert not ok2
+    assert status2 == "block"
 
 
 def test_cross_check_respects_custom_min_rate(app):
     # min_rate를 0.8로 올리면 60% 쌍도 차단.
-    ok, _, _ = app.cross_check_daily_patient(
+    status, _, _ = app.cross_check_daily_patient(
         _chart_df([1, 2, 3, 4, 5]), _chart_df([1, 2, 3, 90, 91]), min_rate=0.8
     )
-    assert not ok
+    assert status == "block"
 
 
 def test_load_gsheet_daily_caches_fallback_signature(app, monkeypatch):

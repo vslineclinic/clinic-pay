@@ -803,7 +803,11 @@ def cross_check_daily_patient(daily, patient, min_rate=None):
 
     같은 지점·같은 날짜면 환자(차트번호)가 크게 겹치고, 다른 지점/날짜면 거의
     안 겹친다. 일치율 = |교집합| / min(일마 차트수, 차트 차트수) (포함율, 0~1).
-    반환: (통과여부, 차단안내문 or None, 상세dict).
+
+    반환: (status, message, info)
+      - 'ok'    : 통과 (message=None)
+      - 'block' : 일치율이 기준 미만 → 다른 지점/날짜 파일로 보고 분석 차단
+      - 'warn'  : 한쪽에 차트번호가 없어 대조 자체가 불가 → 경고만 하고 진행(전환기)
     """
     if min_rate is None:
         min_rate = CROSS_CHECK_MIN_RATE
@@ -820,24 +824,26 @@ def cross_check_daily_patient(daily, patient, min_rate=None):
     rate = inter / min(nd, npat) if (nd and npat) else 0.0
     info = {"rate": rate, "inter": inter, "n_daily": nd, "n_patient": npat, "min_rate": min_rate}
 
+    # 대조 불가(차트번호 없음) → 차단하지 않고 경고만 (표준화 전환기 편의)
     if nd == 0:
-        return False, (
-            "일일마감에 차트번호가 없어 차트마감과 대조할 수 없습니다. "
-            "일일마감 시트를 표준 양식(차트번호 포함, templates/일일마감_표준양식)으로 "
-            "입력한 뒤 다시 시도하세요."
+        return "warn", (
+            "일일마감에 차트번호가 없어 차트마감과 대조(같은 지점·날짜 확인)를 할 수 "
+            "없습니다. 표준 양식(차트번호 포함, templates/일일마감_표준양식)으로 입력하면 "
+            "자동 검증됩니다. 지금 결과는 다른 지점/날짜일 수 있으니 원본과 대조해 확인하세요."
         ), info
     if npat == 0:
-        return False, (
-            "업로드한 차트마감(베가스) 파일에서 차트번호를 읽지 못했습니다. "
+        return "warn", (
+            "차트마감(베가스) 파일에서 차트번호를 읽지 못해 일일마감과 대조할 수 없습니다. "
             "올바른 차트 정산 파일인지 확인하세요."
         ), info
+    # 양쪽 모두 차트번호 있음 → 일치율로 판정. 기준 미만이면 분석 차단.
     if rate < min_rate:
-        return False, (
+        return "block", (
             f"업로드한 차트마감이 선택한 일일마감과 일치하지 않습니다 "
             f"(차트번호 일치율 {rate * 100:.0f}% < 기준 {min_rate * 100:.0f}%). "
             "다른 지점이나 다른 날짜의 파일을 올린 것은 아닌지 확인하세요."
         ), info
-    return True, None, info
+    return "ok", None, info
 
 
 # 결제메모 플랫폼 키워드 → 플랫폼명 매핑
@@ -2937,12 +2943,15 @@ def main():
                         st.stop()
 
                     # ── 교차검증: 차트마감↔일일마감이 같은 지점·날짜인지 확인 ──
-                    # 차트번호 일치율이 기준 미만이면 합계·통계를 일절 표시하지 않고
-                    # 안내 문구만 노출한다(타 지점/다른 날짜 데이터 엿보기 방지).
-                    _ok, _msg, _info = cross_check_daily_patient(daily, patient)
-                    if not _ok:
+                    # 양쪽 차트번호 일치율이 기준 미만이면(='block') 합계·통계를 일절
+                    # 표시하지 않고 안내만 노출(타 지점/다른 날짜 엿보기 방지).
+                    # 차트번호가 없어 대조 불가하면(='warn') 경고만 하고 진행(전환기).
+                    _status, _msg, _info = cross_check_daily_patient(daily, patient)
+                    if _status == "block":
                         st.error("🚫 " + _msg)
                         st.stop()
+                    elif _status == "warn":
+                        st.warning("⚠️ " + _msg)
 
                     # 한솔 파일을 올렸는데 유효 거래를 못 읽으면, 조용히 2-파일 모드로
                     # 넘어가지 말고 사용자에게 한솔이 분석에서 빠졌음을 명확히 알린다.
