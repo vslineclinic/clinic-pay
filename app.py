@@ -2995,15 +2995,24 @@ def main():
     st.caption("★ 결제채널별 파일 합계 차이를 먼저 산출 → 차이를 설명할 후보 거래 추적 | 일마+차트 2개 또는 한솔+일마+차트 3개 분석 가능")
 
     with st.expander("📌 사용 안내", expanded=False):
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
+            st.markdown("""
+### 💳 한솔페이 (선택)
+**한솔페이 파일 받기:**
+☐ https://cateca.kovan.com/nKIMOS/default.aspx 접속 → 로그인
+☐ 거래관리 → 거래내역 조회
+☐ 거래구분선택 = '전체거래' ✓
+☐ 우측 상단 엑셀파일 다운로드
+            """)
+        with col2:
             st.markdown("""
 ### 📝 일일마감
 - **시트명 형식**: `26.06.01` (숫자 6자리, `.` 구분)
 - 각 날짜별 시트명을 정확히 입력해주세요
 - 표준 양식에 맞춰 작성된 자료를 권장합니다
             """)
-        with col2:
+        with col3:
             st.markdown("""
 ### 🔐 차트마감 (베가스)
 - **비밀번호**: 안내받은 비밀번호 필수 입력
