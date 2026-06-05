@@ -242,3 +242,83 @@ def test_load_gsheet_daily_caches_fallback_signature(app, monkeypatch):
     app.load_gsheet_daily(URL, date(2026, 6, 2), cache=cache)
     # 2번째 호출은 sentinel 재조회 없이 1회 fetch (직전 성공 형식 우선)
     assert calls["n"] - first == 1
+
+
+# ── export(gid) 경로 — 숫자열 머리글 보존 (gviz 누락 문제 회피) ──────────
+
+def _gid_blob(name, gid):
+    r"""edit 페이지 부트스트랩의 escape된 {gid↔탭이름} 인코딩 한 토막 재현.
+    실제 형식: \"<gid>\",[{\"1\":[[0,0,\"<name>\"]"""
+    return '\\"' + gid + '\\",[{\\"1\\":[[0,0,\\"' + name + '\\"]'
+
+
+def test_export_csv_url_targets_gid(app):
+    u = app._export_csv_url("SID123", "925828584")
+    assert "/SID123/export" in u and "format=csv" in u and "gid=925828584" in u
+
+
+def test_candidate_tab_names_includes_apgujeong_korean_format(app):
+    # 압구정 탭 이름 형식 '26년 06월 02일'을 후보로 생성해야 한다.
+    assert "26년 06월 02일" in app._candidate_tab_names(date(2026, 6, 2))
+
+
+def test_clinic_sheets_include_ilsan_and_apgujeong(app):
+    assert "일산점" in app.CLINIC_DAILY_SHEETS
+    assert "압구정" in app.CLINIC_DAILY_SHEETS
+
+
+def test_sheet_gid_map_parses_edit_bootstrap(app, monkeypatch):
+    html = "junk" + _gid_blob("26.06.04", "925828584") + "mid" \
+        + _gid_blob("26년 06월 02일", "2134713726") + "end"
+    monkeypatch.setattr(app, "_fetch_url_bytes", lambda url, timeout=20: html.encode("utf-8"))
+    m = app._sheet_gid_map("SID")
+    assert m["26.06.04"] == "925828584"
+    assert m["26년 06월 02일"] == "2134713726"
+
+
+def test_sheet_gid_map_empty_on_fetch_error(app, monkeypatch):
+    # edit 페이지를 못 읽으면(구글 포맷 변경·네트워크) 빈 dict → gviz 폴백을 유도.
+    def boom(url, timeout=20):
+        raise ConnectionError("net")
+    monkeypatch.setattr(app, "_fetch_url_bytes", boom)
+    assert app._sheet_gid_map("SID") == {}
+
+
+def test_load_gsheet_daily_uses_export_preserving_numeric_headers(app, monkeypatch):
+    # 핵심: gviz는 '숫자 열'의 텍스트 머리글(카드/현금/이체)을 떨구지만 export는 보존한다.
+    # export 경로가 성공하면 gviz는 아예 호출되지 않아야 한다.
+    html = "x" + _gid_blob("26.06.04", "925828584") + "y"
+    export_csv = "내원순서,차트번호,성명,이체,현금,카드\n1,100,김철수,0,0,50000\n"
+
+    def fake(url, timeout=20):
+        if url.endswith("/edit"):
+            return html.encode("utf-8")
+        if "/export?" in url:
+            gid = parse_qs(urlparse(url).query).get("gid", [""])[0]
+            assert gid == "925828584"
+            return export_csv.encode("utf-8")
+        raise AssertionError("export 성공 시 gviz를 호출하면 안 됨: " + url)
+
+    monkeypatch.setattr(app, "_fetch_url_bytes", fake)
+    raw, name = app.load_gsheet_daily(URL, date(2026, 6, 4), cache={})
+    assert name == "26.06.04"
+    d, _ = app.parse_daily(raw)
+    assert int(d["카드"].sum()) == 50000   # 머리글 보존 → '카드'로 정확 매핑
+
+
+def test_load_gsheet_daily_falls_back_to_gviz_when_no_gid_map(app, monkeypatch):
+    # gid 매핑을 못 얻으면(edit에 패턴 없음) 기존 gviz 폴백으로 정상 동작.
+    fallback = "견본\n구분\n\n"
+    tabs = {"26.06.04": "내원순서,차트번호,성명,카드\n1,100,김,11000\n"}
+
+    def fake(url, timeout=20):
+        if url.endswith("/edit"):
+            return b"<html>no gid pattern</html>"     # 매핑 0건
+        name = unquote(parse_qs(urlparse(url).query).get("sheet", [""])[0])
+        return tabs.get(name, fallback).encode("utf-8")
+
+    monkeypatch.setattr(app, "_fetch_url_bytes", fake)
+    raw, name = app.load_gsheet_daily(URL, date(2026, 6, 4), cache={})
+    assert name == "26.06.04"
+    d, _ = app.parse_daily(raw)
+    assert int(d["카드"].sum()) == 11000
