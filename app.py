@@ -731,7 +731,27 @@ _PAY_ALIAS = {
     "나만의닥터": "나만의닥터", "나닥": "나만의닥터",
     "제로페이": "제로페이",
     "기타지역화폐": "기타지역화폐", "지역화폐": "기타지역화폐",
+    "알리페이": "알리페이", "알리": "알리페이",
+    "위챗페이": "위챗페이", "위쳇페이": "위챗페이", "위챗": "위챗페이",
+    "카카오페이": "카카오페이",
 }
+
+# 플랫폼(비카드·비현금) 결제 채널 목록. 총액·정산에서 '플랫폼합' 하나로 묶인다.
+# 알리페이·위챗페이·카카오페이(QR·모바일 간편결제)는 제로페이처럼 카드 단말(한솔)을 거치지
+# 않으므로 카드가 아니라 플랫폼으로 집계한다(카드로 넣으면 한솔 카드 대사에 허위 불일치 발생).
+_PLATFORM_CHANNELS = [
+    "여신티켓", "강남언니", "나만의닥터", "제로페이", "기타지역화폐",
+    "알리페이", "위챗페이", "카카오페이",
+]
+
+
+def _platform_sum(frame):
+    """플랫폼 채널 컬럼들의 행별 합계 Series. 없는 컬럼은 0으로 간주한다."""
+    total = 0
+    for c in _PLATFORM_CHANNELS:
+        if c in frame.columns:
+            total = total + frame[c]
+    return total
 
 
 def _channel_of(label):
@@ -890,12 +910,14 @@ def parse_daily(raw):
                     "여신티켓": ["여신티켓", "여신"], "강남언니": ["강남언니"],
                     "나만의닥터": ["나만의닥터"], "제로페이": ["제로페이"],
                     "기타지역화폐": ["기타-지역화폐", "기타지역화폐"],
+                    "알리페이": ["알리페이"], "위챗페이": ["위챗페이", "위쳇페이"],
+                    "카카오페이": ["카카오페이"],
                 }
                 for tgt, cands in pay_map_r.items():
                     mc = next((c for c in cands if c in r_data.columns), None)
                     r_data[tgt] = r_data[mc].apply(clean_money) if mc else 0
 
-                r_data["플랫폼합"] = r_data["여신티켓"] + r_data["강남언니"] + r_data["나만의닥터"] + r_data["제로페이"] + r_data["기타지역화폐"]
+                r_data["플랫폼합"] = _platform_sum(r_data)
                 r_data["총액"] = r_data["카드"] + r_data["현금"] + r_data["이체"] + r_data["플랫폼합"]
                 refund_df = r_data
 
@@ -939,12 +961,14 @@ def parse_daily(raw):
         "여신티켓": ["여신티켓", "여신"], "강남언니": ["강남언니"],
         "나만의닥터": ["나만의닥터", "나만의 닥터"], "제로페이": ["제로페이"],
         "기타지역화폐": ["기타-지역화폐", "기타지역화폐"],
+        "알리페이": ["알리페이"], "위챗페이": ["위챗페이", "위쳇페이"],
+        "카카오페이": ["카카오페이"],
     }
     for tgt, cands in pay_map.items():
         mc = next((c for c in cands if c in df.columns), None)
         df[tgt] = df[mc].apply(clean_money) if mc else 0
 
-    df["플랫폼합"] = df["여신티켓"] + df["강남언니"] + df["나만의닥터"] + df["제로페이"] + df["기타지역화폐"]
+    df["플랫폼합"] = _platform_sum(df)
     df["총액"] = df["카드"] + df["현금"] + df["이체"] + df["플랫폼합"]
 
     # --- 메인 데이터 내 환불/취소 행 추출 (구분 컬럼 기준) ---
@@ -1137,7 +1161,12 @@ def parse_patient(raw):
         | (df["is_취소"] & cancel_norm.str.contains("이체|계좌|입금", na=False)
            & ~cancel_norm.str.contains("카드|현금", na=False))
     )
-    platform_mask = pay_norm.str.startswith("기타", na=False)
+    # 차트마감(베가스)은 플랫폼을 보통 '기타-…'로 적지만, 알리페이/위챗페이/카카오페이는
+    # 접두 없이 그대로 적힐 수 있어 이름으로도 플랫폼으로 잡는다(일일마감 집계와 대칭 유지).
+    platform_mask = (
+        pay_norm.str.startswith("기타", na=False)
+        | pay_norm.str.contains("알리페이|위챗페이|위쳇페이|카카오페이", na=False)
+    )
 
     df["분류"] = "기타"
     df.loc[card_mask, "분류"] = "카드"

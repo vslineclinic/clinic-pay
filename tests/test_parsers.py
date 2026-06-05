@@ -168,6 +168,49 @@ def test_parse_patient_payment_classification(app):
     assert p.iloc[0]["승인번호목록"] == ["100111"]      # 결제메모에서 승인번호 추출
 
 
+# ── QR·모바일 간편결제(알리페이/위챗페이/카카오페이) = 플랫폼 집계 ──────────
+
+def test_channel_of_normalizes_qr_platform_aliases(app):
+    assert app._channel_of("알리페이") == "알리페이"
+    assert app._channel_of("위챗 페이") == "위챗페이"      # 공백 무시
+    assert app._channel_of("위쳇페이") == "위챗페이"        # 흔한 오기
+    assert app._channel_of("카카오페이") == "카카오페이"
+
+
+def test_parse_daily_counts_qr_platform_channels(app):
+    # 압구정형: 알리페이/위챗페이/카카오페이도 플랫폼합·총액에 집계돼야 한다.
+    daily = F.table_raw(
+        ["내원순서", "차트번호", "성명", "카드", "여신티켓", "알리페이", "위챗페이", "카카오페이"],
+        [1, "100", "김철수", 10000, 0, 50000, 0, 0],
+        [2, "200", "이영희", 0, 3000, 0, 20000, 7000],
+    )
+    d, _ = app.parse_daily(daily)
+    assert int(d["알리페이"].sum()) == 50000
+    assert int(d["위챗페이"].sum()) == 20000
+    assert int(d["카카오페이"].sum()) == 7000
+    # 플랫폼합 = 여신티켓3000 + 알리50000 + 위챗20000 + 카카오7000 = 80000
+    assert int(d["플랫폼합"].sum()) == 80000
+    # 총액 = 카드10000 + 플랫폼합80000 = 90000
+    assert int(d["총액"].sum()) == 90000
+
+
+def test_parse_patient_classifies_qr_platforms(app):
+    # 차트마감에서 알리페이/위챗페이/카카오페이는 '플랫폼'으로 분류돼야(일일마감과 대칭).
+    patient = F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "본부금", "결제메모"],
+        ["100", "김철수", "알리페이", 50000, 0, ""],
+        ["200", "이영희", "위챗페이", 20000, 0, ""],
+        ["300", "박민수", "카카오페이", 7000, 0, ""],
+        ["400", "최지우", "카드-삼성카드", 10000, 0, ""],
+    )
+    p = app.parse_patient(patient)
+    cls = dict(zip(p["차트번호"], p["분류"]))
+    assert cls["100"] == "플랫폼"
+    assert cls["200"] == "플랫폼"
+    assert cls["300"] == "플랫폼"
+    assert cls["400"] == "카드"     # 카드 결제는 영향 없음
+
+
 def test_parse_patient_cancellation_makes_amount_negative(app):
     patient = F.table_raw(
         ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
