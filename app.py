@@ -58,6 +58,8 @@ CLINIC_DAILY_SHEETS = {
     "잠실점": "https://docs.google.com/spreadsheets/d/18wHlyD85V-KrTortCt7u4JAbFOn08WJtJJGT1oAm5kA/edit",
     "엔디어트": "https://docs.google.com/spreadsheets/d/1YdruwnAghZARwLALGD9rvbDZsnw4b4FKSt6l3_sLgd4/edit",
     "강남점": "https://docs.google.com/spreadsheets/d/1eNEp8zo27whawGPrb5y7uifZzhXVKpsp5hgpTlDv0UY/edit",
+    "일산점": "https://docs.google.com/spreadsheets/d/1Z--Ps4mds67l95g4V2AKW5y-RjESFxDNct18CgSaK8c/edit",
+    "압구정": "https://docs.google.com/spreadsheets/d/1cum7KVfY1TIkXKBjkIpd5GldAT6dd48if-rn03wce0U/edit",
 }
 
 
@@ -387,6 +389,41 @@ def _gviz_csv_url(sid, sheet_name):
     )
 
 
+def _export_csv_url(sid, gid):
+    """특정 워크시트(gid)를 CSV로 내보내는 'export' URL.
+
+    gviz(out:csv)는 열 타입을 추론하면서 '숫자 열'의 텍스트 머리글(카드/현금/이체 등)을
+    빈칸으로 떨어뜨린다(일산·강남 등 결제수단 머리글이 통째로 사라짐 → 금액열 라벨 소실).
+    반면 이 export 엔드포인트는 셀 원본을 그대로 내보내므로 머리글이 보존된다.
+    다만 탭을 '이름'이 아니라 'gid(숫자)'로만 지정할 수 있어 _sheet_gid_map이 필요하다.
+    """
+    return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
+
+
+# 스프레드시트 edit 페이지 부트스트랩에 들어 있는 {탭이름 ↔ gid} 인코딩.
+# 형식: \"<gid>\",[{\"1\":[[0,0,\"<탭이름>\"]   (JSON이 한 번 더 escape된 형태)
+_GID_NAME_RE = re.compile(r'\\"(\d{4,})\\",\[\{\\"1\\":\[\[0,0,\\"([^"\\]+)\\"')
+
+
+def _sheet_gid_map(sid, timeout=20):
+    """{탭이름: gid} 매핑을 edit 페이지에서 추출. 실패 시 빈 dict.
+
+    export(머리글 보존) 경로는 gid가 필요한데, 공개(링크 보기) 시트에서 gid 목록을 얻는
+    표준 무인증 API가 없어 edit 페이지 부트스트랩을 파싱한다. 구글이 내부 포맷을 바꾸면
+    매핑이 비어 자동으로 gviz 경로로 폴백하므로(load_gsheet_daily 참고) 안전하다.
+    """
+    try:
+        html = _fetch_url_bytes(
+            f"https://docs.google.com/spreadsheets/d/{sid}/edit", timeout
+        ).decode("utf-8", "ignore")
+    except Exception:
+        return {}
+    out = {}
+    for gid, name in _GID_NAME_RE.findall(html):
+        out.setdefault(name.strip(), gid)  # 같은 이름이 여럿이면 첫 번째 채택
+    return out
+
+
 def _classify_gviz(raw_bytes):
     """gviz 응답 종류 판별 → ('csv', None) | ('error', msg) | ('html', None) | ('empty', None)."""
     head = raw_bytes[:2048].decode("utf-8", errors="ignore").lstrip()
@@ -458,7 +495,8 @@ def _candidate_tab_names(d):
 
     실측된 형식(지점·시기마다 다름):
       26.06.02(인천·잠실 최근) / 06.02(엔디어트 최근) / 6.2(엔디어트 과거) /
-      26.6.2·2026.6.2(잠실 과거) / '26.06.02 일일마감'(인천 변형) / 6월2일.
+      26.6.2·2026.6.2(잠실 과거) / '26.06.02 일일마감'(인천 변형) / 6월2일 /
+      '26년 06월 02일'(압구정).
     실제 어느 탭이 존재하는지는 load_gsheet_daily가 폴백 비교로 가려낸다.
     """
     y2, Y = d.strftime("%y"), d.strftime("%Y")
@@ -472,6 +510,7 @@ def _candidate_tab_names(d):
         f"{Y}.{mm}.{dd}",                  # 2026.06.02
         f"{Y}.{m}.{dy}",                   # 2026.6.2
         f"{y2}.{mm}.{dd} 일일마감",         # 인천 '25.11.04 일일마감' 변형
+        f"{y2}년 {mm}월 {dd}일",            # 압구정 '26년 06월 02일'
         f"{m}월{dy}일",                     # 6월2일
     ]
     seen, out = set(), []
@@ -485,10 +524,16 @@ def _candidate_tab_names(d):
 def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
     """지점 스프레드시트 URL/ID + 날짜(date) → (raw DataFrame, 매칭된 탭 이름).
 
-    지점마다 탭 이름 형식이 달라 여러 후보를 순서대로 시도한다. gviz는 탭을 못 찾으면
-    오류 대신 '첫 시트'를 반환하므로, 존재할 수 없는 이름(sentinel)의 응답과 비교해
-    폴백(=해당 날짜 탭 없음)을 가려낸다 — 잘못된 시트를 조용히 읽는 사고를 막는다.
-    cache(dict)를 주면 지점별 폴백 시그니처·직전 성공 형식을 재사용해 호출 수를 줄인다.
+    탭 이름 형식이 지점마다 달라 _candidate_tab_names의 여러 후보를 순서대로 시도한다.
+
+    1순위 export(format=csv&gid=): 셀 원본을 그대로 받아 결제수단 머리글(카드/현금/이체
+      등)이 보존된다. gviz는 '숫자 열'의 텍스트 머리글을 타입 추론 중 떨궈(일산·강남 등)
+      금액열 라벨이 통째로 사라지는 문제가 있다. export는 탭을 gid로만 지정할 수 있어
+      _sheet_gid_map으로 {탭이름: gid}을 한 번 얻어(캐싱) 후보와 정확히 일치하는 탭을 고른다.
+    2순위 gviz(out:csv) 폴백: gid 매핑을 못 얻거나(구글 포맷 변경) 후보가 매핑에 없을 때.
+      gviz는 탭을 못 찾으면 오류 대신 '첫 시트'를 반환하므로, 존재할 수 없는 이름(sentinel)
+      응답과 비교해 폴백(=해당 날짜 탭 없음)을 가려낸다 — 잘못된 시트를 조용히 읽는 사고 방지.
+    cache(dict)를 주면 지점별 gid 매핑·폴백 시그니처·직전 성공 형식을 재사용해 호출을 줄인다.
     """
     import hashlib
 
@@ -500,10 +545,40 @@ def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
     if cache is None:
         cache = {}
 
+    cands = _candidate_tab_names(picked_date)
+
+    def _permission_html():
+        return PermissionError(
+            "구글시트에 접근할 수 없습니다. 스프레드시트 공유를 "
+            "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
+        )
+
+    # ── 1순위: export(gid) — 머리글 보존 ───────────────────────────────
+    gm_key = f"gidmap::{sid}"
+    if gm_key not in cache:
+        cache[gm_key] = _sheet_gid_map(sid, timeout)
+    gid_map = cache[gm_key]
+    for name in cands:
+        gid = gid_map.get(name)
+        if gid is None:
+            continue
+        try:
+            b = _fetch_url_bytes(_export_csv_url(sid, gid), timeout)
+        except PermissionError:
+            raise
+        except Exception:
+            break  # 일시적 네트워크 등 → gviz 폴백으로
+        kind = _classify_gviz(b)[0]
+        if kind == "html":
+            raise _permission_html()
+        if kind == "csv":
+            return _gviz_csv_to_grid(b), name
+
+    # ── 2순위(폴백): gviz(out:csv) + sentinel 폴백 탐지 ─────────────────
     def _sig(b):
         return hashlib.md5(b).hexdigest()
 
-    # 1) 폴백(첫 시트) 시그니처 확보 — 지점별 1회 (존재할 수 없는 이름으로 조회)
+    # 폴백(첫 시트) 시그니처 확보 — 지점별 1회 (존재할 수 없는 이름으로 조회)
     fb_key = f"fb::{sid}"
     if fb_key in cache:
         fb_sig = cache[fb_key]
@@ -517,8 +592,7 @@ def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
             fb_sig = None
         cache[fb_key] = fb_sig
 
-    # 2) 후보 형식 시도 (직전에 성공한 형식 인덱스를 먼저)
-    cands = _candidate_tab_names(picked_date)
+    # 후보 형식 시도 (직전에 성공한 형식 인덱스를 먼저)
     order = list(range(len(cands)))
     pref = cache.get(f"idx::{sid}")
     if isinstance(pref, int) and 0 <= pref < len(cands):
@@ -530,10 +604,7 @@ def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
         b = _fetch_url_bytes(_gviz_csv_url(sid, name), timeout)
         kind = _classify_gviz(b)[0]
         if kind == "html":
-            raise PermissionError(
-                "구글시트에 접근할 수 없습니다. 스프레드시트 공유를 "
-                "'링크가 있는 모든 사용자 - 뷰어'로 설정했는지 확인하세요."
-            )
+            raise _permission_html()
         if kind != "csv":
             continue
         if fb_sig is not None and _sig(b) == fb_sig:
