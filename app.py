@@ -3194,6 +3194,9 @@ def build_verification(patient, daily, branch="", date=""):
     used_d = set()
     for pch in sorted(p_only):
         p = P[pch]
+        # 차트마감에만 있고 금액 0원 → 특이사항만 있는 무수납 건이므로 페어링 불필요
+        if p["amt"] == 0:
+            continue
         best, best_score = None, -1
         for dch in sorted(d_only):
             if dch in used_d:
@@ -3228,6 +3231,9 @@ def build_verification(patient, daily, branch="", date=""):
     typeC1 = []
     for pch in sorted(p_only - paired_p):
         p = P[pch]
+        # 금액 0원 → 특이사항만 남긴 무수납 건이므로 오류로 잡지 않음
+        if p["amt"] == 0:
+            continue
         typeC1.append({"지점": branch, "날짜": date, "구분": "차트마감에만 존재",
                        "차트번호": pch, "성명": p["name"], "금액": p["amt"], "결제수단": p["methods"]})
     for dch in sorted(d_only - used_d):
