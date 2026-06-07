@@ -2444,7 +2444,7 @@ def _safe_int(v, default=0):
 
 def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                   p1_full, h_um, d_um, suspects_by_channel,
-                  totals=None, max_chars=8000):
+                  totals=None, verif=None, max_chars=8000):
     """3개 파일(한솔/일마/차트)을 차트번호·승인번호 join으로 유기적 연결한 통합 raw 구조.
     AI가 사전요약을 rephrase하는게 아니라 cross-file 추적분석을 수행할 수 있게 한다.
 
@@ -2537,12 +2537,57 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             has_patient_diff = True
             break
 
-    if not has_nonzero and not has_patient_diff:
+    # ── 데이터검증(유형B/C1/C2) 존재 여부 — 코드가 확정한 오입력 의심 오차 ──
+    # 유형B(번호 오타)는 이름·금액이 같아 채널 합계엔 안 잡히므로, 합계가 맞아도
+    # 검증 결과가 있으면 절대 조기 종료하지 않는다(놓침 방지).
+    vB = verif.get("유형B_차트번호오타") if verif else None
+    vC1 = verif.get("유형C1_한쪽만존재") if verif else None
+    vC2 = verif.get("유형C2_금액불일치") if verif else None
+    n_vB = len(vB) if vB is not None else 0
+    n_vC1 = len(vC1) if vC1 is not None else 0
+    n_vC2 = len(vC2) if vC2 is not None else 0
+    has_verif = (n_vB + n_vC1 + n_vC2) > 0
+
+    if not has_nonzero and not has_patient_diff and not has_verif:
         L.append("\n[결과] 모든채널·환자 합계 일치 — 추가분석 불필요")
         return "\n".join(L)[:max_chars]
     if not has_nonzero and has_patient_diff:
         L.append("\n[주의] 채널 합계는 일치하나 환자별 금액 불일치가 +/-로 상쇄되어 숨어있음 "
                  "— 아래 [차트번호별 3-way 통합]에서 환자별 개별 검토 필요")
+    if not has_nonzero and not has_patient_diff and has_verif:
+        L.append("\n[주의] 채널·환자 합계는 일치하나 차트마감↔일일마감 환자단위 대조에서 "
+                 "오입력 의심 건이 확정됨 — 아래 [데이터검증] 우선 검토")
+
+    # ── [데이터검증 — 차트마감↔일일마감 확정대조] ──
+    # 코드가 결정론적으로 추출한 '오입력 의심' 확정 단서. AI는 이를 최우선 신뢰·보고.
+    if has_verif:
+        L.append("\n[데이터검증 — 차트마감↔일일마감 환자단위 확정대조 (코드추출·오차0·최우선단서)]")
+        L.append(f"요약: 유형B 차트번호오타 {n_vB}건 · 유형C1 한쪽만존재 {n_vC1}건 · 유형C2 금액불일치 {n_vC2}건")
+        if n_vB:
+            L.append("·유형B[차트번호오타] 이름·금액 동일·번호만 상이 → 일일마감 차트번호 수기오류")
+            L.append("환자|차트마감#|일일마감#|금액|원인")
+            for _, r in vB.head(15).iterrows():
+                nm = str(r.get("성명", ""))[:14].replace("|", " ")
+                cause = str(r.get("추정원인", "")).replace("일일마감 차트번호 수기오류", "").strip("()")
+                L.append(f"{nm}|{r.get('차트마감_차트번호','')}|{r.get('일일마감_차트번호','')}|"
+                         f"{_f(r.get('차트금액'))}|{cause or '번호상이'}")
+        if n_vC1:
+            L.append("·유형C1[한쪽만존재] 한 파일에만 있는 환자 → 누락/미반영 의심")
+            L.append("구분|차트#|환자|금액|결제수단")
+            for _, r in vC1.head(15).iterrows():
+                nm = str(r.get("성명", ""))[:12].replace("|", " ")
+                gb = str(r.get("구분", "")).replace("에만 존재", "").replace("|", " ")
+                pay = str(r.get("결제수단", ""))[:30].replace("|", " ")
+                L.append(f"{gb}|{r.get('차트번호','')}|{nm}|{_f(r.get('금액'))}|{pay}")
+        if n_vC2:
+            L.append("·유형C2[금액불일치] 동일 차트번호·수납액 상이 → 금액/결제수단 오기재 의심")
+            L.append("차트#|환자|차트금액|일마금액|차이|차트결제|일마결제")
+            for _, r in vC2.head(15).iterrows():
+                nm = str(r.get("성명", ""))[:12].replace("|", " ")
+                pc = str(r.get("차트결제수단", ""))[:30].replace("|", " ")
+                dc = str(r.get("일마결제수단", ""))[:30].replace("|", " ")
+                L.append(f"{r.get('차트번호','')}|{nm}|{_f(r.get('차트금액'))}|{_f(r.get('일마금액'))}|"
+                         f"{_f(r.get('차이'))}|{pc}|{dc}")
 
     # ── 차트번호 → 이름 맵 ────────────────────────
     name_map = {}
@@ -2746,6 +2791,10 @@ AI_SYSTEM = (
     "'어느 환자에서 어느 채널에 얼마만큼 차이가 나는지'를 데이터로 정확히 짚고 "
     "'그 환자의 원본 데이터(차트/일마/한솔)를 먼저 검토하라'고 안내하는 것이다. "
     "다음 규칙을 절대 위반하지 말 것:\n"
+    "[R0] 입력에 [데이터검증] 섹션이 있으면 그것은 코드가 차트마감↔일일마감을 환자단위로 "
+    "결정론적 대조해 '확정'한 오입력 의심 단서다(오차0). ★★ 다음가는 최우선 신뢰대상이며 "
+    "절대 누락 없이 전건 보고한다. 특히 유형B(차트번호오타)는 이름·금액이 같아 채널 합계엔 "
+    "안 나타나므로, 합계가 맞아도 반드시 별도로 짚는다.\n"
     "[R1] 환자명·차트번호·금액·승인번호는 반드시 입력에 실제 존재하는 값만 인용 (창작·반올림·근사 금지).\n"
     "[R2] 모든 차이는 환자(차트번호) 단위로 끝까지 추적한다. 채널 합계차이를 큰 환자 한 명으로 "
     "'설명 완료'했다고 나머지 환자별 불일치를 버리지 말 것. 서로 +/-로 상쇄되어 채널 합계엔 "
@@ -2771,6 +2820,15 @@ AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호�
 {data}
 
 [분석 절차 — 반드시 순서대로 수행]
+
+STEP0. [데이터검증] 확정 오입력 우선 처리 (섹션이 있으면 절대 먼저)
+  · 코드가 차트마감↔일일마감을 환자단위로 대조해 확정한 단서 = 추론 불필요한 사실.
+  · 유형B(차트번호오타): 이름·금액 동일·번호만 상이 → "일일마감 차트번호를 차트마감 기준으로
+    정정 검토" 권고. (금액은 맞으므로 합계엔 영향 없음을 명시)
+  · 유형C1(한쪽만존재): 한 파일에만 있는 환자 → "누락된 쪽 파일에 해당 결제건이 빠졌는지/
+    환불 미반영인지 원본 검토" 권고.
+  · 유형C2(금액불일치): 동일번호·금액상이 → R5~R7 적용해 결제수단/금액 오기재 방향 제시.
+  · 이 섹션의 모든 건은 아래 출력 '검토대상'에 누락 없이 포함한다.
 
 STEP1. [채널대사] 차이값 확정
   · 채널별 한-차/한-일/일-차 차이를 정확히 메모 (부호 포함).
@@ -2808,7 +2866,13 @@ STEP6. 정합성 점검 (참고용 — 검토대상을 거르는 필터가 아�
   · 환자별 차이를 채널별로 합산해 채널대사 차이값과 맞는지 점검 → 합계차이를 주로 만든 '주요원인' 환자 식별.
   · 단, 합계엔 안 잡히는 상쇄쌍·소액 불일치도 STEP3 목록에 모두 남길 것 (합계 일치는 생략 사유 아님).
 
-[출력 형식 — 800토큰 이내(반드시 끝까지 완결), 마크다운]
+[출력 형식 — 900토큰 이내(반드시 끝까지 완결), 마크다운]
+
+### 데이터검증 확정건 (입력에 [데이터검증]이 있을 때만)
+- **유형B 차트번호오타**: {{환자}}(차트#{{차트마감#}} → 일마기재 {{일일마감#}}) {{금액}}원 · {{원인}} → 일일마감 번호 정정 검토 (합계 영향 없음)
+- **유형C1 한쪽만존재**: {{구분}} {{환자}}(차트#) {{금액}}원 → {{누락/환불미반영}} 검토
+- **유형C2 금액불일치**: {{환자}}(차트#) 차트{{차트금액}}↔일마{{일마금액}}(차이 {{±}}) → {{결제수단/금액 오기재}} 검토
+(해당 유형 0건이면 그 줄 생략. 검증 섹션 자체가 없으면 이 블록 전체 생략)
 
 ### 채널별 차이 진단
 차이 또는 환자별 불일치가 있는 채널마다 ↓
@@ -2883,9 +2947,18 @@ def build_3way_table(hansol, daily, patient, p1_full):
 
 
 def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_channel=None,
-                   hansol=None, daily=None, patient=None, p1_full=None):
+                   hansol=None, daily=None, patient=None, p1_full=None, verif=None):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        # 시트V: 데이터검증(오입력 의심 확정건) — 가장 앞에 배치
+        if verif:
+            for key, sheet in [("유형B_차트번호오타", "V_차트번호오타"),
+                               ("유형C1_한쪽만존재", "V_한쪽만존재"),
+                               ("유형C2_금액불일치", "V_금액불일치")]:
+                vdf = verif.get(key)
+                if vdf is not None and not vdf.empty:
+                    vdf.drop(columns=[c for c in ["지점", "날짜"] if c in vdf.columns]).to_excel(
+                        w, sheet_name=sheet, index=False)
         # 시트0: 채널 합계 대사 (★메인)
         if channel_df is not None and not channel_df.empty:
             ch_out = channel_df.copy()
@@ -3655,6 +3728,9 @@ def main():
             st.success("✅ 모든 채널 합계 일치 — 추가 분석 불필요")
 
         # 탭 3개 - 메인 탭은 의심 후보 추적
+        # 검증 결과는 tab3(AI 진단 입력)·tab4(검증 표) 양쪽에서 쓰므로 한 번만 계산
+        verif = build_verification(patient, daily)
+
         tab1, tab2, tab3, tab4 = st.tabs([
             "🎯 차이 원인 추적 (★메인)",
             "🔬 1:1 매칭 상세 (보조)",
@@ -3791,7 +3867,7 @@ def main():
         with tab3:
             ai_text = build_ai_text(
                 hansol, daily, daily_refund, patient, channel_df,
-                p1_full, h_um, d_um, suspects_by_channel, totals=totals,
+                p1_full, h_um, d_um, suspects_by_channel, totals=totals, verif=verif,
             )
             st.session_state["_ai_data"] = ai_text
 
@@ -3869,15 +3945,15 @@ def main():
             with st.expander("📥 (대안) 통합 엑셀 다운로드 — 다른 AI/수작업용"):
                 excel = build_ai_excel(
                     p1_diff, h_um, d_um, totals, channel_df, suspects_by_channel,
-                    hansol=hansol, daily=daily, patient=patient, p1_full=p1_full,
+                    hansol=hansol, daily=daily, patient=patient, p1_full=p1_full, verif=verif,
                 )
                 st.download_button(
-                    "통합 엑셀 다운로드 (7시트)",
+                    "통합 엑셀 다운로드 (검증 + 7시트)",
                     data=excel,
                     file_name=f"정산차이_{datetime.now().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-                st.caption("시트: 0_채널대사(★) / 0_3way통합(★) / 0_의심후보 / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭 / 4_합계")
+                st.caption("시트: V_차트번호오타·V_한쪽만존재·V_금액불일치(검증) / 0_채널대사(★) / 0_3way통합(★) / 0_의심후보 / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭 / 4_합계")
 
         with tab4:
             st.markdown(
@@ -3887,7 +3963,6 @@ def main():
                 "🅒1 **한쪽만 존재** = 차트마감/일일마감 중 한쪽에만 있는 환자  \n"
                 "🅒2 **금액 불일치** = 같은 차트번호인데 수납액이 다름"
             )
-            verif = build_verification(patient, daily)
             cB = len(verif["유형B_차트번호오타"])
             c1 = len(verif["유형C1_한쪽만존재"])
             c2 = len(verif["유형C2_금액불일치"])
