@@ -2968,6 +2968,243 @@ def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_cha
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 데이터 검증 (차트마감 ↔ 일일마감 환자단위 대조) — 결정론적, AI 불필요
+#   유형B  차트번호 오타  : 이름·금액 동일 + 차트번호만 상이 (수기 오타)
+#   유형C1 한쪽만 존재    : 차트마감/일일마감 중 한쪽에만 있는 환자
+#   유형C2 금액 불일치    : 동일 차트번호인데 수납액이 다름
+# 셋 다 코드로 100% 확정 계산 → 어떤 AI(제미나이·클로드)와도 무관하게 동일 결과.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 일일마감 플랫폼 세부 결제수단 컬럼 (parse_daily pay_map과 동일, 카드/현금/이체 제외)
+_DAILY_PLAT_COLS = [
+    "여신티켓", "강남언니", "나만의닥터", "제로페이", "기타지역화폐",
+    "알리페이", "위챗페이", "카카오페이", "간편결제", "바비톡", "닥터나우",
+]
+
+
+def _verif_name_norm(s):
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", str(s)).lower()
+
+
+def _verif_name_sim(a, b):
+    """이름 유사 판정: 정규화 후 동일하거나 한쪽이 다른 쪽을 포함."""
+    a, b = _verif_name_norm(a), _verif_name_norm(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
+        return True
+    return False
+
+
+def _verif_osa(a, b):
+    """Optimal String Alignment 거리(인접 전치 1로 계산)."""
+    a, b = str(a), str(b)
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    d = [[0] * (lb + 1) for _ in range(la + 1)]
+    for i in range(la + 1):
+        d[i][0] = i
+    for j in range(lb + 1):
+        d[0][j] = j
+    for i in range(1, la + 1):
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[la][lb]
+
+
+def _verif_chart_typo_adjacent(a, b):
+    """'인접 자릿수 오타' 판정: 편집거리 1(치환/삽입/삭제/전치) 또는 앞자리 일치 잘림."""
+    a, b = str(a), str(b)
+    if a == b:
+        return False
+    short, lng = (a, b) if len(a) <= len(b) else (b, a)
+    if short and lng.startswith(short) and len(lng) > len(short):
+        return True
+    return _verif_osa(a, b) <= 1
+
+
+def _verif_chart_typo_loose(a, b):
+    """차트번호 오타 후보 매칭용(느슨): 인접오타 또는 편집거리 2 이내."""
+    if _verif_chart_typo_adjacent(a, b):
+        return True
+    return _verif_osa(a, b) <= 2
+
+
+def _verif_fmt_methods(meth):
+    return "; ".join(f"{k}:{v:,}" for k, v in meth.items())
+
+
+def _verif_aggregate_patient(patient):
+    """차트마감을 차트번호 단위로 집계: {차트번호: {name, amt, methods}}."""
+    out = {}
+    if patient is None or patient.empty or "차트번호" not in patient.columns:
+        return out
+    df = patient.copy()
+    df["차트번호"] = df["차트번호"].astype(str).str.strip()
+    df = df[df["차트번호"] != ""]
+    order = ["카드", "현금", "이체", "플랫폼", "기타"]
+    for ch, g in df.groupby("차트번호"):
+        name = ""
+        for n in g["이름"].astype(str):
+            t = n.strip()
+            if t and t.lower() != "nan":
+                name = t
+                break
+        amt = int(g["금액"].sum())
+        meth = {}
+        for cls in order:
+            s = int(g.loc[g["분류"] == cls, "금액"].sum()) if "분류" in g.columns else 0
+            if s != 0:
+                meth[cls] = s
+        if "분류" in g.columns:
+            for cls, gg in g.groupby("분류"):
+                if str(cls) not in order:
+                    s = int(gg["금액"].sum())
+                    if s != 0:
+                        meth[str(cls)] = s
+        if not meth:
+            present = [str(c) for c in g["분류"].unique()] if "분류" in g.columns else []
+            meth[(present[0] if present else "카드")] = 0
+        out[ch] = {"name": name, "amt": amt, "methods": _verif_fmt_methods(meth)}
+    return out
+
+
+def _verif_aggregate_daily(daily):
+    """일일마감을 차트번호 단위로 집계: {차트번호: {name, amt, methods}}."""
+    out = {}
+    if daily is None or daily.empty or "차트번호" not in daily.columns:
+        return out
+    df = daily.copy()
+    df["차트번호"] = df["차트번호"].astype(str).str.strip()
+    df = df[df["차트번호"] != ""]
+    name_col = "성명" if "성명" in df.columns else ("이름" if "이름" in df.columns else None)
+    for ch, g in df.groupby("차트번호"):
+        name = ""
+        if name_col:
+            for n in g[name_col].astype(str):
+                t = n.strip()
+                if t and t.lower() != "nan":
+                    name = t
+                    break
+        amt = int(g["총액"].sum()) if "총액" in g.columns else 0
+        meth = {}
+        for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
+            if col in g.columns:
+                s = int(g[col].sum())
+                if s != 0:
+                    meth[col] = s
+        if not meth:
+            meth["카드"] = 0
+        out[ch] = {"name": name, "amt": amt, "methods": _verif_fmt_methods(meth)}
+    return out
+
+
+def build_verification(patient, daily, branch="", date=""):
+    """차트마감↔일일마감 환자단위 대조로 유형B/C1/C2를 추출.
+    반환: {'요약', '유형B_차트번호오타', '유형C1_한쪽만존재', '유형C2_금액불일치'} DataFrame dict."""
+    P = _verif_aggregate_patient(patient)
+    D = _verif_aggregate_daily(daily)
+    p_only = set(P) - set(D)
+    d_only = set(D) - set(P)
+    both = set(P) & set(D)
+
+    # ── 유형B: 한쪽만 존재하는 번호끼리 '금액 동일 + (이름유사 or 번호오타)'로 페어링 ──
+    typeB = []
+    used_d = set()
+    for pch in sorted(p_only):
+        p = P[pch]
+        best, best_score = None, -1
+        for dch in sorted(d_only):
+            if dch in used_d:
+                continue
+            d = D[dch]
+            if p["amt"] != d["amt"]:
+                continue
+            ns = _verif_name_sim(p["name"], d["name"])
+            ts = _verif_chart_typo_loose(pch, dch)
+            if not (ns or ts):
+                continue
+            score = (2 if ns else 0) + (1 if _verif_chart_typo_adjacent(pch, dch) else 0)
+            if score > best_score:
+                best_score, best = score, dch
+        if best is not None:
+            used_d.add(best)
+            d = D[best]
+            adj = _verif_chart_typo_adjacent(pch, best)
+            cause = ("일일마감 차트번호 수기오류(인접 자릿수 오타)" if adj
+                     else "일일마감 차트번호 수기오류(차트번호 상이(이름·금액 동일))")
+            typeB.append({
+                "지점": branch, "날짜": date, "성명": p["name"] or d["name"],
+                "차트마감_차트번호": pch, "일일마감_차트번호": best,
+                "차트금액": p["amt"], "일마금액": d["amt"],
+                "금액일치": "일치" if p["amt"] == d["amt"] else "불일치",
+                "이름일치": "일치" if _verif_name_sim(p["name"], d["name"]) else "불일치",
+                "추정원인": cause,
+            })
+    paired_p = {r["차트마감_차트번호"] for r in typeB}
+
+    # ── 유형C1: 페어링되지 않은 한쪽만 존재 ──
+    typeC1 = []
+    for pch in sorted(p_only - paired_p):
+        p = P[pch]
+        typeC1.append({"지점": branch, "날짜": date, "구분": "차트마감에만 존재",
+                       "차트번호": pch, "성명": p["name"], "금액": p["amt"], "결제수단": p["methods"]})
+    for dch in sorted(d_only - used_d):
+        d = D[dch]
+        typeC1.append({"지점": branch, "날짜": date, "구분": "일일마감에만 존재",
+                       "차트번호": dch, "성명": d["name"], "금액": d["amt"], "결제수단": d["methods"]})
+
+    # ── 유형C2: 동일 차트번호인데 금액 불일치 ──
+    typeC2 = []
+    for ch in sorted(both):
+        p, d = P[ch], D[ch]
+        if p["amt"] != d["amt"]:
+            typeC2.append({"지점": branch, "날짜": date, "차트번호": ch,
+                           "성명": p["name"] or d["name"],
+                           "차트금액": p["amt"], "일마금액": d["amt"], "차이": d["amt"] - p["amt"],
+                           "차트결제수단": p["methods"], "일마결제수단": d["methods"]})
+
+    colsB = ["지점", "날짜", "성명", "차트마감_차트번호", "일일마감_차트번호",
+             "차트금액", "일마금액", "금액일치", "이름일치", "추정원인"]
+    colsC1 = ["지점", "날짜", "구분", "차트번호", "성명", "금액", "결제수단"]
+    colsC2 = ["지점", "날짜", "차트번호", "성명", "차트금액", "일마금액", "차이",
+              "차트결제수단", "일마결제수단"]
+    dfB = pd.DataFrame(typeB, columns=colsB)
+    dfC1 = pd.DataFrame(typeC1, columns=colsC1)
+    dfC2 = pd.DataFrame(typeC2, columns=colsC2)
+    summary = pd.DataFrame([{
+        "지점": branch or "(현재 지점)",
+        "유형B_차트번호오타": len(dfB),
+        "유형C1_한쪽만존재": len(dfC1),
+        "유형C2_금액불일치": len(dfC2),
+    }])
+    return {
+        "요약": summary,
+        "유형B_차트번호오타": dfB,
+        "유형C1_한쪽만존재": dfC1,
+        "유형C2_금액불일치": dfC2,
+    }
+
+
+def build_verification_excel(verif):
+    """검증 결과를 업로드 샘플과 동일한 4시트 엑셀로 출력."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for sheet in ["요약", "유형B_차트번호오타", "유형C1_한쪽만존재", "유형C2_금액불일치"]:
+            verif[sheet].to_excel(w, sheet_name=sheet, index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Gemini API (캐시 + rate limit)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -3418,10 +3655,11 @@ def main():
             st.success("✅ 모든 채널 합계 일치 — 추가 분석 불필요")
 
         # 탭 3개 - 메인 탭은 의심 후보 추적
-        tab1, tab2, tab3 = st.tabs([
+        tab1, tab2, tab3, tab4 = st.tabs([
             "🎯 차이 원인 추적 (★메인)",
             "🔬 1:1 매칭 상세 (보조)",
             "🤖 AI 진단",
+            "🔎 데이터 검증 (오타·누락·불일치)",
         ])
 
         with tab1:
@@ -3640,6 +3878,56 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
                 st.caption("시트: 0_채널대사(★) / 0_3way통합(★) / 0_의심후보 / 1_차트번호별차이 / 2_한솔미매칭 / 3_일마미매칭 / 4_합계")
+
+        with tab4:
+            st.markdown(
+                "**차트마감 ↔ 일일마감을 환자 단위로 자동 대조**해 3가지 오류를 코드로 확정 추출합니다. "
+                "(계산식 기반 — AI 불필요·항상 동일 결과)  \n"
+                "🅑 **차트번호 오타** = 이름·금액 같은데 차트번호만 다름 (일일마감 수기 오타)  \n"
+                "🅒1 **한쪽만 존재** = 차트마감/일일마감 중 한쪽에만 있는 환자  \n"
+                "🅒2 **금액 불일치** = 같은 차트번호인데 수납액이 다름"
+            )
+            verif = build_verification(patient, daily)
+            cB = len(verif["유형B_차트번호오타"])
+            c1 = len(verif["유형C1_한쪽만존재"])
+            c2 = len(verif["유형C2_금액불일치"])
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("🅑 차트번호 오타", cB)
+            mc2.metric("🅒1 한쪽만 존재", c1)
+            mc3.metric("🅒2 금액 불일치", c2)
+
+            if cB + c1 + c2 == 0:
+                st.success(
+                    "✅ 차트번호 오타·누락·금액 불일치 없음 — 차트마감과 일일마감이 환자 단위로 완전 일치합니다."
+                )
+            else:
+                if cB:
+                    st.markdown("#### 🅑 차트번호 오타 (이름·금액 동일, 번호만 상이)")
+                    st.dataframe(
+                        verif["유형B_차트번호오타"].drop(columns=["지점", "날짜"]),
+                        width="stretch", hide_index=True,
+                    )
+                if c1:
+                    st.markdown("#### 🅒1 한쪽만 존재 (한 파일에만 있는 환자)")
+                    st.dataframe(
+                        verif["유형C1_한쪽만존재"].drop(columns=["지점", "날짜"]),
+                        width="stretch", hide_index=True,
+                    )
+                if c2:
+                    st.markdown("#### 🅒2 금액 불일치 (동일 차트번호, 수납액 상이)")
+                    st.dataframe(
+                        verif["유형C2_금액불일치"].drop(columns=["지점", "날짜"]),
+                        width="stretch", hide_index=True,
+                    )
+
+            st.markdown("---")
+            st.download_button(
+                "📥 검증 결과 엑셀 다운로드 (요약 + 유형B / C1 / C2)",
+                data=build_verification_excel(verif),
+                file_name=f"데이터검증_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.caption("시트: 요약 / 유형B_차트번호오타 / 유형C1_한쪽만존재 / 유형C2_금액불일치 (업로드 샘플과 동일 형식)")
 
 
 if __name__ == "__main__":
