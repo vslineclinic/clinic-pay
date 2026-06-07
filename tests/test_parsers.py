@@ -211,6 +211,36 @@ def test_parse_patient_classifies_qr_platforms(app):
     assert cls["400"] == "카드"     # 카드 결제는 영향 없음
 
 
+def test_parse_patient_kanpyeon_cash_receipt_is_platform_not_cash(app):
+    # 베가스 차트마감의 '간편결제(현금영수증)'은 QR 간편결제(큐릭)이므로 '현금영수증'
+    # 글자가 있어도 현금이 아니라 플랫폼으로 분류돼야 한다(일일마감 '간편결제(큐릭)'과 대칭).
+    patient = F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "본부금", "결제메모"],
+        ["100", "리샤", "간편결제(현금영수증)", 4092000, 0, ""],
+        ["200", "이예호", "현금(현금영수증)", 550000, 0, ""],   # 진짜 현금은 현금 유지
+    )
+    p = app.parse_patient(patient)
+    cls = dict(zip(p["차트번호"], p["분류"]))
+    assert cls["100"] == "플랫폼"     # 간편결제 → 플랫폼
+    assert cls["200"] == "현금"       # 일반 현금영수증 → 현금
+
+
+def test_parse_daily_counts_kanpyeon_babitalk_doctornow(app):
+    # 강남형: 간편결제(큐릭)/바비톡/닥터나우도 플랫폼합·총액에 집계돼야 한다.
+    daily = F.table_raw(
+        ["내원순서", "차트번호", "성명", "카드", "간편결제(큐릭)", "바비톡", "닥터나우"],
+        [1, "100", "김철수", 10000, 50000, 0, 0],
+        [2, "200", "이영희", 0, 0, 30000, 7000],
+    )
+    d, _ = app.parse_daily(daily)
+    assert int(d["간편결제"].sum()) == 50000
+    assert int(d["바비톡"].sum()) == 30000
+    assert int(d["닥터나우"].sum()) == 7000
+    # 플랫폼합 = 50000 + 30000 + 7000 = 87000, 총액 = 카드10000 + 87000 = 97000
+    assert int(d["플랫폼합"].sum()) == 87000
+    assert int(d["총액"].sum()) == 97000
+
+
 def test_parse_patient_cancellation_makes_amount_negative(app):
     patient = F.table_raw(
         ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
