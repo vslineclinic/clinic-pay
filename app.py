@@ -16,6 +16,7 @@
 import importlib
 import io
 import re
+import unicodedata
 from datetime import datetime
 from itertools import combinations
 
@@ -92,7 +93,10 @@ def clean_money(x):
 def clean_no(x):
     if pd.isna(x) or str(x).strip() in ("", "nan", "NaN"):
         return ""
-    return re.sub(r"\D", "", str(x).split(".")[0])
+    # NFKC: 전각숫자(１５６０…) → 반각. 차트 결제메모에 승인번호를 전각으로 입력한
+    # 경우 한솔 승인번호(반각)와 문자열이 달라 매칭이 조용히 실패하던 문제 방지.
+    s = unicodedata.normalize("NFKC", str(x))
+    return re.sub(r"\D", "", s.split(".")[0])
 
 
 def clean_name(x):
@@ -3316,41 +3320,76 @@ def _verif_aggregate_patient(patient):
     return out
 
 
-def _verif_aggregate_daily(daily):
-    """일일마감을 차트번호 단위로 집계: {차트번호: {name, amt, methods}}."""
+def _verif_aggregate_daily(daily, daily_refund=None):
+    """일일마감을 차트번호 단위로 집계: {차트번호: {name, amt, methods}}.
+
+    daily_refund(환불/취소 행)를 주면 같은 차트번호에서 차감해 net으로 비교한다.
+    차트마감은 환불을 음수 행으로 합산하므로, 일마 쪽도 환불을 빼야 '당일 결제 후
+    당일 환불'(net 0) 환자가 가짜 금액불일치(유형C2)로 잡히지 않는다.
+    """
     out = {}
-    if daily is None or daily.empty or "차트번호" not in daily.columns:
+    has_daily = daily is not None and not daily.empty and "차트번호" in daily.columns
+    has_refund = (daily_refund is not None and not daily_refund.empty
+                  and "차트번호" in daily_refund.columns)
+    if not has_daily and not has_refund:
         return out
-    df = daily.copy()
-    df["차트번호"] = df["차트번호"].astype(str).str.strip()
-    df = df[df["차트번호"] != ""]
-    name_col = "성명" if "성명" in df.columns else ("이름" if "이름" in df.columns else None)
-    for ch, g in df.groupby("차트번호"):
-        name = ""
-        if name_col:
-            for n in g[name_col].astype(str):
-                t = n.strip()
-                if t and t.lower() != "nan":
-                    name = t
-                    break
-        amt = int(g["총액"].sum()) if "총액" in g.columns else 0
-        meth = {}
-        for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
-            if col in g.columns:
-                s = int(g[col].sum())
-                if s != 0:
-                    meth[col] = s
+    raw = {}
+    if has_daily:
+        df = daily.copy()
+        df["차트번호"] = df["차트번호"].astype(str).str.strip()
+        df = df[df["차트번호"] != ""]
+        name_col = "성명" if "성명" in df.columns else ("이름" if "이름" in df.columns else None)
+        for ch, g in df.groupby("차트번호"):
+            name = ""
+            if name_col:
+                for n in g[name_col].astype(str):
+                    t = n.strip()
+                    if t and t.lower() != "nan":
+                        name = t
+                        break
+            amt = int(g["총액"].sum()) if "총액" in g.columns else 0
+            meth = {}
+            for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
+                if col in g.columns:
+                    s = int(g[col].sum())
+                    if s != 0:
+                        meth[col] = s
+            raw[ch] = {"name": name, "amt": amt, "meth": meth}
+
+    # 환불 행 차감 (환불 전용 환자는 음수 항목으로 새로 생성 → 차트 음수 행과 대조)
+    if has_refund:
+        rdf = daily_refund.copy()
+        rdf["차트번호"] = rdf["차트번호"].astype(str).str.strip()
+        rdf = rdf[rdf["차트번호"] != ""]
+        r_name_col = "성명" if "성명" in rdf.columns else ("이름" if "이름" in rdf.columns else None)
+        for ch, g in rdf.groupby("차트번호"):
+            ent = raw.setdefault(ch, {"name": "", "amt": 0, "meth": {}})
+            if not ent["name"] and r_name_col:
+                for n in g[r_name_col].astype(str):
+                    t = n.strip()
+                    if t and t.lower() != "nan":
+                        ent["name"] = t
+                        break
+            ent["amt"] -= int(g["총액"].sum()) if "총액" in g.columns else 0
+            for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
+                if col in g.columns:
+                    s = int(g[col].sum())
+                    if s != 0:
+                        ent["meth"][col] = ent["meth"].get(col, 0) - s
+
+    for ch, ent in raw.items():
+        meth = {k: v for k, v in ent["meth"].items() if v != 0}
         if not meth:
             meth["카드"] = 0
-        out[ch] = {"name": name, "amt": amt, "methods": _verif_fmt_methods(meth)}
+        out[ch] = {"name": ent["name"], "amt": ent["amt"], "methods": _verif_fmt_methods(meth)}
     return out
 
 
-def build_verification(patient, daily, branch="", date=""):
+def build_verification(patient, daily, daily_refund=None, branch="", date=""):
     """차트마감↔일일마감 환자단위 대조로 유형B/C1/C2를 추출.
     반환: {'요약', '유형B_차트번호오타', '유형C1_한쪽만존재', '유형C2_금액불일치'} DataFrame dict."""
     P = _verif_aggregate_patient(patient)
-    D = _verif_aggregate_daily(daily)
+    D = _verif_aggregate_daily(daily, daily_refund)
     p_only = set(P) - set(D)
     d_only = set(D) - set(P)
     both = set(P) & set(D)
@@ -3404,6 +3443,9 @@ def build_verification(patient, daily, branch="", date=""):
                        "차트번호": pch, "성명": p["name"], "금액": p["amt"], "결제수단": p["methods"]})
     for dch in sorted(d_only - used_d):
         d = D[dch]
+        # 결제+환불 net 0 (또는 특이사항 0원) 건은 차트에 흔적이 없어도 정상
+        if d["amt"] == 0:
+            continue
         typeC1.append({"지점": branch, "날짜": date, "구분": "일일마감에만 존재",
                        "차트번호": dch, "성명": d["name"], "금액": d["amt"], "결제수단": d["methods"]})
 
@@ -4124,7 +4166,7 @@ def main():
 
         # 탭 3개 - 메인 탭은 의심 후보 추적
         # 검증 결과는 tab3(AI 진단 입력)·tab4(검증 표) 양쪽에서 쓰므로 한 번만 계산
-        verif = build_verification(patient, daily)
+        verif = build_verification(patient, daily, daily_refund)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "🎯 차이 원인 추적 (★메인)",
