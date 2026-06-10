@@ -16,6 +16,7 @@
 import importlib
 import io
 import re
+import unicodedata
 from datetime import datetime
 from itertools import combinations
 
@@ -92,7 +93,10 @@ def clean_money(x):
 def clean_no(x):
     if pd.isna(x) or str(x).strip() in ("", "nan", "NaN"):
         return ""
-    return re.sub(r"\D", "", str(x).split(".")[0])
+    # NFKC: 전각숫자(１５６０…) → 반각. 차트 결제메모에 승인번호를 전각으로 입력한
+    # 경우 한솔 승인번호(반각)와 문자열이 달라 매칭이 조용히 실패하던 문제 방지.
+    s = unicodedata.normalize("NFKC", str(x))
+    return re.sub(r"\D", "", s.split(".")[0])
 
 
 def clean_name(x):
@@ -132,6 +136,36 @@ def _parse_clock(val):
         return 0, ""
     ss = ss if 0 <= ss <= 59 else 0
     return hh * 60 + mm, f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def norm_date(val):
+    """날짜 값을 'YYYY-MM-DD'로 정규화. 실패하면 "".
+
+    차트마감 수납일 '2026-06-10(수)', 한솔 거래일 '260610'(YYMMDD 숫자),
+    '2026.06.10' / '26-06-10' / datetime 혼용을 모두 처리한다.
+    """
+    if pd.isna(val):
+        return ""
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return f"{val:%Y-%m-%d}"
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    m = re.search(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        # YYMMDD 6자리 (엑셀이 숫자로 저장한 '260610.0' 포함)
+        m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{2})(?!\d)", s.split(".")[0])
+        if not m:
+            # YY.MM.DD 구분자형
+            m = re.search(r"(?<!\d)(\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})(?!\d)", s)
+        if not m:
+            return ""
+        y, mo, d = 2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= mo <= 12 and 1 <= d <= 31):
+        return ""
+    return f"{y:04d}-{mo:02d}-{d:02d}"
 
 
 def _extract_card_company(pay_str):
@@ -667,6 +701,12 @@ def parse_hansol(raw):
         df["시간_분"] = parsed.apply(lambda x: x[0])
         df["시간표시"] = parsed.apply(lambda x: x[1])
 
+    # 거래일 → 날짜(YYYY-MM-DD). 다일(월간) 파일을 일자별로 대사하기 위한 키.
+    df["날짜"] = ""
+    dcol = next((c for c in ["거래일", "거래일자", "승인일자", "거래날짜"] if c in df.columns), None)
+    if dcol:
+        df["날짜"] = df[dcol].apply(norm_date)
+
     # 거래상태 분류
     scol = next((c for c in ["거래상태", "상태"] if c in df.columns), None)
     df["tx_status"] = "정상"
@@ -1098,6 +1138,14 @@ def parse_patient(raw):
     df["차트번호"] = df["차트번호"].apply(clean_no) if "차트번호" in df.columns else ""
     df["이름"] = df["이름"].apply(clean_name) if "이름" in df.columns else ""
 
+    # 날짜(YYYY-MM-DD): 반드시 '수납일' 기준 — 한솔 거래일·일일마감과 같은 축.
+    # (진료일은 수납일과 다를 수 있어[외상·선결제] 대사 키로 쓰면 안 된다.)
+    df["날짜"] = ""
+    if "수납일" in df.columns:
+        df["날짜"] = df.loc[:, "수납일"].pipe(
+            lambda s: (s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s)
+        ).apply(norm_date)
+
     amt_cols = [c for c in ["비급여(과세총금액)", "비급여(비과세)"] if c in df.columns]
     copay_cols = [c for c in df.columns if ("본부금" in str(c) or "본인부담" in str(c)) and "환불" not in str(c)]
     all_amt_cols = amt_cols + copay_cols
@@ -1170,18 +1218,22 @@ def parse_patient(raw):
            & ~cancel_norm.str.contains("카드", na=False))
     ) & ~kanpyeon_mask
     transfer_mask = (
-        pay_norm.isin(["통장", "통장입금"])
+        # '통장'은 부분일치로 잡는다: '결제취소-통장'/'환불-통장'(통장으로 환불)이
+        # isin 완전일치에 걸리지 않아 '기타'로 새던 문제 수정(인천 5/11 -599,000 등).
+        pay_norm.str.contains("통장", na=False)
         | pay_norm.str.contains("이체", na=False)
         | pay_norm.str.contains("계좌", na=False)
         | pay_norm.str.contains("입금", na=False)
-        | pay_norm.str.contains("무통장", na=False)
-        | (df["is_취소"] & cancel_norm.str.contains("이체|계좌|입금", na=False)
+        | (df["is_취소"] & cancel_norm.str.contains("이체|계좌|입금|통장", na=False)
            & ~cancel_norm.str.contains("카드|현금", na=False))
     )
     # 차트마감(베가스)은 플랫폼을 보통 '기타-…'로 적지만, 알리페이/위챗페이/카카오페이는
     # 접두 없이 그대로 적힐 수 있어 이름으로도 플랫폼으로 잡는다(일일마감 집계와 대칭 유지).
     platform_mask = (
         pay_norm.str.startswith("기타", na=False)
+        # '환불-기타'(기타(여신 등) 결제의 환불)도 플랫폼으로: 양(+)의 '기타(기타)'가
+        # 플랫폼으로 집계되므로 그 환불도 대칭으로 플랫폼에서 차감돼야 한다.
+        | (df["is_취소"] & pay_norm.str.contains("기타", na=False))
         | pay_norm.str.contains("알리페이|위챗페이|위쳇페이|카카오페이", na=False)
         | kanpyeon_mask
     )
@@ -1226,9 +1278,13 @@ def parse_patient(raw):
         parsed = memo.apply(_parse_memo)
         df["승인번호목록"] = parsed.apply(lambda x: x[0])
         df["플랫폼구분"] = parsed.apply(lambda x: x[1])
-        # 플랫폼 키워드가 감지된 행 → 분류를 "플랫폼"으로 변경
-        plat_mask = df["플랫폼구분"] != ""
+        # 플랫폼 키워드가 감지된 행 → 분류를 "플랫폼"으로 변경.
+        # 단, 결제수단이 명시적으로 '카드'인 행(예: '환불-카드' + 메모 "카드 취소 후
+        # 여신앱으로 변경")은 카드 단말(한솔)을 거친 거래이므로 카드 분류를 유지한다
+        # — 메모는 결제수단 '변경 경위'를 적은 것일 뿐이다(엔디어트 5/26 -198,000 사례).
+        plat_mask = (df["플랫폼구분"] != "") & (df["분류"] != "카드")
         df.loc[plat_mask, "분류"] = "플랫폼"
+        df.loc[(df["플랫폼구분"] != "") & (df["분류"] == "카드"), "플랫폼구분"] = ""
 
     df["p_idx"] = range(len(df))
     return df
@@ -2046,6 +2102,120 @@ def compute_channel_recon(totals):
         },
     ]
     return pd.DataFrame(rows)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ★ 기간(다일) 대사: 한솔(거래일) ↔ 차트마감(수납일) 일자별 합계 비교
+#   월 단위 파일 2개만으로 어느 날에 오류가 있는지 즉시 표시하고,
+#   차이가 있는 날만 승인번호·금액 매칭으로 원인 거래를 추출한다.
+#   ※ 기준 축은 차트마감의 '수납일'(진료일 아님) = 한솔 '거래일'.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def _hansol_day_net(h_day, cash):
+    """해당일 한솔 순매출(정상 - 취소). cash=True면 현금영수증, False면 카드."""
+    sel = h_day[h_day["is_현금"] == cash] if "is_현금" in h_day.columns else h_day
+    ok = int(sel[sel["tx_status"] == "정상"]["금액"].sum())
+    cancel = int(sel[sel["tx_status"] == "취소"]["금액"].sum())
+    return ok - cancel
+
+
+def _patient_day_net(p_day, cats):
+    """해당일 차트 분류(cats) 순수납액(일반 - |환불|)."""
+    sel = p_day[p_day["분류"].isin(cats)]
+    normal = int(sel[~sel["is_취소"]]["금액"].sum())
+    cancel = abs(int(sel[sel["is_취소"]]["금액"].sum()))
+    return normal - cancel
+
+
+def compute_period_recon(hansol, patient):
+    """일자별 한솔↔차트 대사표 DataFrame.
+
+    컬럼: 날짜 / 한솔카드 / 차트카드 / 카드차이 / 한솔현금영수증 / 차트현금+이체 /
+          현금차이 / 차트플랫폼 / 건수(한솔·차트)
+    카드차이 = 한솔카드 - 차트카드, 현금차이 = 한솔현금영수증 - 차트(현금+이체).
+    한솔 현금영수증은 현금·이체 중 영수증 발행분만 잡히므로 현금차이는 참고 지표
+    (영수증 미발행 현금이 있는 지점은 차트가 더 클 수 있음).
+    """
+    h = hansol if (hansol is not None and not hansol.empty and "날짜" in hansol.columns) else pd.DataFrame()
+    p = patient if (patient is not None and not patient.empty and "날짜" in patient.columns) else pd.DataFrame()
+    h_days = set(h["날짜"][h["날짜"] != ""]) if not h.empty else set()
+    p_days = set(p["날짜"][p["날짜"] != ""]) if not p.empty else set()
+    rows = []
+    for day in sorted(h_days | p_days):
+        h_day = h[h["날짜"] == day] if not h.empty else pd.DataFrame(columns=h.columns if not h.empty else [])
+        p_day = p[p["날짜"] == day] if not p.empty else pd.DataFrame(columns=p.columns if not p.empty else [])
+        h_card = _hansol_day_net(h_day, cash=False) if not h_day.empty else 0
+        h_cash = _hansol_day_net(h_day, cash=True) if not h_day.empty else 0
+        p_card = _patient_day_net(p_day, ["카드"]) if not p_day.empty else 0
+        p_cashx = _patient_day_net(p_day, ["현금", "이체"]) if not p_day.empty else 0
+        p_plat = _patient_day_net(p_day, ["플랫폼"]) if not p_day.empty else 0
+        rows.append({
+            "날짜": day,
+            "한솔카드": h_card, "차트카드": p_card, "카드차이": h_card - p_card,
+            "한솔현금영수증": h_cash, "차트현금+이체": p_cashx, "현금차이": h_cash - p_cashx,
+            "차트플랫폼": p_plat,
+            "한솔건수": int(len(h_day)), "차트건수": int(len(p_day)),
+        })
+    return pd.DataFrame(rows)
+
+
+def find_period_day_detail(hansol, patient, day):
+    """차이가 있는 날의 원인 거래 추출: (미매칭 한솔 DF, 미매칭 차트 DF).
+
+    1차: 차트 결제메모 승인번호 ↔ 한솔 승인번호 (카드·현금영수증 공통)
+    2차: 동일 승인번호의 한솔 정상+취소 쌍(매출 후 당일취소 → net 0) 상쇄
+    3차: 잔여 건 금액 유일 매칭(차트 |금액| = 한솔 금액, 취소↔환불 방향 일치)
+    남는 건만 사람이 보면 된다(보통 0~3건).
+    """
+    h_day = hansol[(hansol["날짜"] == day) & (hansol["tx_status"].isin(["정상", "취소"]))].copy()
+    # 플랫폼은 한솔을 거치지 않으므로 제외. '기타'는 분류 실패(=오류 후보)라 포함.
+    p_day = patient[(patient["날짜"] == day)
+                    & (patient["분류"].isin(["카드", "현금", "이체", "기타"]))].copy()
+
+    # 1차: 승인번호 매칭
+    h_by_appr = {}
+    if "승인번호" in h_day.columns:
+        for _, hr in h_day.iterrows():
+            a = clean_no(hr.get("승인번호", ""))
+            if a:
+                h_by_appr.setdefault(a, []).append(hr["h_idx"])
+    matched_h, matched_p = set(), set()
+    for pi, pr in p_day.iterrows():
+        for a in pr.get("승인번호목록", []):
+            a = clean_no(a)
+            if a in h_by_appr:
+                matched_h.update(h_by_appr[a])
+                matched_p.add(pi)
+
+    un_h = h_day[~h_day["h_idx"].isin(matched_h)]
+    # 2차: 동일 승인번호 정상+취소 쌍 상쇄 (당일 결제 후 당일 취소 → 차트에 흔적 없음이 정상)
+    if "승인번호" in un_h.columns:
+        appr_status = un_h.groupby(un_h["승인번호"].apply(clean_no))["tx_status"].agg(set)
+        self_cancel = {a for a, sts in appr_status.items() if a and {"정상", "취소"} <= sts}
+        if self_cancel:
+            paired = un_h[un_h["승인번호"].apply(clean_no).isin(self_cancel)]
+            matched_h.update(paired["h_idx"].tolist())
+            un_h = h_day[~h_day["h_idx"].isin(matched_h)]
+    un_p = p_day[~p_day.index.isin(matched_p)]
+
+    # 3차: 금액 유일 매칭 (방향 일치: 한솔 정상↔차트 일반, 한솔 취소↔차트 환불)
+    for pi, pr in un_p.iterrows():
+        amt = abs(int(pr["금액"]))
+        want_cancel = bool(pr["is_취소"])
+        cand = un_h[(un_h["금액"] == amt)
+                    & (un_h["tx_status"] == ("취소" if want_cancel else "정상"))]
+        if len(cand) == 1:
+            matched_h.add(cand.iloc[0]["h_idx"])
+            matched_p.add(pi)
+            un_h = h_day[~h_day["h_idx"].isin(matched_h)]
+    un_p = p_day[~p_day.index.isin(matched_p)]
+
+    h_cols = [c for c in ["날짜", "시간표시", "매입사", "카드사", "금액", "승인번호",
+                          "tx_status", "is_현금", "카드번호"] if c in un_h.columns]
+    p_cols = [c for c in ["날짜", "차트번호", "이름", "결제수단", "분류", "금액",
+                          "is_취소", "결제메모", "수납자"] if c in un_p.columns]
+    return un_h[h_cols].reset_index(drop=True), un_p[p_cols].reset_index(drop=True)
 
 
 def _rank_key(amt, channel_gap):
@@ -3150,41 +3320,76 @@ def _verif_aggregate_patient(patient):
     return out
 
 
-def _verif_aggregate_daily(daily):
-    """일일마감을 차트번호 단위로 집계: {차트번호: {name, amt, methods}}."""
+def _verif_aggregate_daily(daily, daily_refund=None):
+    """일일마감을 차트번호 단위로 집계: {차트번호: {name, amt, methods}}.
+
+    daily_refund(환불/취소 행)를 주면 같은 차트번호에서 차감해 net으로 비교한다.
+    차트마감은 환불을 음수 행으로 합산하므로, 일마 쪽도 환불을 빼야 '당일 결제 후
+    당일 환불'(net 0) 환자가 가짜 금액불일치(유형C2)로 잡히지 않는다.
+    """
     out = {}
-    if daily is None or daily.empty or "차트번호" not in daily.columns:
+    has_daily = daily is not None and not daily.empty and "차트번호" in daily.columns
+    has_refund = (daily_refund is not None and not daily_refund.empty
+                  and "차트번호" in daily_refund.columns)
+    if not has_daily and not has_refund:
         return out
-    df = daily.copy()
-    df["차트번호"] = df["차트번호"].astype(str).str.strip()
-    df = df[df["차트번호"] != ""]
-    name_col = "성명" if "성명" in df.columns else ("이름" if "이름" in df.columns else None)
-    for ch, g in df.groupby("차트번호"):
-        name = ""
-        if name_col:
-            for n in g[name_col].astype(str):
-                t = n.strip()
-                if t and t.lower() != "nan":
-                    name = t
-                    break
-        amt = int(g["총액"].sum()) if "총액" in g.columns else 0
-        meth = {}
-        for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
-            if col in g.columns:
-                s = int(g[col].sum())
-                if s != 0:
-                    meth[col] = s
+    raw = {}
+    if has_daily:
+        df = daily.copy()
+        df["차트번호"] = df["차트번호"].astype(str).str.strip()
+        df = df[df["차트번호"] != ""]
+        name_col = "성명" if "성명" in df.columns else ("이름" if "이름" in df.columns else None)
+        for ch, g in df.groupby("차트번호"):
+            name = ""
+            if name_col:
+                for n in g[name_col].astype(str):
+                    t = n.strip()
+                    if t and t.lower() != "nan":
+                        name = t
+                        break
+            amt = int(g["총액"].sum()) if "총액" in g.columns else 0
+            meth = {}
+            for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
+                if col in g.columns:
+                    s = int(g[col].sum())
+                    if s != 0:
+                        meth[col] = s
+            raw[ch] = {"name": name, "amt": amt, "meth": meth}
+
+    # 환불 행 차감 (환불 전용 환자는 음수 항목으로 새로 생성 → 차트 음수 행과 대조)
+    if has_refund:
+        rdf = daily_refund.copy()
+        rdf["차트번호"] = rdf["차트번호"].astype(str).str.strip()
+        rdf = rdf[rdf["차트번호"] != ""]
+        r_name_col = "성명" if "성명" in rdf.columns else ("이름" if "이름" in rdf.columns else None)
+        for ch, g in rdf.groupby("차트번호"):
+            ent = raw.setdefault(ch, {"name": "", "amt": 0, "meth": {}})
+            if not ent["name"] and r_name_col:
+                for n in g[r_name_col].astype(str):
+                    t = n.strip()
+                    if t and t.lower() != "nan":
+                        ent["name"] = t
+                        break
+            ent["amt"] -= int(g["총액"].sum()) if "총액" in g.columns else 0
+            for col in ["카드", "현금", "이체"] + _DAILY_PLAT_COLS:
+                if col in g.columns:
+                    s = int(g[col].sum())
+                    if s != 0:
+                        ent["meth"][col] = ent["meth"].get(col, 0) - s
+
+    for ch, ent in raw.items():
+        meth = {k: v for k, v in ent["meth"].items() if v != 0}
         if not meth:
             meth["카드"] = 0
-        out[ch] = {"name": name, "amt": amt, "methods": _verif_fmt_methods(meth)}
+        out[ch] = {"name": ent["name"], "amt": ent["amt"], "methods": _verif_fmt_methods(meth)}
     return out
 
 
-def build_verification(patient, daily, branch="", date=""):
+def build_verification(patient, daily, daily_refund=None, branch="", date=""):
     """차트마감↔일일마감 환자단위 대조로 유형B/C1/C2를 추출.
     반환: {'요약', '유형B_차트번호오타', '유형C1_한쪽만존재', '유형C2_금액불일치'} DataFrame dict."""
     P = _verif_aggregate_patient(patient)
-    D = _verif_aggregate_daily(daily)
+    D = _verif_aggregate_daily(daily, daily_refund)
     p_only = set(P) - set(D)
     d_only = set(D) - set(P)
     both = set(P) & set(D)
@@ -3238,6 +3443,9 @@ def build_verification(patient, daily, branch="", date=""):
                        "차트번호": pch, "성명": p["name"], "금액": p["amt"], "결제수단": p["methods"]})
     for dch in sorted(d_only - used_d):
         d = D[dch]
+        # 결제+환불 net 0 (또는 특이사항 0원) 건은 차트에 흔적이 없어도 정상
+        if d["amt"] == 0:
+            continue
         typeC1.append({"지점": branch, "날짜": date, "구분": "일일마감에만 존재",
                        "차트번호": dch, "성명": d["name"], "금액": d["amt"], "결제수단": d["methods"]})
 
@@ -3423,6 +3631,200 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def filter_to_single_date(patient, hansol, daily, picked_date=None):
+    """하루 대사 모드에서 다일(월간) 파일을 분석 날짜 하루로 좁힌다.
+
+    반환: (patient, hansol, note, error). error가 비어 있지 않으면 분석을 중단해야 한다.
+    날짜 결정 우선순위:
+      ① 구글시트 연동에서 고른 날짜
+      ② 차트마감 수납일이 하루뿐이면 그 날
+      ③ (파일 업로드 일마) 일일마감 차트번호와 겹침이 가장 큰 수납일
+    ※ 차트마감은 반드시 '수납일' 기준(진료일은 외상·선결제로 어긋날 수 있음).
+    """
+    note = ""
+    p_days = sorted(set(patient["날짜"]) - {""}) if "날짜" in patient.columns else []
+    target = f"{picked_date:%Y-%m-%d}" if picked_date is not None else ""
+
+    if len(p_days) > 1:
+        if not target:
+            d_charts = {c for c in daily["차트번호"].astype(str)} if "차트번호" in daily.columns else set()
+            d_charts -= {"", "nan"}
+            if not d_charts:
+                return patient, hansol, "", (
+                    f"차트마감 파일이 여러 날({len(p_days)}일: {p_days[0]}~{p_days[-1]})을 담고 있는데 "
+                    "일일마감에 차트번호가 없어 분석 날짜를 정할 수 없습니다. "
+                    "해당 날짜 하루치 차트마감을 올리거나, '기간 대사' 모드를 사용하세요."
+                )
+            best, best_n = "", 0
+            for d in p_days:
+                n = len(d_charts & set(patient.loc[patient["날짜"] == d, "차트번호"].astype(str)))
+                if n > best_n:
+                    best, best_n = d, n
+            if not best:
+                return patient, hansol, "", (
+                    "차트마감의 어느 수납일도 일일마감 환자와 겹치지 않습니다. "
+                    "다른 지점/기간 파일이 아닌지 확인하세요."
+                )
+            target = best
+            note = (f"차트마감이 {len(p_days)}일치 파일이어서, 일일마감과 환자(차트번호) "
+                    f"겹침이 가장 큰 **{target}** 수납일만 분석했습니다.")
+        if target not in p_days:
+            return patient, hansol, "", (
+                f"차트마감에 {target} 수납일 데이터가 없습니다 "
+                f"(파일 범위: {p_days[0]} ~ {p_days[-1]})."
+            )
+        patient = patient[patient["날짜"] == target].reset_index(drop=True)
+        if not note:
+            note = f"차트마감 {len(p_days)}일치 중 **{target}** 수납일만 분석했습니다."
+    elif len(p_days) == 1 and not target:
+        target = p_days[0]
+
+    # 한솔도 다일 파일이면 같은 날짜의 거래만 사용
+    if hansol is not None and not hansol.empty and "날짜" in hansol.columns and target:
+        h_days = sorted(set(hansol["날짜"]) - {""})
+        if len(h_days) > 1:
+            if target not in h_days:
+                return patient, hansol, "", (
+                    f"한솔페이 파일에 {target} 거래가 없습니다 "
+                    f"(파일 범위: {h_days[0]} ~ {h_days[-1]})."
+                )
+            hansol = hansol[hansol["날짜"] == target].reset_index(drop=True)
+            note = (note + "  \n" if note else "") + \
+                f"한솔페이 {len(h_days)}일치 중 **{target}** 거래만 사용했습니다."
+    return patient, hansol, note, ""
+
+
+def _fmt_period_amt(v):
+    try:
+        return f"{int(v):,}"
+    except Exception:
+        return "-"
+
+
+def _render_period_results():
+    ss = st.session_state
+    if st.button("🔄 새 파일로 다시"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+    table = ss["per_table"]
+    hansol, patient = ss["per_hansol"], ss["per_patient"]
+    bad_card = table[table["카드차이"] != 0]
+    bad_cash = table[table["현금차이"] != 0]
+    bad_days = sorted(set(bad_card["날짜"]) | set(bad_cash["날짜"]))
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("기간", f"{table['날짜'].min()} ~ {table['날짜'].max()}", f"{len(table)}일")
+    k2.metric("카드 차이 발생일", f"{len(bad_card)}일", delta_color="inverse")
+    k3.metric("현금 차이 발생일", f"{len(bad_cash)}일", delta_color="inverse")
+    k4.metric("카드 차이 합계", f"{int(table['카드차이'].abs().sum()):,}원", delta_color="inverse")
+
+    st.markdown("### 📅 일자별 대사표 (한솔 거래일 ↔ 차트 수납일)")
+    st.caption("차이 0원 = 완전 일치. **현금차이**는 한솔 현금영수증 발행분과의 비교이므로 "
+               "영수증 미발행 현금이 있으면 차트가 더 클 수 있습니다(참고 지표).")
+
+    RED = "background-color: #ffcccc; color: #8b0000; font-weight: 700"
+    ORANGE = "background-color: #ffe6cc; color: #8b4500; font-weight: 700"
+
+    def _style_row(row):
+        styles = [""] * len(row)
+        cols = row.index.tolist()
+        for i, c in enumerate(cols):
+            if c == "카드차이" and int(row[c]) != 0:
+                styles[i] = RED
+            elif c == "현금차이" and int(row[c]) != 0:
+                styles[i] = ORANGE
+        return styles
+
+    amt_cols = [c for c in table.columns if c not in ("날짜", "한솔건수", "차트건수")]
+    total_row = {"날짜": "합계", **{c: int(table[c].sum()) for c in table.columns if c != "날짜"}}
+    disp = pd.concat([table, pd.DataFrame([total_row])], ignore_index=True)
+    styler = disp.style.format({c: _fmt_period_amt for c in amt_cols}).apply(_style_row, axis=1)
+    st.dataframe(styler, width="stretch", hide_index=True, height=min(40 + 36 * len(disp), 1000))
+
+    st.download_button(
+        "⬇️ 일자별 대사표 CSV",
+        disp.to_csv(index=False).encode("utf-8-sig"),
+        file_name="기간대사표.csv", mime="text/csv",
+    )
+
+    if not bad_days:
+        st.success("✅ 전 기간 카드·현금 합계 일치 — 추가 확인이 필요한 날이 없습니다.")
+        return
+
+    st.markdown("### 🎯 차이 원인 거래 (차이 발생일만)")
+    sel_day = st.selectbox("확인할 날짜", bad_days, key="per_day")
+    un_h, un_p = find_period_day_detail(hansol, patient, sel_day)
+    row = table[table["날짜"] == sel_day].iloc[0]
+    st.caption(f"{sel_day} — 카드차이 **{int(row['카드차이']):,}원** · "
+               f"현금차이 **{int(row['현금차이']):,}원** "
+               "(아래는 승인번호·금액으로 설명되지 않는 거래만 추린 것)")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**한솔 측 미설명 거래** ({len(un_h)}건)")
+        if un_h.empty:
+            st.info("없음")
+        else:
+            st.dataframe(un_h, width="stretch", hide_index=True)
+    with c2:
+        st.markdown(f"**차트 측 미설명 수납** ({len(un_p)}건)")
+        if un_p.empty:
+            st.info("없음")
+        else:
+            st.dataframe(un_p, width="stretch", hide_index=True)
+    st.caption("💡 한솔에만 있으면 차트 기록 누락(또는 카드사 직접 상계), 차트에만 있으면 "
+               "한솔 미경유 결제(타 단말·플랫폼) 또는 오입력일 가능성이 큽니다. "
+               "결제메모에 경위가 적힌 경우가 많으니 함께 확인하세요.")
+
+
+def _period_mode_ui():
+    st.markdown("### 📅 기간 대사 — 한솔페이 ↔ 차트마감 (여러 날 파일)")
+    st.caption("월(기간) 단위로 내려받은 한솔 거래내역과 차트마감(수납) 파일 2개를 "
+               "일자별로 자동 대사해 **오류가 있는 날만** 짚어줍니다. "
+               "차트마감은 **수납일** 기준으로 집계합니다(진료일 아님). 일일마감은 필요 없습니다.")
+    c1, c2 = st.columns(2)
+    with c1:
+        f_h = st.file_uploader("한솔페이 거래내역 (필수)", key="per_h_file", help="CSV·XLSX·XLS·XLSB")
+        h_pw = st.text_input("비밀번호(선택)", type="password", key="per_h_pw")
+    with c2:
+        f_p = st.file_uploader("차트마감 — 수납 (필수)", key="per_p_file", help="CSV·XLSX·XLS·XLSB")
+        p_pw = st.text_input("비밀번호(선택)", type="password", key="per_p_pw",
+                             help="베가스에서 설정한 비밀번호")
+
+    if f_h and f_p:
+        if st.button("🚀 기간 대사 시작", type="primary", width="stretch"):
+            with st.spinner("기간 대사 중..."):
+                try:
+                    hansol = parse_hansol(load_file(f_h, password=h_pw))
+                    patient = parse_patient(load_file(f_p, password=p_pw))
+                except Exception as e:
+                    st.error(f"데이터 로딩 실패: {e}")
+                    st.stop()
+                if hansol.empty:
+                    st.error("한솔페이 파일에서 유효한 거래를 읽지 못했습니다.")
+                    st.stop()
+                if patient.empty:
+                    st.error("차트마감 파일을 읽지 못했습니다.")
+                    st.stop()
+                if (hansol["날짜"] == "").all():
+                    st.error("한솔페이 파일에서 거래일을 찾지 못했습니다. '거래일' 컬럼이 있는 "
+                             "거래내역 파일인지 확인하세요.")
+                    st.stop()
+                if (patient["날짜"] == "").all():
+                    st.error("차트마감 파일에서 수납일을 찾지 못했습니다. '수납' 파일로 "
+                             "다운로드했는지 확인하세요.")
+                    st.stop()
+                ss = st.session_state
+                ss["period_done"] = True
+                ss["per_hansol"], ss["per_patient"] = hansol, patient
+                ss["per_table"] = compute_period_recon(hansol, patient)
+            st.rerun()
+    else:
+        st.button("🚀 기간 대사 시작", type="primary", width="stretch", disabled=True)
+        st.info("한솔페이·차트마감 두 파일을 모두 올리면 시작할 수 있습니다.")
+
+
 def main():
     st.set_page_config(page_title="정산 3-Way 차이 추적기", layout="wide")
     st.title("📊 BW 컨설팅 AI 정산 분석 시스템")
@@ -3455,7 +3857,21 @@ def main():
   **BW컨설팅 | 이두만 상무 / 정용민 센터장** 문의
             """)
 
+    if st.session_state.get("period_done"):
+        _render_period_results()
+        return
+
     if "done" not in st.session_state:
+        mode = st.radio(
+            "분석 모드",
+            ["하루 정밀 대사 (일마+차트, 한솔 선택)", "기간 대사 (한솔↔차트 · 여러 날)"],
+            horizontal=True, key="analysis_mode",
+            help="기간 대사: 월 단위 한솔·차트마감 파일 2개로 일자별 차이를 한 번에 점검",
+        )
+        if mode.startswith("기간"):
+            _period_mode_ui()
+            return
+
         daily_sheets = get_clinic_daily_sheets()
         c1, c2, c3 = st.columns(3)
         # 업로더에 type=[...] 확장자 필터를 두지 않는다. 모바일 브라우저(삼성 인터넷 등)는
@@ -3541,6 +3957,17 @@ def main():
                             "있으면 자동 인식됩니다)."
                         )
 
+                    # ── 다일(월간) 차트마감/한솔 파일 → 분석 날짜 하루로 자동 필터 ──
+                    # 차트마감은 '수납일' 기준. 월 파일을 그대로 합산하면 합계·매칭이
+                    # 전부 어긋나므로 반드시 하루로 좁힌 뒤 기존 파이프라인을 태운다.
+                    patient, hansol, _date_note, _date_err = filter_to_single_date(
+                        patient, hansol, daily,
+                        gs_date if daily_mode == "구글시트 연동" else None,
+                    )
+                    if _date_err:
+                        st.error("🚫 " + _date_err)
+                        st.stop()
+
                     # ── 교차검증: 차트마감↔일일마감이 같은 지점·날짜인지 확인 ──
                     # 양쪽 차트번호 일치율이 기준 미만이면(='block') 합계·통계를 일절
                     # 표시하지 않고 안내만 노출(타 지점/다른 날짜 엿보기 방지).
@@ -3581,6 +4008,7 @@ def main():
                     ss = st.session_state
                     ss["done"] = True
                     ss["daily_source"] = daily_source
+                    ss["date_filter_note"] = _date_note
                     ss["has_hansol"] = has_hansol
                     ss["hansol"], ss["daily"], ss["patient"] = hansol, daily, patient
                     ss["daily_refund"] = daily_refund
@@ -3627,6 +4055,9 @@ def main():
         _src = ss.get("daily_source")
         if _src:
             st.caption(f"📄 일일마감 원본: {_src}")
+        _date_note = ss.get("date_filter_note")
+        if _date_note:
+            st.info("📅 " + _date_note)
 
         # ── 채널 합계 차이 요약 (★메인) ──
         def _nonzero(v):
@@ -3735,7 +4166,7 @@ def main():
 
         # 탭 3개 - 메인 탭은 의심 후보 추적
         # 검증 결과는 tab3(AI 진단 입력)·tab4(검증 표) 양쪽에서 쓰므로 한 번만 계산
-        verif = build_verification(patient, daily)
+        verif = build_verification(patient, daily, daily_refund)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "🎯 차이 원인 추적 (★메인)",
