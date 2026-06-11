@@ -67,6 +67,43 @@ def test_verification_without_refund_kept_backward_compat(app):
     assert len(verif["유형C2_금액불일치"]) == 1
 
 
+def test_verification_carries_staff_columns(app):
+    """수납자(차트)·담당(일마) 정보가 검증 결과에 실려 '누구를 검토할지' 추적 가능."""
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모", "수납자"],
+        ["100", "김철수", "카드(삼성)", 50000, "", "박직원"],
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체", "담당/결제"],
+        [1, "100", "김철수", "", 55000, 0, 0, "이프론트"],
+    ))
+    verif = app.build_verification(patient, daily, refund)
+    c2 = verif["유형C2_금액불일치"]
+    assert len(c2) == 1
+    r = c2.iloc[0]
+    assert r["차트수납자"] == "박직원" and r["일마담당"] == "이프론트"
+
+
+def test_ai_text_verification_includes_staff(app):
+    """AI 입력의 [데이터검증] 섹션에 담당자(차트/일마)가 인용돼 R10 권고가 가능."""
+    import pandas as pd
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모", "수납자"],
+        ["100", "김철수", "카드(삼성)", 50000, "", "박직원"],
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체", "담당/결제"],
+        [1, "100", "김철수", "", 55000, 0, 0, "이프론트"],
+    ))
+    verif = app.build_verification(patient, daily, refund)
+    totals = app.compute_totals(pd.DataFrame(), daily, refund, patient)
+    channel = app.compute_channel_recon(totals)
+    text = app.build_ai_text(pd.DataFrame(), daily, refund, patient, channel,
+                             None, None, None, {}, totals=totals, verif=verif)
+    assert "[데이터검증" in text
+    assert "박직원/이프론트" in text
+
+
 def test_verification_refund_only_daily_patient(app):
     """일마에 환불만 있는 환자(net 음수)도 차트 음수 행과 대조돼 일치 처리."""
     patient = app.parse_patient(F.table_raw(
