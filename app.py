@@ -2402,21 +2402,32 @@ def _rank_key(amt, channel_gap):
     return (abs(a - g), -a)
 
 
-def _chart_method_pivots(patient, daily):
+def _chart_method_pivots(patient, daily, daily_refund=None):
     """차트번호별 결제수단(카드/현금/이체/플랫폼) 금액을 차트·일마 각각 pivot으로 구축.
 
     빈 차트번호('')는 제외. 분류가 파일마다 다른 경우(예: 차트=현금·일마=카드)도
     누락 없이 비교하기 위해, 결제수단 교집합이 아닌 전 차트번호 합집합 기준으로 사용한다.
 
+    daily_refund(일마 환불/취소 행)를 주면 같은 차트번호에서 차감해 net으로 비교한다.
+    차트마감은 결제취소를 음수 행으로 합산하므로, 일마 쪽도 환불을 빼야 '당일 결제 후
+    당일 환불'(양쪽 net 0) 환자가 허위 차이로 잡히지 않는다 (build_verification과 동일 원칙).
+
     일마(일일마감)에 차트번호 컬럼이 없는 export 형식(성명만 존재)도 있으므로,
     일마 행에 차트번호가 없으면 성명 → 차트(EMR) 이름맵으로 차트번호를 보강 링크한다.
     (동명이인 등 이름이 여러 차트에 매핑되면 모호하므로 링크하지 않고 건너뜀 → 허위 불일치 방지)
+
+    유형B(차트번호 오타) 쌍은 마지막에 병합한다: 차트마감(EMR)은 차트번호가 시스템
+    자동기재라 오입력될 수 없으므로, 한쪽에만 존재하는 번호쌍이 '총액 동일 +
+    (이름유사 or 번호오타)'면 일일마감 쪽 수기오류로 보고 일마 pivot을 차트마감
+    번호로 귀속시킨다 → 금액이 맞는 단순 번호오타는 채널/환자 차이 목록에 잡히지
+    않고 [데이터검증] 유형B(번호 정정 안내)로만 보고된다.
 
     find_channel_suspects / build_ai_text / build_3way_table 공용.
     반환: (p_pivot, d_pivot) — 각 {차트번호: {"카드","현금","이체","플랫폼"}}
     """
     empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
     pp, dp = {}, {}
+    p_names, d_names = {}, {}
     name2chart = {}  # 이름 → {차트번호} (유일할 때만 일마 링크 키로 사용)
     if patient is not None and not patient.empty and "분류" in patient.columns:
         for _, r in patient.iterrows():
@@ -2429,12 +2440,15 @@ def _chart_method_pivots(patient, daily):
                 d[cat] += _safe_int(r.get("금액", 0))
             nm = clean_name(r.get("이름", ""))
             if nm:
+                p_names.setdefault(ch, nm)
                 name2chart.setdefault(nm, set()).add(ch)
     # 이름이 단 하나의 차트번호에만 대응할 때만 일마 보강 링크에 사용
     name2chart_unique = {nm: next(iter(s)) for nm, s in name2chart.items() if len(s) == 1}
 
-    if daily is not None and not daily.empty:
-        for _, r in daily.iterrows():
+    for frame, sign in [(daily, 1), (daily_refund, -1)]:
+        if frame is None or frame.empty:
+            continue
+        for _, r in frame.iterrows():
             ch = clean_no(r.get("차트번호", ""))
             if not ch:
                 # 일마에 차트번호가 없으면 성명으로 차트(EMR) 링크 시도
@@ -2442,11 +2456,63 @@ def _chart_method_pivots(patient, daily):
             if not ch:
                 continue
             d = dp.setdefault(ch, dict(empty))
-            d["카드"] += _safe_int(r.get("카드", 0))
-            d["현금"] += _safe_int(r.get("현금", 0))
-            d["이체"] += _safe_int(r.get("이체", 0))
-            d["플랫폼"] += _safe_int(r.get("플랫폼합", 0))
+            d["카드"] += sign * _safe_int(r.get("카드", 0))
+            d["현금"] += sign * _safe_int(r.get("현금", 0))
+            d["이체"] += sign * _safe_int(r.get("이체", 0))
+            d["플랫폼"] += sign * _safe_int(r.get("플랫폼합", 0))
+            nm = clean_name(r.get("성명", ""))
+            if nm:
+                d_names.setdefault(ch, nm)
+
+    _merge_typeB_pairs_into_pivots(pp, dp, p_names, d_names)
     return pp, dp
+
+
+def _merge_typeB_pairs_into_pivots(pp, dp, p_names, d_names):
+    """유형B(일일마감 차트번호 수기오타) 쌍을 일마 pivot에서 차트마감 번호로 병합.
+
+    build_verification의 유형B 페어링과 동일 조건(총액 동일 + 이름유사 or 번호오타).
+    병합 후 분배까지 같으면 차이 0으로 사라지고, 분배가 다르면 결제수단 불일치로
+    정상 포착된다. 반환: {일일마감기재번호: 차트마감번호}"""
+    p_only = [ch for ch in pp if ch not in dp]
+    d_only = [ch for ch in dp if ch not in pp]
+    remap = {}
+    used = set()
+    for pch in sorted(p_only):
+        p_total = sum(pp[pch].values())
+        if p_total == 0:
+            continue
+        best, best_score = None, -1
+        for dch in sorted(d_only):
+            if dch in used or sum(dp[dch].values()) != p_total:
+                continue
+            ns = _verif_name_sim(p_names.get(pch, ""), d_names.get(dch, ""))
+            ts = _verif_chart_typo_loose(pch, dch)
+            if not (ns or ts):
+                continue
+            score = (2 if ns else 0) + (1 if _verif_chart_typo_adjacent(pch, dch) else 0)
+            if score > best_score:
+                best_score, best = score, dch
+        if best is not None:
+            used.add(best)
+            remap[best] = pch
+    for dch, pch in remap.items():
+        dp[pch] = dp.pop(dch)
+    return remap
+
+
+def _pivot_presence_tag(ch, pp, dp):
+    """차이 건이 어느 파일에 존재하는지 명시 태그.
+
+    차트(EMR)가 세무 기준원장이므로 '어느 쪽에만 있는 수납인지'가 검토 방향을
+    결정한다 — 일일마감에만 존재 = 차트 누락(세무위험) 의심,
+    차트마감에만 존재 = 일일마감 누락 의심."""
+    in_p, in_d = ch in pp, ch in dp
+    if in_p and not in_d:
+        return "[차트마감에만 존재]"
+    if in_d and not in_p:
+        return "[일일마감에만 존재]"
+    return "[양쪽 존재·금액 상이]"
 
 
 def _hansol_card_by_chart(hansol, patient):
@@ -2495,7 +2561,8 @@ def _hansol_card_by_chart(hansol, patient):
     return {ch: (v[0], v[1]) for ch, v in acc.items()}
 
 
-def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12):
+def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12,
+                          daily_refund=None):
     """채널 차이를 설명할 후보 거래 추출 (multiset diff + 승인번호 cross-match 기반).
 
     우선순위:
@@ -2696,7 +2763,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
         # 차트 vs 일마 카드금액 차이 — 전 결제수단 pivot 기반(분류 무관, 한솔 유무 무관)
         # 교집합이 아닌 합집합을 사용해 "차트=현금·일마=카드" 같은 결제수단 오기재까지 포착
         if not patient.empty and not daily.empty and "분류" in patient.columns:
-            pp, dp = _chart_method_pivots(patient, daily)
+            pp, dp = _chart_method_pivots(patient, daily, daily_refund)
             empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
             mismatches = []
             for ch in (set(pp) | set(dp)):
@@ -2716,20 +2783,25 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                         side = "차트" if p[m] > d[m] else "일마"
                         moved = f" → {side}가 {m}({max(p[m], d[m]):,})로 기재(결제수단 오기재 의심)"
                         break
+                loc = _pivot_presence_tag(ch, pp, dp)
                 suspects.append({
                     "출처": "차트↔일마 카드차이★" if near else "차트↔일마 카드차이",
                     "환자": name_map.get(str(ch).strip(), ""),
                     "금액": diff,
                     "단서": (
-                        f"차트{ch} 차트(카{p['카드']:,}/현{p['현금']:,}/이{p['이체']:,}) "
+                        f"{loc} 차트{ch} 차트(카{p['카드']:,}/현{p['현금']:,}/이{p['이체']:,}) "
                         f"vs 일마(카{d['카드']:,}/현{d['현금']:,}/이{d['이체']:,}){moved}"
                     ),
-                    "조치": "결제수단(카드↔현금↔이체) 오기재 또는 카드결제 누락/중복 확인",
+                    "조치": ("일일마감에만 있는 수납 — 차트(세무 기준) 누락인지, 일마 오기재인지 확인"
+                             if loc == "[일일마감에만 존재]"
+                             else "차트마감에만 있는 수납 — 일일마감 누락인지, 차트 오기재인지 확인"
+                             if loc == "[차트마감에만 존재]"
+                             else "결제수단(카드↔현금↔이체) 오기재 또는 카드결제 누락/중복 확인"),
                 })
 
     elif channel == "현금+이체":
         if not patient.empty and not daily.empty:
-            pp, dp = _chart_method_pivots(patient, daily)
+            pp, dp = _chart_method_pivots(patient, daily, daily_refund)
             empty = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
             mismatches = []
             for ch in (set(pp) | set(dp)):
@@ -2740,12 +2812,13 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                     mismatches.append((ch, p, d, dv - pv))
             mismatches.sort(key=lambda x: -abs(x[3]))
             for ch, p, d, diff in mismatches[:top_n]:
+                loc = _pivot_presence_tag(ch, pp, dp)
                 suspects.append({
                     "출처": "차트↔일마 현금/이체차이",
                     "환자": name_map.get(str(ch).strip(), ""),
                     "금액": diff,
                     "단서": (
-                        f"차트{ch} 차트(현{p['현금']:,}/이{p['이체']:,}/카{p['카드']:,}) "
+                        f"{loc} 차트{ch} 차트(현{p['현금']:,}/이{p['이체']:,}/카{p['카드']:,}) "
                         f"vs 일마(현{d['현금']:,}/이{d['이체']:,}/카{d['카드']:,})"
                     ),
                     "조치": "현금↔이체↔카드 오기재 확인",
@@ -2753,7 +2826,7 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
 
     elif channel == "플랫폼":
         if not patient.empty and not daily.empty:
-            pp, dp = _chart_method_pivots(patient, daily)
+            pp, dp = _chart_method_pivots(patient, daily, daily_refund)
             mismatches = []
             for ch in (set(pp) | set(dp)):
                 pv = pp.get(ch, {}).get("플랫폼", 0)
@@ -2762,12 +2835,17 @@ def find_channel_suspects(channel, hansol, daily, patient, totals=None, top_n=12
                     mismatches.append((ch, pv, dv, dv - pv))
             mismatches.sort(key=lambda x: -abs(x[3]))
             for ch, pv, dv, diff in mismatches[:top_n]:
+                loc = _pivot_presence_tag(ch, pp, dp)
                 suspects.append({
                     "출처": "차트↔일마 플랫폼차이",
                     "환자": name_map.get(str(ch).strip(), ""),
                     "금액": diff,
-                    "단서": f"차트{ch} / 차트플랫폼={pv:,} 일마={dv:,}",
-                    "조치": "플랫폼 종류/금액 오기재 확인",
+                    "단서": f"{loc} 차트{ch} / 차트플랫폼={pv:,} 일마={dv:,}",
+                    "조치": ("일일마감에만 있는 수납 — 차트(세무 기준) 누락인지, 일마 오기재인지 확인"
+                             if loc == "[일일마감에만 존재]"
+                             else "일일마감 누락인지, 차트 오기재인지 확인"
+                             if loc == "[차트마감에만 존재]"
+                             else "플랫폼 종류/금액 오기재 확인"),
                 })
 
     return suspects
@@ -2871,7 +2949,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
 
     # 환자별(차트번호별) 일마↔차트 금액 불일치 존재 여부 (채널 합계엔 상쇄돼 안 보일 수 있음).
     # 아래 [3-way 통합] 섹션과 동일한 pivot을 한 번만 만들어 재사용한다.
-    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily, daily_refund)
     _empty_m = {"카드": 0, "현금": 0, "이체": 0, "플랫폼": 0}
     has_patient_diff = False
     for ch in (set(p_pivot) | set(d_pivot)):
@@ -2912,7 +2990,9 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
         L.append(f"요약: 유형B 차트번호오타 {n_vB}건 · 유형C1 한쪽만존재 {n_vC1}건 · "
                  f"유형C2 금액불일치 {n_vC2}건 · 유형C3 결제수단불일치 {n_vC3}건")
         if n_vB:
-            L.append("·유형B[차트번호오타] 이름·금액 동일·번호만 상이 → 일일마감 차트번호 수기오류")
+            L.append("·유형B[차트번호오타] 이름·금액 동일·번호만 상이 → 차트마감(EMR)은 차트번호 "
+                     "오입력 불가(시스템 기재) → 항상 구글 일일마감 쪽 수기오류 — 일일마감에서 해당 "
+                     "번호를 찾아 정정만 하면 됨(단순 오류건·차이금액 집계 미포함)")
             L.append("환자|차트마감#|일일마감#|금액|원인")
             for _, r in vB.head(15).iterrows():
                 nm = str(r.get("성명", ""))[:14].replace("|", " ")
@@ -2920,12 +3000,14 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                 L.append(f"{nm}|{r.get('차트마감_차트번호','')}|{r.get('일일마감_차트번호','')}|"
                          f"{_f(r.get('차트금액'))}|{cause or '번호상이'}")
         if n_vC1:
-            L.append("·유형C1[한쪽만존재] 한 파일에만 있는 환자 → 누락/미반영 의심. "
+            L.append("·유형C1[한쪽만존재] 한 파일에만 있는 환자 → 구분 그대로 '[차트마감에만 존재]/"
+                     "[일일마감에만 존재]'를 명시해 보고. 일일마감에만 존재=차트(세무 기준) 누락 의심, "
+                     "차트마감에만 존재=일일마감 누락 의심. "
                      "'동일금액상대'가 있으면 양쪽이 같은 건일 가능성 높음(이름/번호 오기재) → 한 건으로 묶어 보고")
             L.append("구분|차트#|환자|금액|결제수단|동일금액상대")
             for _, r in vC1.head(15).iterrows():
                 nm = str(r.get("성명", ""))[:12].replace("|", " ")
-                gb = str(r.get("구분", "")).replace("에만 존재", "").replace("|", " ")
+                gb = "[" + str(r.get("구분", "")).replace("|", " ") + "]"
                 pay = str(r.get("결제수단", ""))[:30].replace("|", " ")
                 hint = str(r.get("동일금액상대", "")).replace("|", " ")[:40] or "-"
                 L.append(f"{gb}|{r.get('차트번호','')}|{nm}|{_f(r.get('금액'))}|{pay}|{hint}")
@@ -3052,7 +3134,8 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             p_str = f"{p['카드']:,}/{p['현금']:,}/{p['이체']:,}/{p['플랫폼']:,}"
             d_str = f"{d['카드']:,}/{d['현금']:,}/{d['이체']:,}/{d['플랫폼']:,}"
             appr = ",".join(p_appr_by_ch.get(ch, [])) or "-"
-            diff_str = " · ".join(diffs)[:90]
+            loc = _pivot_presence_tag(ch, p_pivot, d_pivot)
+            diff_str = (loc + " " + " · ".join(diffs))[:90]
             if has_hansol:
                 h_str = f"{h_amt:,}({h_cnt})" if h_amt is not None else "-"
                 L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_str}|{appr}|{diff_str}")
@@ -3181,7 +3264,17 @@ AI_SYSTEM = (
     "[R11] 금액 오타 패턴 인식: 서로 다른 파일의 두 미설명 금액이 자릿수 추가/누락"
     "(50,000↔500,000), 한 자리 오타(40,000↔49,000), 인접 자리 뒤바뀜(120,000↔210,000) "
     "관계면 '같은 건의 금액 오타 의심'으로 한 쌍으로 묶어 보고한다 — 별개의 누락 2건으로 "
-    "처리하면 오류 건 수가 부풀려진다. 단, 쌍으로 묶은 근거(두 금액)를 반드시 함께 인용."
+    "처리하면 오류 건 수가 부풀려진다. 단, 쌍으로 묶은 근거(두 금액)를 반드시 함께 인용.\n"
+    "[R12] 차트 기준 원칙: 차트(EMR)가 세무 기준원장이다. 세무조사 시 차트 수치를 기준으로 "
+    "단말기(PG) 결제금액·플랫폼 정산과의 차이에 증빙을 요구하므로, 모든 차이는 '차트 기준 "
+    "±(차트 대비 일마/한솔이 많다·적다)'로 서술한다. 차트마감의 차트번호는 시스템 자동기재라 "
+    "오입력될 수 없다 — 차트번호 불일치(유형B)는 항상 구글 일일마감 쪽 수기오류이므로 "
+    "'구글 일일마감에서 해당 번호를 찾아 정정'으로만 안내하고, 이름·금액이 일치하면 단순 "
+    "오류건으로 차이금액 집계·검토대상 목록에 포함하지 않는다(안내만).\n"
+    "[R13] 위치 명시: 모든 차이·누락 건은 어느 파일에 차이가 있는지 '[차트마감에만 존재]' "
+    "'[일일마감에만 존재]' '[양쪽 존재·금액 상이]' 태그로 구체적으로 명시한다. "
+    "일일마감에만 존재 = 차트(세무 기준) 누락 의심(세무위험 우선 검토), "
+    "차트마감에만 존재 = 일일마감 누락 의심."
 )
 
 AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호로 통합한 raw 구조):
@@ -3192,10 +3285,14 @@ AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호�
 
 STEP0. [데이터검증] 확정 오입력 우선 처리 (섹션이 있으면 절대 먼저)
   · 코드가 차트마감↔일일마감을 환자단위로 대조해 확정한 단서 = 추론 불필요한 사실.
-  · 유형B(차트번호오타): 이름·금액 동일·번호만 상이 → "일일마감 차트번호를 차트마감 기준으로
-    정정 검토" 권고. (금액은 맞으므로 합계엔 영향 없음을 명시)
-  · 유형C1(한쪽만존재): 한 파일에만 있는 환자 → "누락된 쪽 파일에 해당 결제건이 빠졌는지/
-    환불 미반영인지 원본 검토" 권고. '동일금액상대'가 있으면 두 건은 같은 건의 이름/번호
+  · 유형B(차트번호오타): 이름·금액 동일·번호만 상이. 차트마감(EMR)은 차트번호 오입력이
+    불가능(시스템 자동기재)하므로 오류는 항상 구글 일일마감 쪽(R12) → "구글 일일마감에서
+    해당 번호를 찾아 차트마감 번호로 정정" 안내만 한다. 금액·이름이 맞으므로 단순 오류건 —
+    차이금액 집계·검토대상 목록에 포함하지 않는다(합계 영향 없음 명시).
+  · 유형C1(한쪽만존재): 한 파일에만 있는 환자 → 반드시 '[차트마감에만 존재]/[일일마감에만
+    존재]' 위치를 명시(R13)하고, 일일마감에만 존재면 "차트(세무 기준)에 해당 수납 누락
+    여부/환불 미반영 검토", 차트마감에만 존재면 "일일마감 누락 여부 검토" 권고.
+    '동일금액상대'가 있으면 두 건은 같은 건의 이름/번호
     오기재일 가능성이 높으므로 별개 누락 2건이 아니라 한 쌍(오류 건 1건)으로 묶어 보고.
   · 유형C2(금액불일치): 동일번호·금액상이 → R5~R7 적용해 결제수단/금액 오기재 방향 제시.
     두 금액이 R11 오타 패턴이면 '금액 오타 의심'을 명시.
@@ -3243,13 +3340,14 @@ STEP6. 정합성 검산 (R10 — 출력에 결과를 반드시 포함)
   · 환자별 차이를 채널별로 합산해 [채널대사] 차이값과 대조: '채널차이 = Σ건별 차이'가 성립하는지 검산.
   · 성립하면 "검산 일치(잔여 0원)"와 합계차이를 주로 만든 '주요원인' 건을 명시.
   · 성립하지 않으면 "미특정 잔여 ±X원"을 명시하고 PG-only/front-only/환불 행에서 후보를 재탐색.
-  · 단, 합계엔 안 잡히는 상쇄쌍·소액 불일치·유형B/C3도 STEP3 목록에 모두 남길 것 (합계 일치는 생략 사유 아님).
+  · 단, 합계엔 안 잡히는 상쇄쌍·소액 불일치·유형C3도 STEP3 목록에 모두 남길 것 (합계 일치는 생략 사유 아님).
+    유형B(이름·금액 일치·번호만 오타)는 예외 — R12에 따라 데이터검증 확정건에서 안내만 하고 검토대상엔 넣지 않는다.
 
 [출력 형식 — 900토큰 이내(반드시 끝까지 완결), 마크다운]
 
 ### 데이터검증 확정건 (입력에 [데이터검증]이 있을 때만)
-- **유형B 차트번호오타**: {{환자}}(차트#{{차트마감#}} → 일마기재 {{일일마감#}}) {{금액}}원 · {{원인}} → 일일마감 번호 정정 검토 (합계 영향 없음)
-- **유형C1 한쪽만존재**: {{구분}} {{환자}}(차트#) {{금액}}원 → {{누락/환불미반영}} 검토 · 동일금액상대 있으면 "{{상대}}와 동일건 의심 — 한 쌍으로 검토"
+- **유형B 차트번호오타**: {{환자}}(차트#{{차트마감#}} ↔ 일마기재 {{일일마감#}}) {{금액}}원 → 구글 일일마감 차트번호만 정정 (단순 오류건 · 차이금액 미포함 · 합계 영향 없음)
+- **유형C1 한쪽만존재**: [{{차트마감에만 존재/일일마감에만 존재}}] {{환자}}(차트#) {{금액}}원 → {{일일마감에만: 차트(세무 기준) 누락/환불미반영 검토 · 차트마감에만: 일일마감 누락 검토}} · 동일금액상대 있으면 "{{상대}}와 동일건 의심 — 한 쌍으로 검토"
 - **유형C2 금액불일치**: {{환자}}(차트#) 차트{{차트금액}}↔일마{{일마금액}}(차이 {{±}}) → {{결제수단/금액 오기재(R11 오타패턴이면 명시)}} 검토
 - **유형C3 결제수단불일치**: {{환자}}(차트#) 총액 {{금액}} 일치 · {{X↔Y 분배 상이}} → {{어느 채널 합계차이를 설명하는지}} + 결제수단 검토
 (해당 유형 0건이면 그 줄 생략. 검증 섹션 자체가 없으면 이 블록 전체 생략)
@@ -3258,7 +3356,7 @@ STEP6. 정합성 검산 (R10 — 출력에 결과를 반드시 포함)
 차이 또는 환자별 불일치가 있는 채널마다 ↓
 - **{{채널}}**: 한-차=±?원 · 한-일=±?원 · 일-차=±?원
   - **검토대상** (★★ → ★ → 일반 순, 상쇄쌍·소액 포함 빠짐없이):
-    1. `★★/★/-` {{환자명}}(차트#{{ch}}) · {{채널}} {{차이금액}}원 · 추정원인 {{Pa~Pf/복합}} → **검토 권고**: {{어느 파일의 그 환자 어느 내역을 먼저 봐야 하는지}}
+    1. `★★/★/-` {{환자명}}(차트#{{ch}}) · {{채널}} {{차이금액}}원 · [{{차트마감에만 존재/일일마감에만 존재/양쪽 존재·금액 상이}}] · 추정원인 {{Pa~Pf/복합}} → **검토 권고**: {{어느 파일의 그 환자 어느 내역을 먼저 봐야 하는지}}
     2. …
   - **검산(R10)**: 채널차이 {{±X}}원 = {{건별 차이 합산식}} → {{일치(잔여 0원) / 미특정 잔여 ±Y원}} · 주요원인 = {{환자/금액}}
 
@@ -3273,7 +3371,7 @@ STEP6. 정합성 검산 (R10 — 출력에 결과를 반드시 포함)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def build_3way_table(hansol, daily, patient, p1_full):
+def build_3way_table(hansol, daily, patient, p1_full, daily_refund=None):
     """차트번호 단위로 차트(분류별)·일마(채널별)·한솔(매칭카드합)을 한 행으로 통합.
     엑셀/AI 두 곳에서 공통으로 사용."""
     has_hansol = hansol is not None and not hansol.empty
@@ -3292,7 +3390,7 @@ def build_3way_table(hansol, daily, patient, p1_full):
             if ch and nm and nm != "nan" and ch not in name_map:
                 name_map[ch] = nm
 
-    p_pivot, d_pivot = _chart_method_pivots(patient, daily)
+    p_pivot, d_pivot = _chart_method_pivots(patient, daily, daily_refund)
 
     # 한솔 카드금액은 승인번호 다리로 차트에 귀속(일마 차트번호 유무 무관). 미링크는 unknown.
     h_card_by_ch = _hansol_card_by_chart(hansol, patient)
@@ -3328,7 +3426,8 @@ def build_3way_table(hansol, daily, patient, p1_full):
 
 
 def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_channel=None,
-                   hansol=None, daily=None, patient=None, p1_full=None, verif=None):
+                   hansol=None, daily=None, patient=None, p1_full=None, verif=None,
+                   daily_refund=None):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         # 시트V: 데이터검증(오입력 의심 확정건) — 가장 앞에 배치
@@ -3353,7 +3452,7 @@ def build_ai_excel(p1_diff, h_um, d_um, totals, channel_df=None, suspects_by_cha
         # 시트0a: 차트번호 3-way 통합 (차트/일마/한솔 한 행)
         if daily is not None and patient is not None:
             tw = build_3way_table(hansol if hansol is not None else pd.DataFrame(),
-                                  daily, patient, p1_full)
+                                  daily, patient, p1_full, daily_refund)
             if not tw.empty:
                 # 차이 있는 행 우선으로 정렬 (절대 차이 합 큰순)
                 diff_cols_ex = [c for c in tw.columns if c.endswith("차")]
@@ -4436,7 +4535,8 @@ def main():
                     totals = compute_totals(hansol, daily, daily_refund, patient)
                     channel_df = compute_channel_recon(totals)
                     suspects_by_channel = {
-                        ch: find_channel_suspects(ch, hansol, daily, patient, totals=totals, top_n=15)
+                        ch: find_channel_suspects(ch, hansol, daily, patient, totals=totals,
+                                                  top_n=15, daily_refund=daily_refund)
                         for ch in ["카드", "현금+이체", "플랫폼"]
                     }
 
@@ -4818,6 +4918,7 @@ def main():
                 excel = build_ai_excel(
                     p1_diff, h_um, d_um, totals, channel_df, suspects_by_channel,
                     hansol=hansol, daily=daily, patient=patient, p1_full=p1_full, verif=verif,
+                    daily_refund=daily_refund,
                 )
                 st.download_button(
                     "통합 엑셀 다운로드 (검증 + 7시트)",
