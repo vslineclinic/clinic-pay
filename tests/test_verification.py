@@ -67,6 +67,65 @@ def test_verification_without_refund_kept_backward_compat(app):
     assert len(verif["유형C2_금액불일치"]) == 1
 
 
+def test_verification_c3_method_mismatch(app):
+    """총액은 같지만 결제수단 분배가 다른 환자(채널 합계 차이의 직접 원인)를
+    유형C3로 확정 추출. 총액이 같으므로 C2엔 잡히지 않아야 함."""
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["100", "김철수", "카드(삼성)", 50000, ""],     # 차트: 카드 50,000
+        ["200", "이영희", "현금영수증", 30000, ""],      # 정상 환자 (분배 일치)
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체"],
+        [1, "100", "김철수", "", 0, 50000, 0],           # 일마: 현금 50,000 (오기재)
+        [2, "200", "이영희", "", 0, 30000, 0],
+    ))
+    verif = app.build_verification(patient, daily, refund)
+    assert verif["유형C2_금액불일치"].empty
+    c3 = verif["유형C3_결제수단불일치"]
+    assert len(c3) == 1
+    r = c3.iloc[0]
+    assert r["차트번호"] == "100" and r["총액"] == 50000
+    assert "카드↔현금" in r["추정원인"]
+
+
+def test_verification_c1_same_amount_hint(app):
+    """한쪽만존재 양쪽에 동일 금액 1건씩 남으면 '동일건 의심' 힌트로 연결."""
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["100", "김철수", "카드(삼성)", 77000, ""],
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체"],
+        [1, "9999", "박오기", "", 77000, 0, 0],          # 이름·번호 모두 오기재
+    ))
+    verif = app.build_verification(patient, daily, refund)
+    c1 = verif["유형C1_한쪽만존재"]
+    assert len(c1) == 2
+    hints = list(c1["동일금액상대"])
+    assert any("동일건 의심" in h for h in hints)
+
+
+def test_ai_text_verification_includes_c3(app):
+    """AI 입력의 [데이터검증] 섹션에 유형C3(결제수단불일치)가 포함돼야 함."""
+    import pandas as pd
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["100", "김철수", "카드(삼성)", 50000, ""],
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체"],
+        [1, "100", "김철수", "", 0, 50000, 0],
+    ))
+    verif = app.build_verification(patient, daily, refund)
+    totals = app.compute_totals(pd.DataFrame(), daily, refund, patient)
+    channel = app.compute_channel_recon(totals)
+    text = app.build_ai_text(pd.DataFrame(), daily, refund, patient, channel,
+                             None, None, None, {}, totals=totals, verif=verif)
+    assert "[데이터검증" in text
+    assert "유형C3" in text and "김철수" in text
+
+
 def test_verification_refund_only_daily_patient(app):
     """일마에 환불만 있는 환자(net 음수)도 차트 음수 행과 대조돼 일치 처리."""
     patient = app.parse_patient(F.table_raw(
