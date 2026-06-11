@@ -173,6 +173,73 @@ def test_find_period_day_detail_self_cancel_pair(app):
     assert un_h.empty and un_p.empty
 
 
+# ── 오류 건 자동 특정 (미설명 잔여 건 오타쌍 페어링) ─────────
+
+def test_amount_typo_kind_patterns(app):
+    assert "자릿수" in app._amount_typo_kind(50000, 500000)     # 0 추가/누락
+    assert "한 자리" in app._amount_typo_kind(40000, 49000)     # 한 자리 오타
+    assert "뒤바뀜" in app._amount_typo_kind(120000, 210000)    # 인접 자리 전치
+    assert app._amount_typo_kind(40000, 40000) == ""            # 동일 금액
+    assert app._amount_typo_kind(40000, 73000) == ""            # 무관한 금액(편집거리 2)
+    assert app._amount_typo_kind(0, 50000) == ""
+
+
+def test_pair_period_typo_suspects_amount_typo(app):
+    """5/12 미설명 쌍(한솔 40,000 ↔ 차트 49,000)을 같은 건의 금액 오타로 특정."""
+    hansol, patient = _two_day_files(app)
+    un_h, un_p = app.find_period_day_detail(hansol, patient, "2026-05-12")
+    pairs = app.pair_period_typo_suspects(un_h, un_p)
+    assert len(pairs) == 1
+    r = pairs.iloc[0]
+    assert r["차트번호"] == "400" and r["환자"] == "최지우"
+    assert r["차트금액"] == 49000 and r["한솔금액"] == 40000
+    assert r["차이(한솔-차트)"] == -9000
+    assert "오타" in r["추정원인"]
+
+
+def test_pair_period_typo_suspects_direction_mismatch(app):
+    """금액 동일·방향 상이(한솔 정상 ↔ 차트 환불)는 환불방향 불일치로 특정."""
+    hansol = app.parse_hansol(F.hansol_raw(
+        금액=[80000],
+        승인번호=["700777"],
+        거래일=["260511"],
+        거래시간=["100000"],
+        거래상태=["정상승인"],
+        구분=["카드"],
+        매입사=["삼성카드"],
+    ))
+    patient = app.parse_patient(F.table_raw(
+        ["수납일", "차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["2026-05-11(월)", "500", "정환불", "결제취소-카드", 80000, ""],
+    ))
+    un_h, un_p = app.find_period_day_detail(hansol, patient, "2026-05-11")
+    pairs = app.pair_period_typo_suspects(un_h, un_p)
+    assert len(pairs) == 1
+    r = pairs.iloc[0]
+    assert r["차트금액"] == -80000 and r["한솔금액"] == 80000
+    assert "환불방향" in r["추정원인"]
+
+
+def test_pair_period_typo_suspects_no_false_pair(app):
+    """무관한 금액끼리는 페어링하지 않는다(허위 특정 방지)."""
+    hansol = app.parse_hansol(F.hansol_raw(
+        금액=[40000],
+        승인번호=["100111"],
+        거래일=["260511"],
+        거래시간=["100000"],
+        거래상태=["정상승인"],
+        구분=["카드"],
+        매입사=["삼성카드"],
+    ))
+    patient = app.parse_patient(F.table_raw(
+        ["수납일", "차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["2026-05-11(월)", "100", "김철수", "카드(삼성)", 73000, ""],
+    ))
+    un_h, un_p = app.find_period_day_detail(hansol, patient, "2026-05-11")
+    pairs = app.pair_period_typo_suspects(un_h, un_p)
+    assert pairs.empty
+
+
 # ── 기간 분석 × 구글시트 일일마감 비교 ───────────────────────
 
 def _fake_gsheet_loader(tabs):
