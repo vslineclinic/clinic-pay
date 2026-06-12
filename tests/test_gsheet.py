@@ -44,6 +44,91 @@ def test_get_clinic_daily_sheets_default(app):
     assert set(sheets.keys()) == set(app.CLINIC_DAILY_SHEETS.keys())
 
 
+# ── 날짜별 시트 전환 (시트 파일 이전 지점: 엔디어트 26.06.12~ 새 시트) ──────────
+
+NEW_URL = "https://docs.google.com/spreadsheets/d/NEW" + "n" * 30 + "/edit"
+OLD_URL = "https://docs.google.com/spreadsheets/d/OLD" + "o" * 30 + "/edit"
+DATED_ENTRY = [("2026-06-12", NEW_URL), ("", OLD_URL)]
+
+
+def test_resolve_daily_sheet_url_passthrough_for_plain_url(app):
+    url = "https://docs.google.com/spreadsheets/d/" + "A" * 30 + "/edit"
+    assert app.resolve_daily_sheet_url(url, date(2026, 6, 12)) == url
+
+
+def test_resolve_daily_sheet_url_switches_on_cutoff(app):
+    # 시작일 당일부터 새 시트(포함), 그 전날까지는 기존 시트.
+    assert app.resolve_daily_sheet_url(DATED_ENTRY, date(2026, 6, 12)) == NEW_URL
+    assert app.resolve_daily_sheet_url(DATED_ENTRY, date(2026, 6, 13)) == NEW_URL
+    assert app.resolve_daily_sheet_url(DATED_ENTRY, date(2027, 1, 1)) == NEW_URL
+    assert app.resolve_daily_sheet_url(DATED_ENTRY, date(2026, 6, 11)) == OLD_URL
+    assert app.resolve_daily_sheet_url(DATED_ENTRY, date(2025, 12, 31)) == OLD_URL
+
+
+def test_resolve_daily_sheet_url_order_independent(app):
+    # 설정에 옛 시트를 위에 적어도(정렬로 보정) 결과는 같아야 한다.
+    rev = list(reversed(DATED_ENTRY))
+    assert app.resolve_daily_sheet_url(rev, date(2026, 6, 12)) == NEW_URL
+    assert app.resolve_daily_sheet_url(rev, date(2026, 6, 11)) == OLD_URL
+
+
+def test_resolve_daily_sheet_url_accepts_secrets_list_of_lists(app):
+    # Streamlit Secrets(TOML)에서는 튜플이 아닌 list-of-list로 들어온다.
+    entry = [["2026-06-12", NEW_URL], ["", OLD_URL]]
+    assert app.resolve_daily_sheet_url(entry, date(2026, 6, 12)) == NEW_URL
+    assert app.resolve_daily_sheet_url(entry, date(2026, 6, 11)) == OLD_URL
+
+
+def test_resolve_daily_sheet_url_all_dated_falls_back_to_oldest(app):
+    # 빈 시작일 기본값이 없고 분석 날짜가 모든 시작일 이전이면 가장 오래된 시트로.
+    entry = [("2026-06-12", NEW_URL), ("2026-01-01", OLD_URL)]
+    assert app.resolve_daily_sheet_url(entry, date(2025, 5, 1)) == OLD_URL
+
+
+def test_sheet_entry_configured(app):
+    assert app.sheet_entry_configured("https://docs.google.com/spreadsheets/d/X/edit")
+    assert app.sheet_entry_configured(DATED_ENTRY)
+    assert not app.sheet_entry_configured("")
+    assert not app.sheet_entry_configured("   ")
+    assert not app.sheet_entry_configured([])
+    assert not app.sheet_entry_configured([("2026-06-12", "")])
+
+
+def test_clinic_sheets_endiart_switches_sheet_on_2026_06_12(app):
+    # 엔디어트: 26.06.12부터 새 스프레드시트, 그 이전 날짜는 기존 시트(요건 회귀 고정).
+    entry = app.CLINIC_DAILY_SHEETS["엔디어트"]
+    new_sid = "1e1BMgUAF_GGAAJBib8gVAEVoJC6ZjunQ3K399tdc_mA"
+    old_sid = "1YdruwnAghZARwLALGD9rvbDZsnw4b4FKSt6l3_sLgd4"
+    assert app._extract_sheet_id(
+        app.resolve_daily_sheet_url(entry, date(2026, 6, 12))) == new_sid
+    assert app._extract_sheet_id(
+        app.resolve_daily_sheet_url(entry, date(2026, 6, 11))) == old_sid
+
+
+def test_load_gsheet_daily_resolves_dated_entry_per_date(app, monkeypatch):
+    # 단일일·기간 분석이 공유하는 load_gsheet_daily에 [(시작일, URL)] 설정값을 그대로
+    # 주면 날짜에 맞는 스프레드시트로 요청해야 한다(시트별 캐시 분리 포함).
+    csv = "내원순서,차트번호,성명,카드\n1,100,김철수,50000\n"
+    fallback = "견본\n구분\n\n"
+    seen = []
+
+    def fake(url, timeout=20):
+        seen.append(url)
+        if url.endswith("/edit"):
+            return b"<html>no gid pattern</html>"      # gid 매핑 없음 → gviz 경로
+        name = unquote(parse_qs(urlparse(url).query).get("sheet", [""])[0])
+        ok = name in ("26.06.12", "26.06.11")
+        return (csv if ok else fallback).encode("utf-8")
+
+    monkeypatch.setattr(app, "_fetch_url_bytes", fake)
+    cache = {}
+    app.load_gsheet_daily(DATED_ENTRY, date(2026, 6, 12), cache=cache)
+    assert any("/NEW" in u for u in seen) and not any("/OLD" in u for u in seen)
+    seen.clear()
+    app.load_gsheet_daily(DATED_ENTRY, date(2026, 6, 11), cache=cache)
+    assert any("/OLD" in u for u in seen) and not any("/NEW" in u for u in seen)
+
+
 def test_parse_gviz_csv_returns_object_grid_consumable_by_parse_daily(app):
     csv = "내원순서,차트번호,성명,카드,현금\n1,100,김철수,50000,0\n2,200,이영희,0,30000\n"
     raw = app._parse_gviz_csv(csv.encode("utf-8"), sheet_name="26.06.02")

@@ -54,10 +54,20 @@ CROSS_CHECK_MIN_RATE = 0.6
 # 탭 이름 형식은 지점·시기마다 달라도 자동 매칭한다(26.06.02 / 06.02 / 6.2 / 26.6.2 …).
 # ※ 정확한 분석을 위해 각 날짜 탭은 표준 양식(templates/일일마감_표준양식 참고)으로 입력할 것.
 #    표준 양식이 아닌 탭은 합계가 실제와 다를 수 있고, 앱에서 경고가 표시된다.
+#
+# 지점이 스프레드시트를 새 파일로 옮긴 경우(이전 날짜는 옛 시트, 이후는 새 시트),
+# 값에 URL 대신 [(적용 시작일 "YYYY-MM-DD", URL), ...] 목록을 적는다.
+# 분석 날짜가 시작일 이후(당일 포함)인 첫 항목의 URL이 쓰이므로 **최신 시작일을 위에**,
+# 마지막 항목의 시작일을 ""(빈 문자열)로 두면 그 이전 전체 날짜의 기본 시트가 된다.
+# (Secrets로 줄 때도 동일: "엔디어트" = [["2026-06-12", "URL"], ["", "URL"]])
 CLINIC_DAILY_SHEETS = {
     "인천점": "https://docs.google.com/spreadsheets/d/1FJwllsTCVbmtorRr_0XcYMCQ49yym2aXHj8pdrP9inU/edit",
     "잠실점": "https://docs.google.com/spreadsheets/d/18wHlyD85V-KrTortCt7u4JAbFOn08WJtJJGT1oAm5kA/edit",
-    "엔디어트": "https://docs.google.com/spreadsheets/d/1YdruwnAghZARwLALGD9rvbDZsnw4b4FKSt6l3_sLgd4/edit",
+    # 엔디어트는 26.06.12부터 새 스프레드시트 사용, 그 이전 날짜는 기존 시트에서 읽는다.
+    "엔디어트": [
+        ("2026-06-12", "https://docs.google.com/spreadsheets/d/1e1BMgUAF_GGAAJBib8gVAEVoJC6ZjunQ3K399tdc_mA/edit"),
+        ("", "https://docs.google.com/spreadsheets/d/1YdruwnAghZARwLALGD9rvbDZsnw4b4FKSt6l3_sLgd4/edit"),
+    ],
     "강남점": "https://docs.google.com/spreadsheets/d/1eNEp8zo27whawGPrb5y7uifZzhXVKpsp5hgpTlDv0UY/edit",
     "일산점": "https://docs.google.com/spreadsheets/d/1Z--Ps4mds67l95g4V2AKW5y-RjESFxDNct18CgSaK8c/edit",
     "압구정": "https://docs.google.com/spreadsheets/d/1cum7KVfY1TIkXKBjkIpd5GldAT6dd48if-rn03wce0U/edit",
@@ -74,6 +84,35 @@ def get_clinic_daily_sheets():
     except Exception:
         pass
     return dict(CLINIC_DAILY_SHEETS)
+
+
+def sheet_entry_configured(entry):
+    """지점 시트 설정값(단일 URL 또는 [(시작일, URL), ...])에 URL이 하나라도 있는지."""
+    if isinstance(entry, (list, tuple)):
+        return any(len(it) > 1 and str(it[1]).strip() for it in entry)
+    return bool(str(entry or "").strip())
+
+
+def resolve_daily_sheet_url(entry, picked_date):
+    """지점 시트 설정값에서 분석 날짜(picked_date, date)에 적용할 URL/ID를 고른다.
+
+    단일 URL(문자열)이면 그대로 반환. [(시작일 "YYYY-MM-DD", URL), ...] 목록이면
+    시작일 내림차순으로 보아 picked_date가 시작일 이후(당일 포함)인 첫 항목의 URL을
+    반환한다(빈 시작일 = 그 이전 전체의 기본값). 날짜 비교는 ISO 문자열 순서를 그대로
+    이용하므로 시작일은 반드시 0패딩된 YYYY-MM-DD 형식이어야 한다.
+    """
+    if not isinstance(entry, (list, tuple)):
+        return entry
+    items = sorted(
+        (it for it in entry if len(it) > 1 and str(it[1]).strip()),
+        key=lambda it: str(it[0] or "").strip(), reverse=True,
+    )
+    day = picked_date.isoformat() if picked_date is not None else ""
+    for start, url in ((str(it[0] or "").strip(), it[1]) for it in items):
+        if not start or day >= start:
+            return url
+    # 모든 항목에 시작일이 있는데 picked_date가 그보다 이전 → 가장 오래된 시트로.
+    return items[-1][1] if items else None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -558,6 +597,11 @@ def _candidate_tab_names(d):
 def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
     """지점 스프레드시트 URL/ID + 날짜(date) → (raw DataFrame, 매칭된 탭 이름).
 
+    url_or_id에는 단일 URL/ID 외에 CLINIC_DAILY_SHEETS의 [(시작일, URL), ...] 목록도
+    그대로 줄 수 있다 — 시트를 새 파일로 이전한 지점은 picked_date에 맞는 시트가
+    자동 선택된다(resolve_daily_sheet_url). 기간 분석처럼 날짜마다 호출돼도 시트별
+    캐시 키(sid 기준)가 분리돼 있어 두 시트가 섞이지 않는다.
+
     탭 이름 형식이 지점마다 달라 _candidate_tab_names의 여러 후보를 순서대로 시도한다.
 
     1순위 export(format=csv&gid=): 셀 원본을 그대로 받아 결제수단 머리글(카드/현금/이체
@@ -571,7 +615,7 @@ def load_gsheet_daily(url_or_id, picked_date, timeout=20, cache=None):
     """
     import hashlib
 
-    sid = _extract_sheet_id(url_or_id)
+    sid = _extract_sheet_id(resolve_daily_sheet_url(url_or_id, picked_date))
     if not sid:
         raise ValueError(
             "스프레드시트 URL/ID를 인식할 수 없습니다. 올바른 구글시트 링크인지 확인하세요."
@@ -4267,7 +4311,7 @@ def _period_mode_ui():
     # 지점 선택: 구글시트 일일마감을 일자별로 불러와 같이 비교(기본 포함).
     # 시트에 없는 날짜는 자동으로 빼고 검증하며, 결과 화면에서 따로 안내한다.
     daily_sheets = get_clinic_daily_sheets()
-    _branches = [b for b, u in daily_sheets.items() if str(u).strip()]
+    _branches = [b for b, u in daily_sheets.items() if sheet_entry_configured(u)]
     gs_branch = None
     if _branches:
         sel = st.selectbox(
@@ -4419,7 +4463,7 @@ def main():
                 f_d = st.file_uploader("일일마감", key="d", help="CSV·XLSX·XLS·XLSB")
                 d_pw = st.text_input("비밀번호(선택)", type="password", key="d_pw")
             else:
-                _branches = [b for b, u in daily_sheets.items() if str(u).strip()]
+                _branches = [b for b, u in daily_sheets.items() if sheet_entry_configured(u)]
                 if not _branches:
                     st.warning(
                         "등록된 지점 구글시트가 없습니다. app.py 상단의 "
