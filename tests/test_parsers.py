@@ -168,6 +168,29 @@ def test_parse_patient_payment_classification(app):
     assert p.iloc[0]["승인번호목록"] == ["100111"]      # 결제메모에서 승인번호 추출
 
 
+def test_parse_patient_strips_leading_zero_approval(app):
+    """차트(베가스)가 승인번호를 0패딩해 적어도(예: "00873971") 한솔 자연수("873971")와
+    같은 키로 정규화돼야 한다(선행 0 제거). 안 하면 승인번호 매칭이 조용히 실패한다."""
+    patient = F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["886", "김준영", "카드(현대)", 419000, "00873971"],   # 0패딩 6자리 승인
+        ["552", "오예진", "카드(삼성)", 6900, "08272602"],      # 0패딩 7자리 승인
+    )
+    p = app.parse_patient(patient)
+    assert p.iloc[0]["승인번호목록"] == ["873971"]
+    assert p.iloc[1]["승인번호목록"] == ["8272602"]
+
+
+def test_parse_hansol_approval_key_matches_padded_chart(app):
+    """한솔 승인번호도 _appr_key로 정규화돼 0패딩 차트 승인번호와 동일 키가 된다."""
+    h = app.parse_hansol(F.hansol_raw(
+        금액=[419000], 승인번호=["873971"], 거래상태=["정상승인"],
+        구분=["카드"], 매입사=["현대카드"],
+    ))
+    assert h.iloc[0]["승인번호"] == "873971"
+    assert app._appr_key("00873971") == h.iloc[0]["승인번호"]   # 차트(0패딩) == 한솔
+
+
 # ── QR·모바일 간편결제(알리페이/위챗페이/카카오페이) = 플랫폼 집계 ──────────
 
 def test_channel_of_normalizes_qr_platform_aliases(app):
