@@ -27,6 +27,18 @@ def test_p1_approval_match(app):
     assert (match_df["매칭규칙"] == "P1_승인번호").sum() == 2
 
 
+def test_p1_approval_match_zero_padded_chart(app):
+    """차트 결제메모가 승인번호를 0패딩("00100111")해도 한솔 자연수("100111")와 P1 매칭."""
+    hansol, daily, patient = F.basic_three_files()
+    patient.iloc[1, 5] = "00100111"   # 100 김철수 메모를 0패딩 형태로 (행0=헤더)
+    patient.iloc[2, 5] = "00200222"   # 200 이영희 메모를 0패딩 형태로
+    H = app.parse_hansol(hansol)
+    D, _ = app.parse_daily(daily)
+    P = app.parse_patient(patient)
+    match_df, _, _ = app.run_matching(H, D, P)
+    assert (match_df["매칭규칙"] == "P1_승인번호").sum() == 2
+
+
 def test_p2_unique_amount_match(app):
     """승인번호 연결이 없으면 유일 금액으로 P2 매칭된다."""
     hansol, daily, patient = F.basic_three_files()

@@ -220,6 +220,36 @@ def test_pair_period_typo_suspects_direction_mismatch(app):
     assert "환불방향" in r["추정원인"]
 
 
+def test_period_zero_padded_approval_no_false_typo_pair(app):
+    """차트(베가스)가 승인번호를 0패딩("00873971")해 적고 한솔은 자연수("873971")로
+    적은 실데이터 회귀: 선행 0을 제거해 매칭하므로 같은 거래로 설명되고, 금액이 비슷한
+    남의 거래와 '금액 오타 의심' 쌍으로 잘못 묶이지 않는다.
+
+    실사례(2026-06-11): 홍규진 차트 409,000(승인 00443125)이 김준영의 한솔 419,000
+    (승인 873971)과 '한 자리 오타'로 오특정되던 버그. 둘 다 자기 한솔 건과 매칭돼야 한다.
+    """
+    hansol = app.parse_hansol(F.hansol_raw(
+        금액=[409000, 419000],
+        승인번호=["443125", "873971"],          # 한솔: 선행 0 없는 자연수
+        거래일=["260611", "260611"],
+        거래시간=["170155", "100849"],
+        거래상태=["정상승인", "정상승인"],
+        구분=["카드", "카드"],
+        매입사=["현대카드", "현대카드"],
+    ))
+    patient = app.parse_patient(F.table_raw(
+        ["수납일", "차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["2026-06-11(목)", "86882", "홍규진", "카드(현대)", 409000, "00443125"],  # 0패딩
+        ["2026-06-11(목)", "88491", "김준영", "카드(현대)", 419000, "00873971"],  # 0패딩
+    ))
+    un_h, un_p = app.find_period_day_detail(hansol, patient, "2026-06-11")
+    # 승인번호 매칭이 성립 → 미설명 잔여 0건
+    assert un_h.empty and un_p.empty
+    # 따라서 허위 오타쌍도 0건(이전엔 홍규진↔873971 등 6쌍이 잘못 떴음)
+    pairs = app.pair_period_typo_suspects(un_h, un_p)
+    assert pairs.empty
+
+
 def test_pair_period_typo_suspects_no_false_pair(app):
     """무관한 금액끼리는 페어링하지 않는다(허위 특정 방지)."""
     hansol = app.parse_hansol(F.hansol_raw(
