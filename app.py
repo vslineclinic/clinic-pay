@@ -938,6 +938,27 @@ def _relabel_pay_columns(df, summary_totals):
     return df
 
 
+def _uniquify_columns(cols):
+    """중복 컬럼명을 고유하게 만든다(첫 등장은 원래 이름 유지, 이후 '.1','.2' 접미).
+
+    지점 시트 머리글에 같은 이름(또는 빈칸)이 두 번 이상 나오면 DataFrame에
+    중복 라벨이 생긴다. 이 경우 df[label] 이 Series 대신 DataFrame 을 반환해
+    불리언 마스킹이 ValueError 로 죽거나 to_dict 가 'columns are not unique'
+    경고와 함께 일부 열을 누락시킨다. 첫 등장 이름은 그대로 두어 pay_map 등의
+    이름 기반 조회(예: '카드')는 정상 동작하도록 한다.
+    """
+    seen, out = {}, []
+    for c in cols:
+        c = str(c)
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            out.append(c)
+    return out
+
+
 def parse_daily(raw):
     """일일마감 파싱: 동적 헤더, 결제수단별 금액, 환불/취소 내역 포함"""
     hdr = None
@@ -961,7 +982,7 @@ def parse_daily(raw):
         if (gpos is not None and gpos + 1 < len(cols) and cols[gpos + 1] == ""
                 and _looks_like_chart_no(raw.iloc[hdr + 1:, gpos + 1])):
             cols[gpos + 1] = "차트번호"
-    df.columns = cols
+    df.columns = _uniquify_columns(cols)
     df = df.reset_index(drop=True)
 
     # --- 환불/취소 섹션 탐지 및 분리 ---
@@ -995,7 +1016,8 @@ def parse_daily(raw):
                 break
         if r_hdr is not None:
             r_data = refund_raw.iloc[r_hdr + 1:].copy()
-            r_data.columns = [str(c).strip().replace("\n", "") for c in refund_raw.iloc[r_hdr]]
+            r_data.columns = _uniquify_columns(
+                [str(c).strip().replace("\n", "") for c in refund_raw.iloc[r_hdr]])
             r_data = r_data.reset_index(drop=True)
             # 빈 행 + 합계/총계 행 제거 (환자 이름은 숫자뿐일 수 없음 → 숫자만이면 합계행)
             if "성명" in r_data.columns:
@@ -1491,6 +1513,11 @@ def run_matching(hansol, daily, patient):
         charts = list(appr_map.get(appr_no, set()))
         if not appr_no or len(charts) < 2:
             continue
+        # 방어: 승인번호 하나가 비정상적으로 많은 차트에 매핑되면(플레이스홀더/데이터
+        # 오류 등) 아래 전수조합이 C(n,6)로 폭증해 워커가 세그폴트로 죽는다. 실제
+        # 공동결제는 몇 개 차트에 그치므로 상한을 둔다.
+        if len(charts) > 8:
+            continue
 
         cand = d_card[(d_card["차트번호"].isin(charts)) & (~d_card["d_idx"].isin(matched_dc))].copy()
         # 일마에 같은 차트가 여러 줄로 나뉜 경우까지 고려하기 위해 최소 2건 이상이면 탐색
@@ -1499,6 +1526,11 @@ def run_matching(hansol, daily, patient):
 
         target = int(hr["금액"])
         cand_rows = list(cand.to_dict("records"))
+        # 후보 수(n)에 대해 조합 수가 C(n,2)+…+C(n,6) 로 급증한다(n=25면 24만,
+        # n=60이면 5,600만, n=100이면 12억). 미매칭 한솔 건마다 반복되므로 상한을
+        # 넘으면 전수탐색을 건너뛰어 조합 폭발/세그폴트를 방지한다.
+        if len(cand_rows) > 24:
+            continue
         chosen = None
         max_r = min(6, len(cand_rows))
         for r in range(2, max_r + 1):
