@@ -1448,10 +1448,13 @@ def run_matching(hansol, daily, patient):
 
     matched_h, matched_dc = set(), set()
     results = []
+    # h_idx → 행 조회맵: add()가 매 매칭마다 전체 프레임을 불리언 스캔하지 않도록
+    # 한 번만 구축한다 (매칭 수 × 한솔 건수 만큼의 반복 스캔 제거).
+    h_by_idx = {int(r["h_idx"]): r for _, r in hansol.iterrows()}
 
     def add(rule, conf, h_idxs, d_row, amount_override=None, note=""):
         for hi in h_idxs:
-            hr = hansol[hansol["h_idx"] == hi].iloc[0]
+            hr = h_by_idx[int(hi)]
             matched_amt = int(amount_override) if amount_override is not None else int(hr["금액"])
             results.append(dict(
                 매칭규칙=rule, 확신도=conf,
@@ -2616,8 +2619,9 @@ def _hansol_card_by_chart(hansol, patient):
 
     일마(일일마감)·한솔에 차트번호가 없어도 한솔 승인번호 ↔ 차트(EMR) 결제메모 승인번호로
     직접 연결한다. 승인번호가 정확히 한 차트에만 대응할 때만 귀속(공동결제·미링크는 제외)해
-    허위 차이를 방지한다.
-    반환: {차트번호: (한솔카드합, 건수)} — 링크 불가 차트는 미포함(=한솔금액 unknown).
+    허위 차이를 방지한다. 취소 건은 음수로 차감해 net으로 귀속한다 — 당일 결제 후
+    당일 취소된 거래가 한솔카드에 양수로만 잡혀 차트(net) 대비 과대해지는 허위 차이 방지.
+    반환: {차트번호: (한솔카드 net합, 건수)} — 링크 불가 차트는 미포함(=한솔금액 unknown).
     """
     if (hansol is None or hansol.empty or patient is None or patient.empty
             or "분류" not in patient.columns or "승인번호목록" not in patient.columns
@@ -2640,7 +2644,7 @@ def _hansol_card_by_chart(hansol, patient):
             if len(clean_no(a)) >= 4:
                 appr_charts.setdefault(_ak(a), set()).add(ch)
 
-    h_ok = hansol[hansol["tx_status"] == "정상"]
+    h_ok = hansol[hansol["tx_status"].isin(["정상", "취소"])]
     h_card = h_ok[~h_ok["is_현금"]] if "is_현금" in h_ok.columns else h_ok
     acc: dict = {}  # 차트번호 → [금액합, 건수]
     for _, hr in h_card.iterrows():
@@ -2652,7 +2656,8 @@ def _hansol_card_by_chart(hansol, patient):
             continue
         ch = next(iter(charts))
         e = acc.setdefault(ch, [0, 0])
-        e[0] += int(hr["금액"])
+        sign = -1 if str(hr.get("tx_status", "")) == "취소" else 1
+        e[0] += sign * int(hr["금액"])
         e[1] += 1
     return {ch: (v[0], v[1]) for ch, v in acc.items()}
 
@@ -3108,14 +3113,18 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                 hint = str(r.get("동일금액상대", "")).replace("|", " ")[:40] or "-"
                 L.append(f"{gb}|{r.get('차트번호','')}|{nm}|{_f(r.get('금액'))}|{pay}|{hint}")
         if n_vC2:
-            L.append("·유형C2[금액불일치] 동일 차트번호·수납액 상이 → 금액/결제수단 오기재 의심")
-            L.append("차트#|환자|차트금액|일마금액|차이|차트결제|일마결제")
+            L.append("·유형C2[금액불일치] 동일 차트번호·수납액 상이 → 금액/결제수단 오기재 의심. "
+                     "'원인'에 환불 이중차감/미반영 진단, '한솔판정'에 PG 대조 결과(어느 파일이 "
+                     "틀렸는지)가 있으면 그대로 최우선 인용할 것")
+            L.append("차트#|환자|차트금액|일마금액|차이|차트결제|일마결제|원인|한솔판정")
             for _, r in vC2.head(15).iterrows():
                 nm = str(r.get("성명", ""))[:12].replace("|", " ")
                 pc = str(r.get("차트결제수단", ""))[:30].replace("|", " ")
                 dc = str(r.get("일마결제수단", ""))[:30].replace("|", " ")
+                cz = str(r.get("추정원인", "") or "-")[:120].replace("|", " ")
+                hv = str(r.get("한솔판정", "") or "-")[:70].replace("|", " ")
                 L.append(f"{r.get('차트번호','')}|{nm}|{_f(r.get('차트금액'))}|{_f(r.get('일마금액'))}|"
-                         f"{_f(r.get('차이'))}|{pc}|{dc}")
+                         f"{_f(r.get('차이'))}|{pc}|{dc}|{cz}|{hv}")
         if n_vC3:
             L.append("·유형C3[결제수단불일치] 총액 동일·채널 분배 상이 → 채널 합계 차이의 직접 원인 후보 "
                      "(환자 총액 비교론 안 보임 — 채널대사 차이와 대조 필수)")
@@ -3370,7 +3379,13 @@ AI_SYSTEM = (
     "[R13] 위치 명시: 모든 차이·누락 건은 어느 파일에 차이가 있는지 '[차트마감에만 존재]' "
     "'[일일마감에만 존재]' '[양쪽 존재·금액 상이]' 태그로 구체적으로 명시한다. "
     "일일마감에만 존재 = 차트(세무 기준) 누락 의심(세무위험 우선 검토), "
-    "차트마감에만 존재 = 일일마감 누락 의심."
+    "차트마감에만 존재 = 일일마감 누락 의심.\n"
+    "[R14] 환불 표기 방식 차이: 차트(EMR)는 환불을 '원거래 전액취소(음수 행) + 재승인(양수 "
+    "행)'으로, 일일마감은 '본행 + 환불 행 차감'으로 적는 경우가 있다. 일마 본행이 이미 환불 "
+    "반영된 재승인액인데 환불 행을 또 차감하면 환불 이중차감(일마 net 과소)이고, 반대로 "
+    "차트에 환불 행이 아직 없으면 차트 net 과대다. 유형C2의 '원인'에 환불 진단이 있으면 "
+    "그것을 그대로 인용하고, '한솔판정'(PG 카드 net이 어느 파일과 일치하는지)이 있으면 그 "
+    "방향을 최종 결론으로 삼는다 — 한솔=차트면 일일마감 정정, 한솔=일마면 차트 정정 권고."
 )
 
 AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호로 통합한 raw 구조):
@@ -3392,6 +3407,8 @@ STEP0. [데이터검증] 확정 오입력 우선 처리 (섹션이 있으면 절
     오기재일 가능성이 높으므로 별개 누락 2건이 아니라 한 쌍(오류 건 1건)으로 묶어 보고.
   · 유형C2(금액불일치): 동일번호·금액상이 → R5~R7 적용해 결제수단/금액 오기재 방향 제시.
     두 금액이 R11 오타 패턴이면 '금액 오타 의심'을 명시.
+    '원인'에 환불 이중차감/미반영 진단이 있으면 R14 적용 — 그 진단을 그대로 인용하고,
+    '한솔판정'이 있으면(PG가 어느 파일과 일치) 그 방향(일마 정정/차트 정정)을 결론으로 제시.
   · 유형C3(결제수단불일치): 총액 일치·채널 분배 상이 = 채널 합계 차이의 직접 원인 후보.
     [채널대사]의 채널별 차이값과 대조해 어느 환자의 분배 오류가 어느 채널 차이를 만드는지
     연결해 보고 (예: 카드 +50,000·현금 -50,000 분배 오류 → 카드채널 +50,000 차이 설명).
@@ -3431,6 +3448,8 @@ STEP4. [한솔 PG-only] · [일마 front-only] cross-match
 
 STEP5. [환불/취소] 행 부호 검토
   · 차트환불/일마환불 행이 채널대사에 정상 반영됐는지 확인 (음수 누락 시 차이 발생 가능).
+  · 채널 차이금액이 어느 환불 행 금액과 정확히 일치하면 R14(환불 이중차감/미반영) 패턴을
+    의심 — 그 환자의 차트 '취소+재승인' 행과 일마 '본행+환불행'을 대조하라고 권고.
 
 STEP6. 정합성 검산 (R10 — 출력에 결과를 반드시 포함)
   · 환자별 차이를 채널별로 합산해 [채널대사] 차이값과 대조: '채널차이 = Σ건별 차이'가 성립하는지 검산.
@@ -3444,7 +3463,7 @@ STEP6. 정합성 검산 (R10 — 출력에 결과를 반드시 포함)
 ### 데이터검증 확정건 (입력에 [데이터검증]이 있을 때만)
 - **유형B 차트번호오타**: {{환자}}(차트#{{차트마감#}} ↔ 일마기재 {{일일마감#}}) {{금액}}원 → 구글 일일마감 차트번호만 정정 (단순 오류건 · 차이금액 미포함 · 합계 영향 없음)
 - **유형C1 한쪽만존재**: [{{차트마감에만 존재/일일마감에만 존재}}] {{환자}}(차트#) {{금액}}원 → {{일일마감에만: 차트(세무 기준) 누락/환불미반영 검토 · 차트마감에만: 일일마감 누락 검토}} · 동일금액상대 있으면 "{{상대}}와 동일건 의심 — 한 쌍으로 검토"
-- **유형C2 금액불일치**: {{환자}}(차트#) 차트{{차트금액}}↔일마{{일마금액}}(차이 {{±}}) → {{결제수단/금액 오기재(R11 오타패턴이면 명시)}} 검토
+- **유형C2 금액불일치**: {{환자}}(차트#) 차트{{차트금액}}↔일마{{일마금액}}(차이 {{±}}) → {{결제수단/금액 오기재(R11 오타패턴이면 명시) / 환불 이중차감·미반영(R14, 원인·한솔판정 인용)}} 검토
 - **유형C3 결제수단불일치**: {{환자}}(차트#) 총액 {{금액}} 일치 · {{X↔Y 분배 상이}} → {{어느 채널 합계차이를 설명하는지}} + 결제수단 검토
 (해당 유형 0건이면 그 줄 생략. 검증 섹션 자체가 없으면 이 블록 전체 생략)
 
@@ -3814,12 +3833,113 @@ def _verif_aggregate_daily(daily, daily_refund=None):
     return out
 
 
-def build_verification(patient, daily, daily_refund=None, branch="", date=""):
+def _verif_refund_by_chart(patient, daily_refund):
+    """환불 정합성 진단용 보조 집계.
+
+    반환: (p_ref_by_ch, d_ref_by_ch)
+      p_ref_by_ch: 차트마감의 환불/취소 행 합계(양수) per 차트번호
+      d_ref_by_ch: 일일마감 환불 행 총액 per 차트번호
+    """
+    p_ref, d_ref = {}, {}
+    if (patient is not None and not patient.empty
+            and "is_취소" in patient.columns and "차트번호" in patient.columns):
+        pc = patient[patient["is_취소"]]
+        for ch, g in pc.groupby(pc["차트번호"].astype(str).str.strip()):
+            if ch:
+                p_ref[ch] = abs(int(g["금액"].sum()))
+    if (daily_refund is not None and not daily_refund.empty
+            and "차트번호" in daily_refund.columns and "총액" in daily_refund.columns):
+        for ch, g in daily_refund.groupby(
+                daily_refund["차트번호"].astype(str).str.strip()):
+            if ch:
+                d_ref[ch] = int(g["총액"].sum())
+    return p_ref, d_ref
+
+
+def _verif_refund_cause(diff, p_ref, d_ref):
+    """유형C2 차이(일마-차트)가 환불 표기 방식 차이로 설명되는지 진단 → 문구(또는 "").
+
+    실사례(잠실 7/15 조인태): 차트(EMR)는 환불을 '원거래 전액취소(음수) + 재승인(양수)'
+    두 행으로 적어 net에 이미 환불이 반영되는데, 일일마감은 본행에 재승인액(환불 반영 후
+    금액)을 적고 환불 행으로 또 차감 → 환불이 이중차감돼 일마 net이 환불액만큼 과소.
+    반대로 차트가 환불을 아직 안 태운 경우(차트 과대)도 같은 금액 패턴으로 나타나므로,
+    방향 판정은 한솔(PG) 대조(_verif_hansol_verdict)에 맡기고 여기선 패턴만 짚는다.
+    """
+    if diff == 0:
+        return ""
+    if d_ref and diff == -d_ref:
+        return (f"환불 정합성 의심: 일마가 환불 {d_ref:,}원을 본행과 별도로 차감 — "
+                "일마 본행이 이미 환불 반영된 재승인액이면 이중차감(일마 오류), "
+                "아니면 차트 환불 미반영(차트 오류) → 한솔판정 참조")
+    if p_ref and diff == p_ref:
+        return (f"일마 환불 미반영 의심: 차트 환불 {p_ref:,}원이 일마에 반영되지 않음 "
+                "(일마에 환불 행 누락 가능)")
+    if d_ref and diff == d_ref:
+        return (f"차트 환불 과다반영/일마 환불행 부호 의심: 일마 환불 {d_ref:,}원 만큼 "
+                "일마가 오히려 큼 — 양쪽 환불 행 부호·중복 확인")
+    return ""
+
+
+def _verif_hansol_verdict(h_net, p_card, d_card, h_amts=None):
+    """한솔(PG) 카드 net으로 차트↔일마 중 어느 쪽이 맞는지 3자 판정 → 문구(또는 "").
+
+    한솔은 카드 단말 원본이므로 카드금액이 어긋난 환자에서 '누가 맞는지'를 결정한다.
+    1순위: 승인번호 링크로 환자에 귀속된 한솔 net(h_net)과 정확 대조(확정 판정).
+    2순위(폴백): 차트 결제메모에 승인번호가 없어 링크 불가(h_net=None)면, 그날 한솔
+    승인금액 목록(h_amts, 정상-취소 net 건수)에 차트금액/일마금액이 존재하는지로
+    정황 판정한다 — 실사례(잠실 7/15 조인태): 메모에 승인번호가 없어도 한솔에
+    341,000 승인은 있고 286,000은 없으므로 차트마감 값을 지지할 수 있다.
+    카드금액이 같은 환자는 판정하지 않는다.
+    """
+    if p_card == d_card:
+        return ""
+    if h_net is not None:
+        if h_net == p_card:
+            return f"한솔(PG)카드 {h_net:,} = 차트마감 일치 → 일일마감 쪽 오류 확정적"
+        if h_net == d_card:
+            return f"한솔(PG)카드 {h_net:,} = 일일마감 일치 → 차트마감 쪽 오류 확정적"
+        return f"한솔(PG)카드 {h_net:,} — 3자 모두 상이(분할결제/타단말 가능) 수동확인"
+    if h_amts:
+        p_in = p_card > 0 and h_amts.get(p_card, 0) > 0
+        d_in = d_card > 0 and h_amts.get(d_card, 0) > 0
+        if p_in and not d_in:
+            return (f"한솔에 차트금액 {p_card:,} 승인 있음·일마금액 {d_card:,} 없음 "
+                    "→ 차트마감 지지(정황·승인번호 미링크)")
+        if d_in and not p_in:
+            return (f"한솔에 일마금액 {d_card:,} 승인 있음·차트금액 {p_card:,} 없음 "
+                    "→ 일일마감 지지(정황·승인번호 미링크)")
+    return ""
+
+
+def _verif_hansol_amount_counter(hansol):
+    """한솔 카드 승인금액 → net 건수 Counter (정상 +1 / 취소 -1, 양수만 유지).
+
+    승인번호 미링크 환자의 정황 판정(_verif_hansol_verdict 2순위)용. 당일 결제 후
+    당일 취소된 금액은 상쇄돼 존재하지 않는 것으로 본다.
+    """
+    from collections import Counter
+    if hansol is None or hansol.empty or "tx_status" not in hansol.columns:
+        return None
+    sel = hansol[hansol["tx_status"].isin(["정상", "취소"])]
+    if "is_현금" in sel.columns:
+        sel = sel[~sel["is_현금"]]
+    c = Counter()
+    for _, hr in sel.iterrows():
+        c[int(hr["금액"])] += -1 if str(hr.get("tx_status", "")) == "취소" else 1
+    return {amt: n for amt, n in c.items() if n > 0}
+
+
+def build_verification(patient, daily, daily_refund=None, branch="", date="",
+                       hansol=None):
     """차트마감↔일일마감 환자단위 대조로 오류 '건'(어떤 환자·어떤 거래)을 확정 추출.
 
     유형B  차트번호오타   : 이름·금액 동일·번호만 상이 → 그 건의 번호가 오류
     유형C1 한쪽만존재     : 한 파일에만 있는 환자 → 그 건의 누락/미반영이 오류
-    유형C2 금액불일치     : 동일 번호·총액 상이 → 그 건의 금액이 오류
+    유형C2 금액불일치     : 동일 번호·총액 상이 → 그 건의 금액이 오류.
+                            차이가 환불 행 금액과 정확히 일치하면 '환불 이중차감/미반영'
+                            을 추정원인으로 진단하고, hansol을 주면 승인번호 링크로
+                            한솔(PG) 카드 net과 대조해 어느 파일이 틀렸는지 판정까지
+                            제시한다(잠실 7/15 조인태 사례 — 일마 환불 이중차감).
     유형C3 결제수단불일치 : 동일 번호·총액 일치·채널 분배 상이 → 그 건의 결제수단이
                             오류 (채널 합계 차이를 만드는 직접 원인 — 총액 비교만으론
                             안 잡히던 건을 확정 포착)
@@ -3827,6 +3947,9 @@ def build_verification(patient, daily, daily_refund=None, branch="", date=""):
            '유형C3_결제수단불일치'} DataFrame dict."""
     P = _verif_aggregate_patient(patient)
     D = _verif_aggregate_daily(daily, daily_refund)
+    p_ref_by_ch, d_ref_by_ch = _verif_refund_by_chart(patient, daily_refund)
+    h_card_by_ch = _hansol_card_by_chart(hansol, patient) if hansol is not None else {}
+    h_amts = _verif_hansol_amount_counter(hansol) if hansol is not None else None
     p_only = set(P) - set(D)
     d_only = set(D) - set(P)
     both = set(P) & set(D)
@@ -3910,10 +4033,18 @@ def build_verification(patient, daily, daily_refund=None, branch="", date=""):
     for ch in sorted(both):
         p, d = P[ch], D[ch]
         if p["amt"] != d["amt"]:
+            diff = d["amt"] - p["amt"]
+            pb2 = _verif_method_buckets(p.get("meth"))
+            db2 = _verif_method_buckets(d.get("meth"))
+            h_net = h_card_by_ch.get(ch, (None, 0))[0]
             typeC2.append({"지점": branch, "날짜": date, "차트번호": ch,
                            "성명": p["name"] or d["name"],
-                           "차트금액": p["amt"], "일마금액": d["amt"], "차이": d["amt"] - p["amt"],
-                           "차트결제수단": p["methods"], "일마결제수단": d["methods"]})
+                           "차트금액": p["amt"], "일마금액": d["amt"], "차이": diff,
+                           "차트결제수단": p["methods"], "일마결제수단": d["methods"],
+                           "추정원인": _verif_refund_cause(
+                               diff, p_ref_by_ch.get(ch, 0), d_ref_by_ch.get(ch, 0)),
+                           "한솔판정": _verif_hansol_verdict(
+                               h_net, pb2["카드"], db2["카드"], h_amts)})
             continue
         pb = _verif_method_buckets(p.get("meth"))
         db = _verif_method_buckets(d.get("meth"))
@@ -3936,7 +4067,7 @@ def build_verification(patient, daily, daily_refund=None, branch="", date=""):
              "차트금액", "일마금액", "금액일치", "이름일치", "추정원인"]
     colsC1 = ["지점", "날짜", "구분", "차트번호", "성명", "금액", "결제수단", "동일금액상대"]
     colsC2 = ["지점", "날짜", "차트번호", "성명", "차트금액", "일마금액", "차이",
-              "차트결제수단", "일마결제수단"]
+              "차트결제수단", "일마결제수단", "추정원인", "한솔판정"]
     colsC3 = ["지점", "날짜", "차트번호", "성명", "총액",
               "차트결제수단", "일마결제수단", "차이요약", "추정원인"]
     dfB = pd.DataFrame(typeB, columns=colsB)
@@ -4314,8 +4445,12 @@ def _render_period_results():
     if sel_day in gs_daily:
         daily_day, refund_day = gs_daily[sel_day]
         p_day = patient[patient["날짜"] == sel_day] if "날짜" in patient.columns else patient
+        h_day = (hansol[hansol["날짜"] == sel_day]
+                 if hansol is not None and not hansol.empty and "날짜" in hansol.columns
+                 else None)
         verif_day = build_verification(p_day, daily_day, refund_day,
-                                       branch=gs_branch or "", date=sel_day)
+                                       branch=gs_branch or "", date=sel_day,
+                                       hansol=h_day)
         nB = len(verif_day["유형B_차트번호오타"])
         nC1 = len(verif_day["유형C1_한쪽만존재"])
         nC2 = len(verif_day["유형C2_금액불일치"])
@@ -4337,6 +4472,8 @@ def _render_period_results():
                 st.markdown("#### 🅒2 금액 불일치 (동일 차트번호, 수납액 상이)")
                 st.dataframe(verif_day["유형C2_금액불일치"].drop(columns=["지점", "날짜"]),
                              width="stretch", hide_index=True)
+                st.caption("💡 '추정원인'은 환불 이중차감/미반영 자동 진단, '한솔판정'은 "
+                           "한솔(PG) 원본 대조로 어느 파일이 틀렸는지 판정한 결과입니다.")
             if nC3:
                 st.markdown("#### 🅒3 결제수단 불일치 (총액 일치, 채널 분배 상이)")
                 st.dataframe(verif_day["유형C3_결제수단불일치"].drop(columns=["지점", "날짜"]),
@@ -4797,7 +4934,9 @@ def main():
 
         # 탭 3개 - 메인 탭은 의심 후보 추적
         # 검증 결과는 tab3(AI 진단 입력)·tab4(검증 표) 양쪽에서 쓰므로 한 번만 계산
-        verif = build_verification(patient, daily, daily_refund)
+        # 한솔이 있으면 유형C2(금액불일치)에 PG 기준 3자 판정(어느 파일 오류인지)이 붙는다.
+        verif = build_verification(patient, daily, daily_refund,
+                                   hansol=hansol if has_hansol else None)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "🎯 차이 원인 추적 (★메인)",
@@ -5069,6 +5208,11 @@ def main():
                         verif["유형C2_금액불일치"].drop(columns=["지점", "날짜"]),
                         width="stretch", hide_index=True,
                     )
+                    st.caption("💡 **추정원인**: 차이가 환불 행 금액과 일치하면 환불 "
+                               "이중차감/미반영을 자동 진단합니다. **한솔판정**: 한솔(PG) "
+                               "카드 원본과 대조해 차트마감·일일마감 중 **어느 파일이 "
+                               "틀렸는지**를 판정합니다 (예: 일마 본행이 환불 반영된 "
+                               "재승인액인데 환불 행을 또 차감한 이중차감 케이스).")
                 if c3:
                     st.markdown("#### 🅒3 결제수단 불일치 (총액 일치, 채널 분배 상이)")
                     st.dataframe(

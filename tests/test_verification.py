@@ -126,6 +126,130 @@ def test_ai_text_verification_includes_c3(app):
     assert "유형C3" in text and "김철수" in text
 
 
+def _refund_double_deduction_inputs(app):
+    """잠실 7/15 조인태 실사례 축소판.
+
+    차트(EMR): 카드 396,000 결제 → 전액취소(-396,000) → 재승인 341,000 = net 341,000.
+    일일마감: 본행 카드 341,000(이미 환불 반영된 재승인액) + 환불행 55,000 또 차감
+              = net 286,000 (환불 이중차감 오류).
+    한솔(PG): 341,000 승인 1건 = 차트와 일치 → 일일마감 오류 확정.
+    """
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["30366", "조인태", "카드(현대)", 396000, ""],
+        ["30366", "조인태", "환불-카드", 396000, ""],
+        ["30366", "조인태", "카드(재승인)", 341000, "406318"],
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체"],
+        [1, "30366", "조인태", "구환", 341000, 0, 0],
+        [2, "30366", "조인태", "환불", 55000, 0, 0],
+    ))
+    hansol = app.parse_hansol(F.hansol_raw(
+        금액=[341000], 승인번호=["406318"], 거래시간=["182751"],
+        거래상태=["정상승인"], 구분=["카드"], 매입사=["현대카드"],
+    ))
+    return patient, daily, refund, hansol
+
+
+def test_verification_refund_double_deduction_diagnosed(app):
+    """일마 환불 이중차감(잠실 7/15 조인태 유형)이 유형C2 추정원인으로 진단돼야 함."""
+    patient, daily, refund, _ = _refund_double_deduction_inputs(app)
+    verif = app.build_verification(patient, daily, refund)
+    c2 = verif["유형C2_금액불일치"]
+    assert len(c2) == 1
+    r = c2.iloc[0]
+    assert r["차트번호"] == "30366"
+    assert r["차트금액"] == 341000 and r["일마금액"] == 286000 and r["차이"] == -55000
+    assert "환불" in r["추정원인"] and "55,000" in r["추정원인"]
+    assert "이중차감" in r["추정원인"]
+
+
+def test_verification_refund_hansol_verdict(app):
+    """한솔(PG)을 주면 차트↔일마 중 어느 파일이 틀렸는지 3자 판정까지 제시."""
+    patient, daily, refund, hansol = _refund_double_deduction_inputs(app)
+    verif = app.build_verification(patient, daily, refund, hansol=hansol)
+    r = verif["유형C2_금액불일치"].iloc[0]
+    assert "차트마감 일치" in r["한솔판정"]
+    assert "일일마감 쪽 오류" in r["한솔판정"]
+
+
+def test_verification_hansol_verdict_fallback_without_approval_link(app):
+    """실제 잠실 7/15 조건: 차트 결제메모에 승인번호가 없어도(미링크)
+    한솔 승인금액 존재 여부로 정황 판정이 나와야 함."""
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["30366", "조인태", "카드(현대)", 396000, "마취크림 환불로 수가 넣음"],
+        ["30366", "조인태", "환불-카드", 396000, "마취크림 환불로 수가 넣음"],
+        ["30366", "조인태", "카드(재승인)", 341000, ""],   # 승인번호 없음
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체"],
+        [1, "30366", "조인태", "구환", 341000, 0, 0],
+        [2, "30366", "조인태", "환불", 55000, 0, 0],
+    ))
+    hansol = app.parse_hansol(F.hansol_raw(
+        금액=[341000], 승인번호=["406318"], 거래시간=["182751"],
+        거래상태=["정상승인"], 구분=["카드"], 매입사=["현대카드"],
+    ))
+    verif = app.build_verification(patient, daily, refund, hansol=hansol)
+    r = verif["유형C2_금액불일치"].iloc[0]
+    assert "차트마감 지지" in r["한솔판정"] and "정황" in r["한솔판정"]
+
+
+def test_verification_refund_missing_in_daily(app):
+    """반대 방향: 차트에는 환불이 반영됐는데 일마에 환불행이 누락된 경우."""
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["700", "박환불", "카드(국민)", 300000, ""],
+        ["700", "박환불", "환불-카드", 50000, ""],
+    ))
+    daily, refund = app.parse_daily(F.table_raw(
+        ["내원순서", "차트번호", "성명", "구분", "카드", "현금", "이체"],
+        [1, "700", "박환불", "구환", 300000, 0, 0],   # 환불행 없음 → 일마 과대
+    ))
+    verif = app.build_verification(patient, daily, refund)
+    c2 = verif["유형C2_금액불일치"]
+    assert len(c2) == 1
+    r = c2.iloc[0]
+    assert r["차이"] == 50000
+    assert "일마 환불 미반영" in r["추정원인"]
+
+
+def test_hansol_card_by_chart_nets_cancels(app):
+    """한솔 취소 건이 승인번호 링크 시 음수로 차감돼 net으로 귀속돼야 함."""
+    hansol = app.parse_hansol(F.hansol_raw(
+        금액=[396000, 396000, 341000],
+        승인번호=["111222", "111222", "406318"],
+        거래시간=["100000", "110000", "120000"],
+        거래상태=["정상승인", "취소승인", "정상승인"],
+        구분=["카드", "카드", "카드"],
+        매입사=["현대카드", "현대카드", "현대카드"],
+    ))
+    patient = app.parse_patient(F.table_raw(
+        ["차트번호", "이름", "결제수단", "비급여(과세총금액)", "결제메모"],
+        ["30366", "조인태", "카드(현대)", 396000, "111222"],
+        ["30366", "조인태", "환불-카드", 396000, "111222"],
+        ["30366", "조인태", "카드(재승인)", 341000, "406318"],
+    ))
+    m = app._hansol_card_by_chart(hansol, patient)
+    # 정상 396,000 - 취소 396,000 + 정상 341,000 = 341,000 (차트 net과 일치)
+    assert m["30366"][0] == 341000
+
+
+def test_ai_text_c2_includes_refund_cause(app):
+    """AI 입력 유형C2 섹션에 환불 진단(원인)·한솔판정 컬럼이 실려야 함."""
+    import pandas as pd
+    patient, daily, refund, hansol = _refund_double_deduction_inputs(app)
+    verif = app.build_verification(patient, daily, refund, hansol=hansol)
+    totals = app.compute_totals(hansol, daily, refund, patient)
+    channel = app.compute_channel_recon(totals)
+    text = app.build_ai_text(hansol, daily, refund, patient, channel,
+                             None, None, None, {}, totals=totals, verif=verif)
+    assert "이중차감" in text
+    assert "한솔판정" in text
+
+
 def test_verification_refund_only_daily_patient(app):
     """일마에 환불만 있는 환자(net 음수)도 차트 음수 행과 대조돼 일치 처리."""
     patient = app.parse_patient(F.table_raw(
