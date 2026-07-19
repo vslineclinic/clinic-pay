@@ -48,8 +48,8 @@ def test_ai_text_gap_summary_single_cause(app):
                              ctx["p1_full"], ctx["h_um"], ctx["d_um"], ctx["suspects"],
                              totals=ctx["totals"])
     assert "[오차요약" in text
-    assert "일마가 차트보다 5,000원 적음(-5,000)" in text       # 차트 기준 부호·금액
-    assert "한솔이 차트보다 5,000원 적음(-5,000)" in text
+    assert "구글 일일마감이 베가스 마감보다 5,000원 적음(-5,000)" in text       # 차트 기준 부호·금액
+    assert "단말기 마감이 베가스 마감보다 5,000원 적음(-5,000)" in text
     assert "단일일치후보(유일): 이영희(차트#200)" in text        # 단일 원인 힌트
     assert "전액 환자단위 분해·잔여 0" in text                   # 검산
 
@@ -65,9 +65,9 @@ def test_ai_text_gap_summary_front_only_hint(app):
     text = app.build_ai_text(ctx["H"], ctx["D"], ctx["DR"], ctx["P"], ctx["channel"],
                              ctx["p1_full"], ctx["h_um"], ctx["d_um"], ctx["suspects"],
                              totals=ctx["totals"])
-    assert "일마가 차트보다 40,000원 많음(+40,000)" in text
+    assert "구글 일일마감이 베가스 마감보다 40,000원 많음(+40,000)" in text
     assert "단일일치후보(유일): 최지우(차트#400)[일일마감에만 존재]" in text
-    assert "한솔(PG)에 없음" in text and "미수납" in text
+    assert "단말기 마감(PG)에 없음" in text and "미수납" in text
 
 
 def test_ai_text_gap_summary_combo_cause(app):
@@ -81,7 +81,7 @@ def test_ai_text_gap_summary_combo_cause(app):
     text = app.build_ai_text(ctx["H"], ctx["D"], ctx["DR"], ctx["P"], ctx["channel"],
                              ctx["p1_full"], ctx["h_um"], ctx["d_um"], ctx["suspects"],
                              totals=ctx["totals"])
-    assert "일마가 차트보다 10,000원 적음(-10,000)" in text
+    assert "구글 일일마감이 베가스 마감보다 10,000원 적음(-10,000)" in text
     assert "단일일치후보" not in text
     assert "조합일치후보(2건 복합)" in text
     assert "김철수(차트#100)" in text and "이영희(차트#200)" in text
