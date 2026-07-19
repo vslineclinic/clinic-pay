@@ -41,6 +41,75 @@ def test_ai_text_mismatch_has_star2_section(app):
     assert "차트번호별 3-way 통합" in text
 
 
+def test_ai_text_gap_summary_single_cause(app):
+    """차트 200만 35,000(일마·한솔 30,000) → 오차요약에 차트 기준 서술 + 단일일치후보(유일)."""
+    ctx = _full_pipeline(app, F.mismatch_three_files)
+    text = app.build_ai_text(ctx["H"], ctx["D"], ctx["DR"], ctx["P"], ctx["channel"],
+                             ctx["p1_full"], ctx["h_um"], ctx["d_um"], ctx["suspects"],
+                             totals=ctx["totals"])
+    assert "[오차요약" in text
+    assert "구글 일일마감이 베가스 마감보다 5,000원 적음(-5,000)" in text       # 차트 기준 부호·금액
+    assert "단말기 마감이 베가스 마감보다 5,000원 적음(-5,000)" in text
+    assert "단일일치후보(유일): 이영희(차트#200)" in text        # 단일 원인 힌트
+    assert "전액 환자단위 분해·잔여 0" in text                   # 검산
+
+
+def test_ai_text_gap_summary_front_only_hint(app):
+    """일마에만 카드 40,000(한솔·차트에 없음) → '한솔(PG)에 없음 = 미수납 의심' 위치 힌트."""
+    def scenario():
+        hansol, daily, patient = F.basic_three_files()
+        daily.loc[len(daily)] = [4, "400", "최지우", 40000, 0, 0]
+        return hansol, daily, patient
+
+    ctx = _full_pipeline(app, scenario)
+    text = app.build_ai_text(ctx["H"], ctx["D"], ctx["DR"], ctx["P"], ctx["channel"],
+                             ctx["p1_full"], ctx["h_um"], ctx["d_um"], ctx["suspects"],
+                             totals=ctx["totals"])
+    assert "구글 일일마감이 베가스 마감보다 40,000원 많음(+40,000)" in text
+    assert "단일일치후보(유일): 최지우(차트#400)[일일마감에만 존재]" in text
+    assert "단말기 마감(PG)에 없음" in text and "미수납" in text
+
+
+def test_ai_text_gap_summary_combo_cause(app):
+    """단일 일치가 없고 2건 조합(−5,000 + −5,000 = −10,000)일 때 조합일치후보 제시."""
+    def scenario():
+        hansol, daily, patient = F.mismatch_three_files()   # 200: 일-차 -5,000
+        daily.iloc[1, 3] = 45000                            # 100 김철수 카드 45,000(차트 50,000) → -5,000
+        return hansol, daily, patient
+
+    ctx = _full_pipeline(app, scenario)
+    text = app.build_ai_text(ctx["H"], ctx["D"], ctx["DR"], ctx["P"], ctx["channel"],
+                             ctx["p1_full"], ctx["h_um"], ctx["d_um"], ctx["suspects"],
+                             totals=ctx["totals"])
+    assert "구글 일일마감이 베가스 마감보다 10,000원 적음(-10,000)" in text
+    assert "단일일치후보" not in text
+    assert "조합일치후보(2건 복합)" in text
+    assert "김철수(차트#100)" in text and "이영희(차트#200)" in text
+
+
+def test_find_exact_combos_bounded_and_exact(app):
+    items = [("100", -5000), ("200", -5000), ("300", 7000), ("400", -12000)]
+    combos = app._find_exact_combos(items, -10000)
+    assert combos, "합계 -10,000 조합을 찾아야 함"
+    assert all(sum(v for _, v in c) == -10000 for c in combos)
+    # (-5000, -5000) 페어 포함
+    assert any({ch for ch, _ in c} == {"100", "200"} for c in combos)
+    # 일치 조합이 없으면 빈 목록
+    assert app._find_exact_combos(items, 999) == []
+
+
+def test_patient_channel_diffs_channels(app):
+    pp = {"100": {"카드": 50000, "현금": 0, "이체": 0, "플랫폼": 0},
+          "300": {"카드": 0, "현금": 20000, "이체": 0, "플랫폼": 0}}
+    dp = {"100": {"카드": 45000, "현금": 0, "이체": 0, "플랫폼": 0},
+          "300": {"카드": 0, "현금": 0, "이체": 20000, "플랫폼": 0}}
+    diffs = app._patient_channel_diffs(pp, dp)
+    assert diffs["카드"] == [("100", -5000)]
+    # 현금→이체 이동은 현금+이체 채널 합계로는 0 → 미포함 (채널 정의 = compute_channel_recon)
+    assert diffs["현금+이체"] == []
+    assert diffs["플랫폼"] == []
+
+
 def test_ai_text_respects_max_chars(app):
     ctx = _full_pipeline(app, F.mismatch_three_files)
     text = app.build_ai_text(ctx["H"], ctx["D"], ctx["DR"], ctx["P"], ctx["channel"],
