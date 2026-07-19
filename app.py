@@ -8,9 +8,11 @@
 원칙:
   - 채널 합계 차이 → 의심 후보(소수) → AI 한 줄 진단 흐름
   - 1:1 매칭은 후보 식별 도구로만 사용 (메인 산출물 아님)
-  - AI 입력: 차트번호·승인번호로 3개 파일을 join한 통합 raw 구조 (≤ ~8KB / ~3K토큰)
-    → AI가 단순 비교가 아닌 cross-file 추적 분석 수행
-  - 출력 ≤ 900토큰 / Gemini 무료 한도(2.5-flash-lite: 250K TPM) 내
+  - AI 입력: 차트번호·승인번호로 3개 파일을 join한 통합 raw 구조 (≤ ~100KB / ~40K토큰)
+    하루 한솔 500건·일일마감 500명·차트마감 500명 규모 기준으로 섹션 캡 설계.
+    차이환자의 원시 거래행까지 제공 → AI가 요약 받아쓰기가 아닌 행 단위 추적 분석 수행
+  - 무료 한도 병목은 RPD(호출수)이지 요청당 토큰이 아님 (TPM 250K 內, 캐시로 재호출 절약)
+  - 출력 ≤ 900토큰(별도로 thinking 토큰 활성 — 추론 강화) / Gemini 무료 한도 내
 """
 
 import importlib
@@ -2968,18 +2970,26 @@ def _safe_int(v, default=0):
 
 def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                   p1_full, h_um, d_um, suspects_by_channel,
-                  totals=None, verif=None, max_chars=8000):
+                  totals=None, verif=None, max_chars=100_000):
     """3개 파일(한솔/일마/차트)을 차트번호·승인번호 join으로 유기적 연결한 통합 raw 구조.
     AI가 사전요약을 rephrase하는게 아니라 cross-file 추적분석을 수행할 수 있게 한다.
+
+    한도 설계 (하루 한솔 카드 500건 · 일일마감 500명 · 차트마감 500명 가정):
+      무료 티어 병목은 RPD(호출수)이지 요청당 토큰이 아니다 (TPM 250K · 컨텍스트 1M).
+      max_chars 100K자 ≈ 40K토큰으로 TPM의 ~16% — 전 섹션 캡을 500명 규모에 맞춰
+      열어도 한도 내이며, 상쇄쌍·소액 건이 캡에 잘려 AI가 못 보는 문제를 없앤다.
 
     섹션 구성:
       [META]              — 파일별 건수·총액 (방향감각)
       [채널대사]           — 채널×파일 합계·차이 (분석 진입점)
-      [★★승인번호확정]    — 한솔↔차트 승인번호 매핑 + 금액불일치 (코드추출 확정단서)
-      [차트번호3way통합]   — 한 환자의 차트/일마/한솔 채널별 금액을 한 줄로 (오기재 패턴추적)
-      [한솔PG-only]        — PG미매칭 + 동일금액 일마환자 hint (누락추정)
-      [일마front-only]     — front미매칭 카드 (PG에 없음 = 결제수단 오기재 의심)
-      [차트환불/일마환불]   — 합계에 영향 주는 음수 행
+      [데이터검증]         — 코드 확정 오입력 의심 (유형별 50건)
+      [★★승인번호확정]    — 한솔↔차트 승인번호 매핑 + 금액불일치 (코드추출 확정단서, 30건)
+      [차트번호3way통합]   — 한 환자의 차트/일마/한솔 채널별 금액을 한 줄로 (200명)
+      [원시거래행]         — 차이환자의 파일별 개별 행 (40명) — pivot 합계가 아닌 행 단위
+                            대조로 분할결제·중복기재·환불 이중차감을 AI가 직접 추적
+      [한솔PG-only]        — PG미매칭 + 동일금액·오타패턴 일마환자 hint (100건)
+      [일마front-only]     — front미매칭 카드 (PG에 없음 = 결제수단 오기재 의심, 100건)
+      [차트환불/일마환불]   — 합계에 영향 주는 음수 행 (각 40건)
 
     구분자 파이프(|). 숫자 천단위 콤마. 차이가 0이면 META+채널대사만 반환.
     """
@@ -3095,7 +3105,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                      "오입력 불가(시스템 기재) → 항상 구글 일일마감 쪽 수기오류 — 일일마감에서 해당 "
                      "번호를 찾아 정정만 하면 됨(단순 오류건·차이금액 집계 미포함)")
             L.append("환자|차트마감#|일일마감#|금액|원인")
-            for _, r in vB.head(15).iterrows():
+            for _, r in vB.head(50).iterrows():
                 nm = str(r.get("성명", ""))[:14].replace("|", " ")
                 cause = str(r.get("추정원인", "")).replace("일일마감 차트번호 수기오류", "").strip("()")
                 L.append(f"{nm}|{r.get('차트마감_차트번호','')}|{r.get('일일마감_차트번호','')}|"
@@ -3106,7 +3116,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                      "차트마감에만 존재=일일마감 누락 의심. "
                      "'동일금액상대'가 있으면 양쪽이 같은 건일 가능성 높음(이름/번호 오기재) → 한 건으로 묶어 보고")
             L.append("구분|차트#|환자|금액|결제수단|동일금액상대")
-            for _, r in vC1.head(15).iterrows():
+            for _, r in vC1.head(50).iterrows():
                 nm = str(r.get("성명", ""))[:12].replace("|", " ")
                 gb = "[" + str(r.get("구분", "")).replace("|", " ") + "]"
                 pay = str(r.get("결제수단", ""))[:30].replace("|", " ")
@@ -3117,7 +3127,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                      "'원인'에 환불 이중차감/미반영 진단, '한솔판정'에 PG 대조 결과(어느 파일이 "
                      "틀렸는지)가 있으면 그대로 최우선 인용할 것")
             L.append("차트#|환자|차트금액|일마금액|차이|차트결제|일마결제|원인|한솔판정")
-            for _, r in vC2.head(15).iterrows():
+            for _, r in vC2.head(50).iterrows():
                 nm = str(r.get("성명", ""))[:12].replace("|", " ")
                 pc = str(r.get("차트결제수단", ""))[:30].replace("|", " ")
                 dc = str(r.get("일마결제수단", ""))[:30].replace("|", " ")
@@ -3129,7 +3139,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             L.append("·유형C3[결제수단불일치] 총액 동일·채널 분배 상이 → 채널 합계 차이의 직접 원인 후보 "
                      "(환자 총액 비교론 안 보임 — 채널대사 차이와 대조 필수)")
             L.append("차트#|환자|총액|차트결제|일마결제|차이요약|원인")
-            for _, r in vC3.head(15).iterrows():
+            for _, r in vC3.head(50).iterrows():
                 nm = str(r.get("성명", ""))[:12].replace("|", " ")
                 pc = str(r.get("차트결제수단", ""))[:30].replace("|", " ")
                 dc = str(r.get("일마결제수단", ""))[:30].replace("|", " ")
@@ -3169,7 +3179,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
         star2_all.sort(key=lambda x: (0 if "gap일치" in str(x["출처"]) else 1, -abs(int(x["금액"]))))
         L.append("\n[★★ 승인번호확정매칭 — 한솔↔차트 동일환자·금액불일치 (1순위)]")
         L.append("환자|차이금액|단서")
-        for s in star2_all[:10]:
+        for s in star2_all[:30]:
             nm = str(s.get("환자", ""))[:14].replace("|", " ")
             clue = str(s.get("단서", ""))[:90].replace("|", " ")
             L.append(f"{nm}|{int(s['금액']):+,}|{clue}")
@@ -3229,12 +3239,12 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
 
     cross_rows.sort(key=lambda x: -x[0])
     if cross_rows:
-        L.append("\n[차트번호별 3-way 통합 — 차이있는 환자, gap큰순 TOP25]")
+        L.append(f"\n[차트번호별 3-way 통합 — 차이있는 환자 전체 {len(cross_rows)}명, gap큰순 (표시 최대200)]")
         if has_hansol:
             L.append("차트#|이름|차트(카/현/이/플)|일마(카/현/이/플)|한솔카드(건)|차트승인말미|차이요약")
         else:
             L.append("차트#|이름|차트(카/현/이/플)|일마(카/현/이/플)|차트승인말미|차이요약")
-        for _, ch, p, d, h_amt, h_cnt, diffs in cross_rows[:25]:
+        for _, ch, p, d, h_amt, h_cnt, diffs in cross_rows[:200]:
             nm = name_map.get(ch, "")[:10].replace("|", " ")
             p_str = f"{p['카드']:,}/{p['현금']:,}/{p['이체']:,}/{p['플랫폼']:,}"
             d_str = f"{d['카드']:,}/{d['현금']:,}/{d['이체']:,}/{d['플랫폼']:,}"
@@ -3246,6 +3256,95 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                 L.append(f"{ch}|{nm}|{p_str}|{d_str}|{h_str}|{appr}|{diff_str}")
             else:
                 L.append(f"{ch}|{nm}|{p_str}|{d_str}|{appr}|{diff_str}")
+
+    # ── [원시거래행 — 차이환자 개별 행] ───────────
+    # pivot 합계만으론 분할결제·중복기재·환불 이중차감을 구분할 수 없다.
+    # 차이가 큰 환자에 한해 세 파일의 개별 행(승인번호·시각 포함)을 그대로 제공해
+    # AI가 코드 판정을 받아쓰는 게 아니라 행 단위로 직접 재계산·대조하게 한다.
+    if cross_rows:
+        def _cell(v, n):
+            s = "" if v is None else str(v)
+            return ("" if s in ("nan", "None") else s)[:n]
+
+        detail_charts = [r[1] for r in cross_rows[:40]]
+        detail_set = set(detail_charts)
+
+        # 한솔 행을 승인번호(말미8) → 차트번호로 링크 (_hansol_card_by_chart와 동일 규칙:
+        # 카드분류 승인번호가 정확히 한 차트에만 대응할 때만 귀속, 현금영수증 제외)
+        h_rows_by_chart = {}
+        if (has_hansol and "승인번호" in hansol.columns
+                and not patient.empty and "승인번호목록" in patient.columns
+                and "분류" in patient.columns):
+            appr_charts_raw = {}
+            for _, pr in patient[patient["분류"] == "카드"].iterrows():
+                pch = clean_no(pr.get("차트번호", ""))
+                al = pr.get("승인번호목록", [])
+                if not pch or not isinstance(al, list):
+                    continue
+                for a in al:
+                    s = clean_no(a)
+                    if len(s) >= 4:
+                        appr_charts_raw.setdefault(s[-8:], set()).add(pch)
+            for _, hr in hansol.iterrows():
+                if str(hr.get("tx_status", "")) not in ("정상", "취소"):
+                    continue
+                if bool(hr.get("is_현금", False)):
+                    continue
+                a = clean_no(hr.get("승인번호", ""))
+                if len(a) < 4:
+                    continue
+                charts = appr_charts_raw.get(a[-8:])
+                if not charts or len(charts) != 1:
+                    continue
+                hch = next(iter(charts))
+                if hch in detail_set:
+                    h_rows_by_chart.setdefault(hch, []).append(hr)
+
+        p_rows_by_chart = {}
+        if not patient.empty and "차트번호" in patient.columns:
+            for _, pr in patient.iterrows():
+                pch = clean_no(pr.get("차트번호", ""))
+                if pch in detail_set:
+                    p_rows_by_chart.setdefault(pch, []).append(pr)
+
+        d_rows_by_chart = {}
+        for frame, tag in [(daily, "일마"), (daily_refund, "일마환불")]:
+            if frame is None or frame.empty:
+                continue
+            for _, dr in frame.iterrows():
+                dch = clean_no(dr.get("차트번호", ""))
+                if dch in detail_set:
+                    d_rows_by_chart.setdefault(dch, []).append((tag, dr))
+
+        L.append("\n[원시거래행 — 차이환자 개별 행 (gap큰순 40명): 합계가 아닌 행 단위로 "
+                 "분할결제 합산·중복기재·'차트 취소+재승인 vs 일마 본행+환불행'을 직접 대조할 것]")
+        for ch in detail_charts:
+            nm = name_map.get(ch, "")[:10].replace("|", " ")
+            L.append(f"·차트#{ch} {nm}")
+            for pr in p_rows_by_chart.get(ch, [])[:8]:
+                cat = _cell(pr.get("분류", ""), 4)
+                amt = _safe_int(pr.get("금액", 0))
+                al = pr.get("승인번호목록", [])
+                ap = ",".join(str(a)[-8:] for a in al[:2]) if isinstance(al, list) and al else "-"
+                can = "·취소행" if bool(pr.get("is_취소", False)) else ""
+                L.append(f"  차트|{cat}|{amt:+,}|승인{ap}{can}")
+            for tag, dr in d_rows_by_chart.get(ch, [])[:6]:
+                sign = -1 if tag == "일마환불" else 1
+                L.append(
+                    f"  {tag}|카{sign * _safe_int(dr.get('카드', 0)):,}"
+                    f"/현{sign * _safe_int(dr.get('현금', 0)):,}"
+                    f"/이{sign * _safe_int(dr.get('이체', 0)):,}"
+                    f"/플{sign * _safe_int(dr.get('플랫폼합', 0)):,}"
+                    f"|순서{_safe_int(dr.get('내원순서', 0))}"
+                )
+            for hr in h_rows_by_chart.get(ch, [])[:8]:
+                t = _cell(hr.get("시간표시", ""), 8) or "-"
+                sgn = "-" if str(hr.get("tx_status", "")) == "취소" else "+"
+                L.append(
+                    f"  한솔|{t}|{sgn}{_safe_int(hr.get('금액', 0)):,}"
+                    f"|{_cell(hr.get('카드사', ''), 5)}"
+                    f"|승인{_cell(hr.get('승인번호', ''), 20)[-8:]}|{hr.get('tx_status', '')}"
+                )
 
     # ── 채널 gap 산출 (PG-only/front-only 정렬용) ──
     gap_card = 0
@@ -3275,10 +3374,10 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
                     if nm not in d_amt_to_names[amt]:
                         d_amt_to_names[amt].append(nm)
 
-        L.append("\n[한솔 PG-only 카드미매칭 — gap근접순 TOP15]")
-        L.append("시각|금액|카드사|말미|승인번호|동일금액일마환자")
+        L.append("\n[한솔 PG-only 카드미매칭 — gap근접순 (표시 최대100)]")
+        L.append("시각|금액|카드사|말미|승인번호|동일금액일마환자|오타패턴후보(×10/÷10)")
         h_sorted = sorted(h_um.to_dict("records"), key=lambda r: _rank(r.get("금액", 0)))
-        for r in h_sorted[:15]:
+        for r in h_sorted[:100]:
             t = str(r.get("시간표시", ""))[:8]
             amt = _safe_int(r.get("금액", 0))
             cs = str(r.get("카드사", ""))[:5]
@@ -3287,14 +3386,22 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
             ap = str(r.get("승인번호", ""))[-8:]
             cands = d_amt_to_names.get(amt, [])
             cand_str = ("·".join(cands[:2]) + "?") if cands else "-"
-            L.append(f"{t}|{amt:,}|{cs}|*{tail}|{ap}|{cand_str}")
+            # R11 자릿수 오타 후보: 일마에 금액×10 또는 ÷10 이 존재하면 같은 건의
+            # 자릿수 추가/누락(50,000↔500,000) 오타 쌍일 수 있음 → AI가 쌍으로 검토
+            typo = []
+            typo_amts = [amt * 10] + ([amt // 10] if amt % 10 == 0 else [])
+            for ta in typo_amts:
+                for nm2 in d_amt_to_names.get(ta, [])[:1]:
+                    typo.append(f"{nm2}({ta:,})?")
+            typo_str = "·".join(typo[:2]) if typo else "-"
+            L.append(f"{t}|{amt:,}|{cs}|*{tail}|{ap}|{cand_str}|{typo_str}")
 
     # ── [일마 front-only] ────────────────────────
     if d_um is not None and not d_um.empty:
-        L.append("\n[일마 front-only 카드미매칭 — gap근접순 TOP15]")
+        L.append("\n[일마 front-only 카드미매칭 — gap근접순 (표시 최대100)]")
         L.append("차트#|이름|금액|내원순서")
         d_sorted = sorted(d_um.to_dict("records"), key=lambda r: _rank(r.get("카드", 0)))
-        for r in d_sorted[:15]:
+        for r in d_sorted[:100]:
             ch = clean_no(r.get("차트번호", ""))
             nm = str(r.get("성명", ""))[:10]
             amt = _safe_int(r.get("카드", 0))
@@ -3307,7 +3414,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
         if not p_can.empty:
             L.append("\n[차트환불/취소 — 합계에 영향]")
             L.append("차트#|이름|분류|금액")
-            for _, r in p_can.head(10).iterrows():
+            for _, r in p_can.head(40).iterrows():
                 ch = clean_no(r.get("차트번호", ""))
                 nm = str(r.get("이름", ""))[:10]
                 cat = str(r.get("분류", ""))
@@ -3318,7 +3425,7 @@ def build_ai_text(hansol, daily, daily_refund, patient, channel_df,
     if daily_refund is not None and not daily_refund.empty:
         L.append("\n[일마환불/취소 행]")
         L.append("차트#|성명|카드|현금|이체|플랫폼")
-        for _, r in daily_refund.head(10).iterrows():
+        for _, r in daily_refund.head(40).iterrows():
             ch = clean_no(r.get("차트번호", ""))
             nm = str(r.get("성명", ""))[:10]
             L.append(
@@ -3385,7 +3492,11 @@ AI_SYSTEM = (
     "반영된 재승인액인데 환불 행을 또 차감하면 환불 이중차감(일마 net 과소)이고, 반대로 "
     "차트에 환불 행이 아직 없으면 차트 net 과대다. 유형C2의 '원인'에 환불 진단이 있으면 "
     "그것을 그대로 인용하고, '한솔판정'(PG 카드 net이 어느 파일과 일치하는지)이 있으면 그 "
-    "방향을 최종 결론으로 삼는다 — 한솔=차트면 일일마감 정정, 한솔=일마면 차트 정정 권고."
+    "방향을 최종 결론으로 삼는다 — 한솔=차트면 일일마감 정정, 한솔=일마면 차트 정정 권고.\n"
+    "[R15] [원시거래행] 섹션이 있으면 pivot 합계 비교에 그치지 말고 그 환자의 개별 행을 "
+    "직접 대조·재계산해 원인을 특정한다 — 분할결제 합산 누락, 동일 행 중복기재, "
+    "차트 '취소+재승인' vs 일마 '본행+환불행'(R14), 한솔 승인번호·시각 대조. "
+    "결론에는 근거가 된 행(금액·시각·승인말미)을 반드시 인용한다."
 )
 
 AI_USER = """병원 정산 데이터 (3개 파일을 차트번호·승인번호로 통합한 raw 구조):
@@ -3439,10 +3550,22 @@ STEP3. [차트번호별 3-way 통합]의 차이행을 환자 단위로 빠짐없
   · ★중요★ 채널 합계차이를 큰 환자 한 명으로 설명했어도 나머지 차이행을 생략하지 말 것.
     +/-로 상쇄되는 환자쌍(예: A −27,500 · B +27,500, 합계 0)도 각각 검토대상으로 반드시 나열한다.
 
+STEP3b. [원시거래행 — 차이환자 개별 행] 심층추적 (섹션이 있으면 필수 — R15)
+  · STEP3에서 분류한 각 차이 환자에 대해, 세 파일의 개별 행을 직접 대조해
+    패턴 분류(Pa~Pf)를 검증·구체화한다:
+    - 차트 행들의 합 vs 일마 행 vs 한솔 행들의 합을 행 단위로 재계산
+      → 분할결제(여러 행 합이 상대 파일 한 행과 일치) / 중복기재(같은 금액 행 2개) 식별
+    - 차트 '취소행+재승인행' ↔ 일마 '본행+환불행' 대조 → R14 환불 이중차감/미반영 판정
+    - 한솔 행의 시각·승인말미·금액으로 어느 결제가 어느 파일에서 빠졌는지 특정
+  · 행 단위 근거(금액·시각·승인말미)를 인용해 검토 권고의 신뢰도를 높인다.
+    행 대조 결과가 STEP3의 패턴 분류와 다르면 원시거래행 쪽을 우선한다.
+
 STEP4. [한솔 PG-only] · [일마 front-only] cross-match
   · 한솔PG-only의 '동일금액일마환자' hint 존재 → R8 → 그 환자 일마 결제수단(현금/이체 오기재) 검토 권고.
   · 한솔PG-only 금액 = 일마front-only 금액 페어 → 환자 동일성 검토 권고.
   · 한솔PG-only 금액 ↔ 일마front-only 금액이 R11 오타 패턴 → Pf '같은 건의 금액 오타 의심' 쌍으로 보고.
+  · 한솔PG-only의 '오타패턴후보' 열은 코드가 미리 찾은 ×10/÷10 금액의 일마 환자 —
+    자릿수 오타(R11) 쌍 후보이므로 해당 환자와 우선 대조.
   · hint 없는 한솔PG-only → 일마·차트 결제건 누락 가능성 검토.
   · hint 없는 일마front-only → PG승인 없음 → 미수납 or 결제수단 오기재 가능성 검토.
 
@@ -4107,23 +4230,34 @@ def build_verification_excel(verif):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-# Gemini 무료 한도 (2026년 기준, 모델별 일일 호출수 RPD 기준):
-#   gemini-2.5-flash-lite  : 15 RPM / 250K TPM / 1000 RPD  ← 무료 RPD 최다, 권장 기본값
-#   gemini-2.5-flash       : 10 RPM / 250K TPM /  500 RPD
-#   gemini-2.0-flash       : 15 RPM /   1M TPM /  200 RPD  ← TPM은 크지만 RPD 적음
-#   gemini-2.0-flash-lite  : 30 RPM /   1M TPM /  200 RPD
+# Gemini 무료 한도 (2026-07 공개자료 기준 — 실계정 한도는 AI Studio 대시보드가 정답):
+#   gemini-3-flash         : 10 RPM / 250K TPM / 1500 RPD  ← 권장 기본(추론 최강·thinking 내장)
+#   gemini-2.5-flash-lite  : 15 RPM / 250K TPM / 1000 RPD  ← RPD 폴백(thinking_budget으로 사고 활성)
+#   gemini-2.5-flash       : 10 RPM / 250K TPM /  250 RPD
+#   gemini-2.0-flash       : 15 RPM /   1M TPM /  200 RPD  (thinking 미지원 — 최후 폴백)
+#   gemini-2.0-flash-lite  : 30 RPM /   1M TPM /  200 RPD  (thinking 미지원)
+# ※ 2026-04부터 Pro 계열은 무료 티어에서 제외됨.
+# ※ 병목은 RPD(일일 호출수)다. TPM 250K 대비 요청당 입력(~수만 토큰)은 여유가 크므로
+#    입력 데이터를 크게 보내는 것은 무료 한도에 부담이 없다 (build_ai_text 참고).
 GEMINI_MODELS = {
-    "gemini-2.5-flash-lite": {"rpm": 15, "rpd": 1000, "label": "Flash Lite 2.5 (권장·RPD1000)"},
-    "gemini-2.5-flash":      {"rpm": 10, "rpd": 500,  "label": "Flash 2.5 (RPD500)"},
-    "gemini-2.0-flash":      {"rpm": 15, "rpd": 200,  "label": "Flash 2.0 (RPD200)"},
-    "gemini-2.0-flash-lite": {"rpm": 30, "rpd": 200,  "label": "Flash Lite 2.0 (RPM30)"},
+    "gemini-3-flash":        {"rpm": 10, "rpd": 1500, "label": "Gemini 3 Flash (권장·추론최강)"},
+    "gemini-2.5-flash-lite": {"rpm": 15, "rpd": 1000, "label": "Flash Lite 2.5 (RPD1000·폴백)"},
+    "gemini-2.5-flash":      {"rpm": 10, "rpd": 250,  "label": "Flash 2.5 (RPD250)"},
+    "gemini-2.0-flash":      {"rpm": 15, "rpd": 200,  "label": "Flash 2.0 (RPD200·사고없음)"},
+    "gemini-2.0-flash-lite": {"rpm": 30, "rpd": 200,  "label": "Flash Lite 2.0 (RPM30·사고없음)"},
 }
 GEMINI_FALLBACK_ORDER = [
+    "gemini-3-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 ]
+# 모델 ID 개편(preview↔GA) 대비: 404(미지원 ID) 시 순서대로 시도할 대체 ID.
+# gemini-flash-latest는 구글이 유지하는 '최신 Flash' 공식 별칭.
+GEMINI_MODEL_ALIASES = {
+    "gemini-3-flash": ["gemini-3-flash-preview", "gemini-flash-latest"],
+}
 
 
 def _gemini_wait(rpm_limit=15):
@@ -4171,8 +4305,28 @@ def _cache_set(k, v):
         pass
 
 
-def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", allow_fallback=True):
-    """무료 한도 친화: 캐시 → 호출 → 한도초과 시 다른 무료 모델로 자동 폴백."""
+def _gemini_gen_config(model, types):
+    """모델별 생성 설정 — 추론(thinking) 최대 활용.
+
+    사고 토큰은 max_output_tokens에 포함되므로, 출력한도를 900으로 걸면 사고가
+    봉쇄된다 → 한도를 크게 열고 출력 길이는 프롬프트('900토큰 이내')로 통제한다.
+      - 3.x  : thinking 기본 활성(thinking_level 방식) → 별도 설정 불필요
+      - 2.5  : thinking_budget으로 명시 활성 (flash-lite는 기본 off이므로 필수)
+      - 2.0  : thinking 미지원 → thinking_config를 넣으면 400 에러
+    """
+    kw = dict(system_instruction=AI_SYSTEM, temperature=0.15)
+    if model.startswith("gemini-2.0"):
+        kw["max_output_tokens"] = 8192
+    elif model.startswith("gemini-2.5"):
+        kw["thinking_config"] = types.ThinkingConfig(thinking_budget=4096)
+        kw["max_output_tokens"] = 16384
+    else:
+        kw["max_output_tokens"] = 16384
+    return types.GenerateContentConfig(**kw)
+
+
+def run_gemini(api_key, data_text, question="", model="gemini-3-flash", allow_fallback=True):
+    """무료 한도 친화: 캐시 → 호출 → 한도초과·미지원ID 시 다른 무료 모델로 자동 폴백."""
     import hashlib
     from google import genai
     from google.genai import types
@@ -4193,11 +4347,17 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
 
     client = genai.Client(api_key=api_key)
 
-    # 폴백 순서: 사용자 선택 모델 우선, 그 후 권장 순서
+    # 폴백 순서: 사용자 선택 모델 우선, 그 후 권장 순서.
+    # 각 모델 뒤에 대체 ID(preview↔GA 개편 대비)를 붙여 404에도 끊기지 않게 한다.
     if allow_fallback:
-        try_order = [model] + [m for m in GEMINI_FALLBACK_ORDER if m != model]
+        base_order = [model] + [m for m in GEMINI_FALLBACK_ORDER if m != model]
     else:
-        try_order = [model]
+        base_order = [model]
+    try_order = []
+    for m in base_order:
+        for cand in [m] + GEMINI_MODEL_ALIASES.get(m, []):
+            if cand not in try_order:
+                try_order.append(cand)
 
     last_err = None
     for try_model in try_order:
@@ -4208,11 +4368,7 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
             r = client.models.generate_content(
                 model=try_model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=AI_SYSTEM,
-                    max_output_tokens=900,
-                    temperature=0.15,
-                ),
+                config=_gemini_gen_config(try_model, types),
             )
             out = r.text
             st.session_state["_ai_ck"] = ckey
@@ -4223,7 +4379,11 @@ def run_gemini(api_key, data_text, question="", model="gemini-2.5-flash-lite", a
         except Exception as e:
             last_err = e
             err = str(e)
-            if "429" in err or "rate" in err.lower() or "quota" in err.lower() or "resource" in err.lower():
+            low = err.lower()
+            if "404" in err or "not_found" in low or "not found" in low:
+                # 미지원 모델 ID(지역/버전 차이) → 다음 후보 ID 시도
+                continue
+            if "429" in err or "rate" in low or "quota" in low or "resource" in low:
                 # 한도 초과 → 다음 모델 즉시 시도
                 if "_g_times" in st.session_state:
                     st.session_state["_g_times"] = []
@@ -5104,13 +5264,13 @@ def main():
             )
 
             est_in = int(len(ai_text) / 2.5) + 250
-            est_total = est_in + 900
-            col = "🟢" if est_total < 6000 else "🟡" if est_total < 12000 else "🔴"
+            est_total = est_in + 16384  # 출력한도(사고 토큰 포함) 기준 보수적 추정
+            col = "🟢" if est_total < 60000 else "🟡" if est_total < 120000 else "🔴"
             rpd = GEMINI_MODELS[model_choice]["rpd"]
             rpm = GEMINI_MODELS[model_choice]["rpm"]
             st.caption(
-                f"{col} 통합데이터 {len(ai_text):,}자 / 토큰 ~{est_in}입력+~900출력 = ~{est_total} | "
-                f"선택모델 무료한도 RPM{rpm}·RPD{rpd}·TPM250K (한도 시 다른 무료 모델로 자동 폴백)"
+                f"{col} 통합데이터 {len(ai_text):,}자 / 토큰 ~{est_in:,}입력+최대16K출력(사고포함) = ~{est_total:,} | "
+                f"선택모델 무료한도 RPM{rpm}·RPD{rpd}·TPM250K (한도·미지원ID 시 다른 무료 모델로 자동 폴백)"
             )
 
             with st.expander("📄 전송 데이터 미리보기"):
