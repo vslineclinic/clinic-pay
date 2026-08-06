@@ -1,0 +1,56 @@
+{
+  "enabledPlugins": {
+    "example-skills@anthropic-agent-skills": true,
+    "document-skills@anthropic-agent-skills": true,
+    "claude-seo@agricidaniel-claude-seo": true,
+    "rampstack-seo@rampstack": true,
+    "claude-ads@ai-marketing-hub-claude-ads": true,
+    "marketing-skills@marketingskills": true,
+    "financial-analysis@claude-for-financial-services": true,
+    "core@finance-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "anthropic-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/skills"
+      }
+    },
+    "agricidaniel-claude-seo": {
+      "source": {
+        "source": "github",
+        "repo": "AgriciDaniel/claude-seo"
+      }
+    },
+    "rampstack": {
+      "source": {
+        "source": "github",
+        "repo": "rampstackco/claude-skills"
+      }
+    },
+    "ai-marketing-hub-claude-ads": {
+      "source": {
+        "source": "github",
+        "repo": "AgriciDaniel/claude-ads"
+      }
+    },
+    "marketingskills": {
+      "source": {
+        "source": "github",
+        "repo": "coreyhaines31/marketingskills"
+      }
+    },
+    "claude-for-financial-services": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/financial-services-plugins"
+      }
+    },
+    "finance-skills": {
+      "source": {
+        "source": "github",
+        "repo": "JoelLewis/finance_skills"
+      }
+    }
+  }
+}
