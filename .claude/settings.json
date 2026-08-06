@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/devlog-context.sh\"",
+            "timeout": 10,
+            "statusMessage": "개발일지(DEVLOG) 최근 내역 로드 중"
+          }
+        ]
+      }
+    ]
+  }
+}
